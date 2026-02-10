@@ -223,7 +223,7 @@ class Messages:
 Смотрите /terms
 
 **Техническая поддержка:**
-@clavis_support
+@clavis\_support
 
 **Другие команды:**
 /menu - Все команды

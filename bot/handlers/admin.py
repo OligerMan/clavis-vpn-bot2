@@ -200,6 +200,25 @@ def _create_vless_reality_inbound(api: Api, remark: str = "clavis") -> dict:
 def register_admin_handlers(bot: TeleBot) -> None:
     """Register all admin command handlers."""
 
+    # ── /admin_help ───────────────────────────────────────────
+    @bot.message_handler(commands=['admin_help'])
+    def handle_admin_help(message: Message):
+        """Show all admin commands."""
+        if not is_admin(message.from_user.id):
+            return
+
+        bot.send_message(
+            message.chat.id,
+            "*Admin Commands*\n\n"
+            "`/servers` — list all servers with status and config\n"
+            "`/add_server` — add server (dialog: name → domain → auto-setup)\n"
+            "`/check_server <id>` — health check (version, uptime, clients)\n"
+            "`/toggle_server <id>` — enable/disable server\n"
+            "`/delete_server <id>` — delete server (force delete if keys exist)\n"
+            "\n`/admin_help` — this message",
+            parse_mode='Markdown'
+        )
+
     # ── /servers ──────────────────────────────────────────────
     @bot.message_handler(commands=['servers'])
     def handle_servers(message: Message):

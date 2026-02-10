@@ -12,6 +12,7 @@ from message_templates import Messages
 from bot.keyboards.markups import (
     main_menu_keyboard,
     test_key_confirmation_keyboard,
+    key_actions_keyboard,
     platform_menu_keyboard,
     status_actions_keyboard,
     back_button_keyboard
@@ -133,7 +134,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                         days_left=days_left,
                         device_limit=DEVICE_LIMIT
                     ),
-                    reply_markup=platform_menu_keyboard(),
+                    reply_markup=key_actions_keyboard(v2raytun_deeplink),
                     parse_mode='Markdown'
                 )
 
@@ -378,6 +379,20 @@ def register_user_handlers(bot: TeleBot) -> None:
             bot.answer_callback_query(call.id)
         except Exception as e:
             logger.error(f"Error in back_to_menu callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'show_platforms')
+    def callback_show_platforms(call: CallbackQuery):
+        """Handle show_platforms callback - show platform selection."""
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.id,
+                reply_markup=platform_menu_keyboard()
+            )
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in show_platforms callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Ошибка")
 
     @bot.callback_query_handler(func=lambda call: call.data == 'cancel')

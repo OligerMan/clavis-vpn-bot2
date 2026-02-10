@@ -70,6 +70,30 @@ def payment_plans_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
+def key_actions_keyboard(v2raytun_deeplink: str) -> InlineKeyboardMarkup:
+    """
+    Keyboard for /key command.
+
+    Buttons:
+    - v2rayTun connect (URL button)
+    - Install client (platform selection)
+    - Back to menu
+    """
+    keyboard = InlineKeyboardMarkup()
+
+    keyboard.row(
+        InlineKeyboardButton("🚀 Подключить v2rayTun", url=v2raytun_deeplink)
+    )
+    keyboard.row(
+        InlineKeyboardButton("📲 Установить клиент", callback_data="show_platforms")
+    )
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
+    )
+
+    return keyboard
+
+
 def platform_menu_keyboard() -> InlineKeyboardMarkup:
     """
     Generate platform selection keyboard.
