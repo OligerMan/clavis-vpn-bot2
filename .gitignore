@@ -1,3 +1,12 @@
+# Environment variables
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
 # Python
 __pycache__/
 *.py[cod]
@@ -22,48 +31,37 @@ wheels/
 
 # Virtual environments
 venv/
-ENV/
 env/
-.venv/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.nox/
-
-# Database
-*.db
-*.sqlite
-*.sqlite3
-data/*.db
-
-# Environment and secrets
-.env
-.env.local
-.env.*.local
-*.pem
-*.key
-secrets/
-config/settings.local.json
+ENV/
+.venv
 
 # Logs
 *.log
 logs/
 
-# OS
-.DS_Store
-Thumbs.db
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Test files
+tests/__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Temporary files
-temp_repo_analysis/
 *.tmp
 *.bak
+*.old
+
+# Credentials (extra protection)
+*credentials*.json
+*_key.txt
+*.pem
+*.key
+
+# Config backups
+*_config.json
