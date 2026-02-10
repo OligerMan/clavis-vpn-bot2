@@ -1,11 +1,14 @@
 """Key management and traffic aggregation service."""
 
-from typing import List, Dict, Optional
+import logging
+from typing import Dict, List
+
 from sqlalchemy.orm import Session
 
-from database.models import Server, Subscription, Key
+from database.models import Key, Server, Subscription
 from vpn.xui_client import XUIClient
-from message_templates import Messages
+
+logger = logging.getLogger(__name__)
 
 
 class KeyService:
@@ -44,12 +47,10 @@ class KeyService:
         """
         Create VPN keys for a subscription via XUIClient.
 
-        For now, creates a single key. In the future, may support multiple servers.
-
         Args:
             db: Database session
             subscription: Subscription object
-            user_telegram_id: User's Telegram ID for remarks
+            user_telegram_id: User's Telegram ID
 
         Returns:
             List of created Key objects
@@ -57,41 +58,14 @@ class KeyService:
         Raises:
             ValueError: If server not available or key creation fails
         """
-        # Get available server
         server = KeyService.get_available_server(db)
 
-        # Initialize XUI client
-        client = XUIClient(
-            panel_url=server.api_url,
-            username=server.username,
-            password=server.password
-        )
+        client = XUIClient(server)
 
-        # Login to panel
-        if not client.login():
-            raise ValueError(f"Failed to login to server {server.name}")
-
-        # Generate remarks
-        remarks = f"Clavis VPN - TG{user_telegram_id}"
-
-        # Create key via XUI API
         try:
-            key_data = client.create_key(
-                subscription_id=subscription.id,
-                telegram_id=user_telegram_id,
-                remarks=remarks
-            )
+            key = client.create_key(subscription, user_telegram_id)
         except Exception as e:
-            raise ValueError(f"Failed to create key: {str(e)}")
-
-        # Create Key record in database
-        key = Key(
-            subscription_id=subscription.id,
-            server_id=server.id,
-            protocol='vless',
-            key_data=key_data.get('uuid', ''),
-            is_active=True
-        )
+            raise ValueError(f"Failed to create key: {e}")
 
         db.add(key)
         db.commit()
@@ -114,38 +88,35 @@ class KeyService:
         total_upload = 0
         total_download = 0
 
-        # Get all keys for this subscription
         keys = db.query(Key).filter(
             Key.subscription_id == subscription.id,
             Key.is_active == True
         ).all()
 
+        # Group keys by server to reuse XUIClient connections
+        keys_by_server: Dict[int, list] = {}
         for key in keys:
-            # Get server for this key
-            server = db.query(Server).filter(Server.id == key.server_id).first()
+            if key.server_id not in keys_by_server:
+                keys_by_server[key.server_id] = []
+            keys_by_server[key.server_id].append(key)
 
+        for server_id, server_keys in keys_by_server.items():
+            server = db.query(Server).filter(Server.id == server_id).first()
             if not server or not server.is_active:
                 continue
 
-            # Initialize XUI client
-            client = XUIClient(
-                panel_url=server.api_url,
-                username=server.username,
-                password=server.password
-            )
-
-            # Login and get traffic
             try:
-                if client.login():
-                    traffic = client.get_traffic(key.key_data)
-                    if traffic:
-                        total_upload += traffic.get('up', 0)
-                        total_download += traffic.get('down', 0)
+                client = XUIClient(server)
+                for key in server_keys:
+                    try:
+                        traffic = client.get_traffic(key)
+                        total_upload += traffic.upload_bytes
+                        total_download += traffic.download_bytes
+                    except Exception:
+                        continue
             except Exception:
-                # Skip failed traffic queries
                 continue
 
-        # Convert bytes to GB
         upload_gb = total_upload / (1024 ** 3)
         download_gb = total_download / (1024 ** 3)
         total_gb = upload_gb + download_gb
@@ -159,7 +130,7 @@ class KeyService:
     @staticmethod
     def delete_subscription_keys(db: Session, subscription: Subscription) -> None:
         """
-        Delete all keys for a subscription (e.g., when upgrading from test to paid).
+        Delete all keys for a subscription.
 
         Args:
             db: Database session
@@ -170,29 +141,31 @@ class KeyService:
             Key.is_active == True
         ).all()
 
+        # Group keys by server
+        keys_by_server: Dict[int, list] = {}
         for key in keys:
-            # Get server
-            server = db.query(Server).filter(Server.id == key.server_id).first()
+            if key.server_id not in keys_by_server:
+                keys_by_server[key.server_id] = []
+            keys_by_server[key.server_id].append(key)
 
+        for server_id, server_keys in keys_by_server.items():
+            server = db.query(Server).filter(Server.id == server_id).first()
             if not server or not server.is_active:
+                # Still mark keys inactive even if server unreachable
+                for key in server_keys:
+                    key.is_active = False
                 continue
 
-            # Initialize XUI client
-            client = XUIClient(
-                panel_url=server.api_url,
-                username=server.username,
-                password=server.password
-            )
-
-            # Login and delete key
             try:
-                if client.login():
-                    client.delete_key(key.key_data)
+                client = XUIClient(server)
+                for key in server_keys:
+                    try:
+                        client.delete_key(key)
+                    except Exception:
+                        pass
+                    key.is_active = False
             except Exception:
-                # Continue even if deletion fails
-                pass
-
-            # Mark key as inactive
-            key.is_active = False
+                for key in server_keys:
+                    key.is_active = False
 
         db.commit()

@@ -333,28 +333,35 @@ def register_user_handlers(bot: TeleBot) -> None:
             bot.send_message(call.message.chat.id, Messages.ERROR_GENERIC)
 
     # Callback handlers for navigation
+    # Note: call.message.from_user is the bot, not the actual user.
+    # We patch from_user so that command handlers can use message.from_user.id.
+    def _patch_from_user(call: CallbackQuery) -> Message:
+        """Return call.message with from_user set to the actual user."""
+        call.message.from_user = call.from_user
+        return call.message
+
     @bot.callback_query_handler(func=lambda call: call.data == 'get_test_key')
     def callback_get_test_key(call: CallbackQuery):
         """Handle get_test_key callback - same as /test_key command."""
-        handle_test_key(call.message)
+        handle_test_key(_patch_from_user(call))
         bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == 'get_key')
     def callback_get_key(call: CallbackQuery):
         """Handle get_key callback - same as /key command."""
-        handle_key(call.message)
+        handle_key(_patch_from_user(call))
         bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == 'status')
     def callback_status(call: CallbackQuery):
         """Handle status callback - same as /status command."""
-        handle_status(call.message)
+        handle_status(_patch_from_user(call))
         bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == 'help')
     def callback_help(call: CallbackQuery):
         """Handle help callback - same as /help command."""
-        handle_help(call.message)
+        handle_help(_patch_from_user(call))
         bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == 'back_to_menu')
