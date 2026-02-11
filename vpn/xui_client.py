@@ -116,9 +116,9 @@ class XUIClient:
     def _generate_email(self, telegram_id: int, subscription_id: int) -> str:
         """Generate unique email identifier for a client.
 
-        Format: clavis_{telegram_id}_{subscription_id}
+        Format: clavis_{telegram_id}_{subscription_id}_s{server_id}
         """
-        return f"clavis_{telegram_id}_{subscription_id}"
+        return f"clavis_{telegram_id}_{subscription_id}_s{self.server.id}"
 
     def _get_inbound_id(self) -> int:
         """Get the configured inbound ID."""
@@ -148,7 +148,7 @@ class XUIClient:
         # Generate unique identifiers
         client_uuid = str(uuid_lib.uuid4())
         email = self._generate_email(user_telegram_id, subscription.id)
-        display_name = remarks or "Clavis VPN"
+        display_name = remarks or self.server.name
         inbound_id = self._get_inbound_id()
 
         # Calculate expiry timestamp (milliseconds since epoch)
@@ -171,9 +171,78 @@ class XUIClient:
 
         except Exception as e:
             error_msg = str(e).lower()
-            if "inbound" in error_msg:
+
+            # Handle duplicate email by deleting old client first
+            if "duplicate email" in error_msg:
+                logger.warning(f"Client {email} already exists, deleting and retrying")
+                temp_client_id = None
+                temp_email = None
+                try:
+                    # Create dummy key object for deletion
+                    dummy_key = Key(
+                        subscription_id=subscription.id,
+                        server_id=self.server.id,
+                        protocol='xui',
+                        remote_key_id=email,
+                        key_data='',
+                        remarks='',
+                        is_active=False
+                    )
+                    # Try to delete existing client
+                    try:
+                        self.delete_key(dummy_key)
+                        logger.info(f"Deleted duplicate client {email}")
+                    except Exception as del_error:
+                        # If "no client remained", add a temporary client first
+                        if "no client remained" in str(del_error).lower():
+                            logger.warning("Cannot delete last client, adding temporary then deleting duplicate")
+                            temp_email = f"temp_{int(datetime.now().timestamp())}"
+                            temp_client_id = str(uuid_lib.uuid4())
+                            temp_client = Client(
+                                id=temp_client_id,
+                                email=temp_email,
+                                enable=True,  # Keep it active
+                                expiry_time=expiry_ms,
+                                flow=self._connection_settings.flow,
+                                limit_ip=1,
+                                total_gb=0
+                            )
+                            self.api.client.add(inbound_id, [temp_client])
+                            logger.info(f"Added temporary client {temp_email}")
+                            # Now delete the duplicate
+                            self.delete_key(dummy_key)
+                            logger.info(f"Deleted duplicate client {email} (had to add temp first)")
+                        else:
+                            raise
+
+                    # Retry creating the client
+                    self.api.client.add(inbound_id, [client])
+                    logger.info(f"Created client {email} after removing duplicate")
+
+                    # Delete temporary client if it was created
+                    if temp_client_id and temp_email:
+                        try:
+                            temp_key = Key(
+                                subscription_id=subscription.id,
+                                server_id=self.server.id,
+                                protocol='xui',
+                                remote_key_id=temp_email,
+                                key_data='',
+                                remarks='',
+                                is_active=False
+                            )
+                            self.delete_key(temp_key)
+                            logger.info(f"Deleted temporary client {temp_email}")
+                        except Exception as temp_del_error:
+                            logger.warning(f"Failed to delete temporary client {temp_email}: {temp_del_error}")
+                            # Don't fail the whole operation if temp cleanup fails
+
+                except Exception as retry_error:
+                    raise XUIError(f"Failed to handle duplicate client: {retry_error}", retry_error)
+            elif "inbound" in error_msg:
                 raise XUIInboundError(f"Inbound error: {e}", e)
-            raise XUIError(f"Failed to create client: {e}", e)
+            else:
+                raise XUIError(f"Failed to create client: {e}", e)
 
         # Build VLESS URI
         vless_uri = build_vless_uri(
@@ -223,12 +292,13 @@ class XUIClient:
         email = key.remote_key_id
 
         try:
-            # Get client UUID first
-            client = self._find_client_by_email(email)
-            if client is None:
+            # Find client UUID from inbound list (get_by_email returns numeric id,
+            # but api.client.delete needs the UUID string)
+            client_uuid = self._find_client_uuid_by_email(inbound_id, email)
+            if client_uuid is None:
                 raise XUIClientNotFoundError(f"Client not found: {email}")
 
-            self.api.client.delete(inbound_id, client.id)
+            self.api.client.delete(inbound_id, client_uuid)
             logger.info(f"Deleted client {email} from server {self.server.name}")
             return True
 
@@ -236,6 +306,59 @@ class XUIClient:
             raise
         except Exception as e:
             raise XUIError(f"Failed to delete client: {e}", e)
+
+    def update_key_expiry(self, key: Key, new_expiry_ms: int) -> bool:
+        """Update expiry time for an existing key.
+
+        Args:
+            key: Key model to update
+            new_expiry_ms: New expiry time in milliseconds since epoch
+
+        Returns:
+            True if updated successfully
+
+        Raises:
+            XUIClientNotFoundError: If client doesn't exist
+            XUIError: On other API errors
+        """
+        self._ensure_connected()
+
+        if not key.remote_key_id:
+            raise XUIError("Key has no remote_key_id")
+
+        inbound_id = self._get_inbound_id()
+        email = key.remote_key_id
+
+        try:
+            # Get inbound to access all clients
+            inbound = self.api.inbound.get_by_id(inbound_id)
+
+            # Find the client
+            target_client = None
+            for client in inbound.settings.clients:
+                if client.email == email:
+                    target_client = client
+                    break
+
+            if not target_client:
+                raise XUIClientNotFoundError(f"Client not found: {email}")
+
+            # Update client's expiry time
+            target_client.expiry_time = new_expiry_ms
+
+            # Set inbound_id (required for update API)
+            target_client.inbound_id = inbound_id
+
+            # Use client.update to update the client (positional args)
+            self.api.client.update(target_client.id, target_client)
+
+            logger.info(f"Updated expiry for client {email} on server {self.server.name} to {new_expiry_ms}")
+            return True
+
+        except XUIClientNotFoundError:
+            raise
+        except Exception as e:
+            raise XUIError(f"Failed to update client expiry: {e}", e)
 
     def get_traffic(self, key: Key) -> TrafficStats:
         """Get traffic statistics for a key.
@@ -373,55 +496,6 @@ class XUIClient:
                 error_message=f"Unknown error: {e}",
             )
 
-    def update_key_expiry(self, key: Key, new_expiry: datetime) -> bool:
-        """Update key expiration time on the server.
-
-        Args:
-            key: Key model to update
-            new_expiry: New expiration datetime
-
-        Returns:
-            True if updated successfully
-
-        Raises:
-            XUIClientNotFoundError: If client doesn't exist
-            XUIError: On other API errors
-        """
-        self._ensure_connected()
-
-        if not key.remote_key_id:
-            raise XUIError("Key has no remote_key_id")
-
-        inbound_id = self._get_inbound_id()
-        email = key.remote_key_id
-        expiry_ms = int(new_expiry.timestamp() * 1000)
-
-        try:
-            # Get client from inbound list (more reliable than get_by_email)
-            inbound = self.api.inbound.get_by_id(inbound_id)
-            client = None
-            for c in inbound.settings.clients:
-                if c.email == email:
-                    client = c
-                    break
-
-            if client is None:
-                raise XUIClientNotFoundError(f"Client not found: {email}")
-
-            # Ensure inbound_id is set (required for update)
-            client.inbound_id = inbound_id
-
-            # Update expiry time
-            client.expiry_time = expiry_ms
-            self.api.client.update(client.id, client)
-            logger.info(f"Updated expiry for {email} to {new_expiry}")
-            return True
-
-        except XUIClientNotFoundError:
-            raise
-        except Exception as e:
-            raise XUIError(f"Failed to update expiry: {e}", e)
-
     def enable_key(self, key: Key) -> bool:
         """Enable a disabled key on the server.
 
@@ -479,6 +553,24 @@ class XUIClient:
             raise
         except Exception as e:
             raise XUIError(f"Failed to update client: {e}", e)
+
+    def _find_client_uuid_by_email(self, inbound_id: int, email: str) -> Optional[str]:
+        """Find a client's UUID by email from the inbound client list.
+
+        get_by_email returns a numeric id, but delete/update need the UUID.
+        This method gets the UUID from the inbound's client list directly.
+        """
+        try:
+            inbounds = self.api.inbound.get_list()
+            inbound = next((i for i in inbounds if i.id == inbound_id), None)
+            if inbound is None:
+                return None
+            for c in inbound.settings.clients:
+                if c.email == email:
+                    return c.id  # UUID string
+            return None
+        except Exception:
+            return None
 
     def _find_client_by_email(self, email: str) -> Optional[Client]:
         """Find a client by email address.
