@@ -10,12 +10,18 @@ from database.models import User
 from services import SubscriptionService, KeyService
 from message_templates import Messages
 from bot.keyboards.markups import (
-    main_menu_keyboard,
+    start_menu_keyboard,
+    full_menu_keyboard,
     test_key_confirmation_keyboard,
     key_actions_keyboard,
     platform_menu_keyboard,
     status_actions_keyboard,
-    back_button_keyboard
+    back_button_keyboard,
+    support_actions_keyboard,
+    android_instructions_keyboard,
+    ios_instructions_keyboard,
+    windows_instructions_keyboard,
+    macos_instructions_keyboard
 )
 from config.settings import SUBSCRIPTION_BASE_URL, DEVICE_LIMIT
 
@@ -32,7 +38,7 @@ def register_user_handlers(bot: TeleBot) -> None:
             bot.send_message(
                 message.chat.id,
                 Messages.WELCOME,
-                reply_markup=main_menu_keyboard(),
+                reply_markup=start_menu_keyboard(),
                 parse_mode='Markdown'
             )
         except Exception as e:
@@ -43,12 +49,28 @@ def register_user_handlers(bot: TeleBot) -> None:
     def handle_menu(message: Message):
         """Handle /menu command - show all commands."""
         try:
-            bot.send_message(
-                message.chat.id,
-                Messages.MENU,
-                reply_markup=main_menu_keyboard(),
-                parse_mode='Markdown'
-            )
+            with get_db_session() as db:
+                user = db.query(User).filter(
+                    User.telegram_id == message.from_user.id
+                ).first()
+
+                # Hide test key button if user already used test OR has paid subscription
+                hide_test_key = False
+                if user:
+                    # Check if already used test
+                    if SubscriptionService.has_test_subscription(db, user):
+                        hide_test_key = True
+                    # Check if has active paid subscription
+                    active_sub = SubscriptionService.get_active_subscription(db, user)
+                    if active_sub and not active_sub.is_test:
+                        hide_test_key = True
+
+                bot.send_message(
+                    message.chat.id,
+                    Messages.MENU,
+                    reply_markup=full_menu_keyboard(hide_test_key),
+                    parse_mode='Markdown'
+                )
         except Exception as e:
             logger.error(f"Error in /menu handler: {e}", exc_info=True)
             bot.send_message(message.chat.id, Messages.ERROR_GENERIC)
@@ -207,18 +229,35 @@ def register_user_handlers(bot: TeleBot) -> None:
             logger.error(f"Error in /status handler: {e}", exc_info=True)
             bot.send_message(message.chat.id, Messages.ERROR_GENERIC)
 
-    @bot.message_handler(commands=['help'])
-    def handle_help(message: Message):
-        """Handle /help command - show help message."""
+    @bot.message_handler(commands=['support'])
+    def handle_support(message: Message):
+        """Handle /support command - show support info with subscription status."""
         try:
-            bot.send_message(
-                message.chat.id,
-                Messages.HELP_MESSAGE.format(telegram_id=message.from_user.id),
-                reply_markup=back_button_keyboard(),
-                parse_mode='Markdown'
-            )
+            with get_db_session() as db:
+                user = db.query(User).filter(
+                    User.telegram_id == message.from_user.id
+                ).first()
+
+                # Get subscription status
+                subscription_status = "**Статус подписки:** Не оплачена"
+                if user:
+                    subscription = SubscriptionService.get_active_subscription(db, user)
+                    if subscription:
+                        days_left = (subscription.expires_at - datetime.utcnow()).days
+                        sub_type = "Тестовая" if subscription.is_test else "Платная"
+                        subscription_status = f"**Статус подписки:** {sub_type} (осталось {days_left} дней)"
+
+                bot.send_message(
+                    message.chat.id,
+                    Messages.SUPPORT_MESSAGE.format(
+                        telegram_id=message.from_user.id,
+                        subscription_status=subscription_status
+                    ),
+                    reply_markup=support_actions_keyboard(message.from_user.id),
+                    parse_mode='Markdown'
+                )
         except Exception as e:
-            logger.error(f"Error in /help handler: {e}", exc_info=True)
+            logger.error(f"Error in /support handler: {e}", exc_info=True)
             bot.send_message(message.chat.id, Messages.ERROR_GENERIC)
 
     @bot.message_handler(commands=['terms'])
@@ -241,20 +280,21 @@ def register_user_handlers(bot: TeleBot) -> None:
         try:
             command = message.text.lower().replace('/', '')
 
-            message_map = {
-                'android': Messages.ANDROID_INSTRUCTIONS,
-                'ios': Messages.IOS_INSTRUCTIONS,
-                'windows': Messages.WINDOWS_INSTRUCTIONS,
-                'macos': Messages.MACOS_INSTRUCTIONS
+            platform_data = {
+                'android': (Messages.ANDROID_INSTRUCTIONS, android_instructions_keyboard()),
+                'ios': (Messages.IOS_INSTRUCTIONS, ios_instructions_keyboard()),
+                'windows': (Messages.WINDOWS_INSTRUCTIONS, windows_instructions_keyboard()),
+                'macos': (Messages.MACOS_INSTRUCTIONS, macos_instructions_keyboard())
             }
 
-            instruction_message = message_map.get(command)
+            data = platform_data.get(command)
 
-            if instruction_message:
+            if data:
+                instruction_message, keyboard = data
                 bot.send_message(
                     message.chat.id,
                     instruction_message,
-                    reply_markup=back_button_keyboard(),
+                    reply_markup=keyboard,
                     parse_mode='Markdown'
                 )
 
@@ -359,24 +399,56 @@ def register_user_handlers(bot: TeleBot) -> None:
         handle_status(_patch_from_user(call))
         bot.answer_callback_query(call.id)
 
-    @bot.callback_query_handler(func=lambda call: call.data == 'help')
-    def callback_help(call: CallbackQuery):
-        """Handle help callback - same as /help command."""
-        handle_help(_patch_from_user(call))
+    @bot.callback_query_handler(func=lambda call: call.data == 'support')
+    def callback_support(call: CallbackQuery):
+        """Handle support callback - same as /support command."""
+        handle_support(_patch_from_user(call))
         bot.answer_callback_query(call.id)
 
-    @bot.callback_query_handler(func=lambda call: call.data == 'back_to_menu')
-    def callback_back_to_menu(call: CallbackQuery):
-        """Handle back_to_menu callback - show main menu."""
+    @bot.callback_query_handler(func=lambda call: call.data == 'faq')
+    def callback_faq(call: CallbackQuery):
+        """Handle FAQ callback - show frequently asked questions."""
         try:
             bot.edit_message_text(
-                Messages.WELCOME,
+                Messages.FAQ_MESSAGE,
                 call.message.chat.id,
                 call.message.id,
-                reply_markup=main_menu_keyboard(),
+                reply_markup=back_button_keyboard(),
                 parse_mode='Markdown'
             )
             bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in FAQ callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'back_to_menu')
+    def callback_back_to_menu(call: CallbackQuery):
+        """Handle back_to_menu callback - show full menu."""
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(
+                    User.telegram_id == call.from_user.id
+                ).first()
+
+                # Hide test key button if user already used test OR has paid subscription
+                hide_test_key = False
+                if user:
+                    # Check if already used test
+                    if SubscriptionService.has_test_subscription(db, user):
+                        hide_test_key = True
+                    # Check if has active paid subscription
+                    active_sub = SubscriptionService.get_active_subscription(db, user)
+                    if active_sub and not active_sub.is_test:
+                        hide_test_key = True
+
+                bot.edit_message_text(
+                    Messages.WELCOME,
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=full_menu_keyboard(hide_test_key),
+                    parse_mode='Markdown'
+                )
+                bot.answer_callback_query(call.id)
         except Exception as e:
             logger.error(f"Error in back_to_menu callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Ошибка")

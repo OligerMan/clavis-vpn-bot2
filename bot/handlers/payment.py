@@ -8,7 +8,7 @@ from database import get_db_session
 from database.models import User, Transaction
 from services import SubscriptionService, KeyService
 from message_templates import Messages
-from bot.keyboards.markups import payment_plans_keyboard, platform_menu_keyboard
+from bot.keyboards.markups import payment_plans_keyboard, key_actions_keyboard, payment_confirmation_keyboard
 from config.settings import PLANS, ADMIN_IDS, SUBSCRIPTION_BASE_URL, DEVICE_LIMIT
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,7 @@ def register_payment_handlers(bot: TeleBot) -> None:
                     Messages.PAYMENT_PENDING.format(transaction_id=transaction.id),
                     call.message.chat.id,
                     call.message.id,
+                    reply_markup=payment_confirmation_keyboard(transaction.id),
                     parse_mode='Markdown'
                 )
 
@@ -79,6 +80,33 @@ def register_payment_handlers(bot: TeleBot) -> None:
 
         except Exception as e:
             logger.error(f"Error in plan selection callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
+            bot.send_message(call.message.chat.id, Messages.ERROR_GENERIC)
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mock_pay_'))
+    def handle_mock_payment(call: CallbackQuery):
+        """Handle mock payment button - simulates successful payment."""
+        try:
+            # Extract transaction ID from callback data
+            transaction_id = int(call.data.split('_')[2])
+
+            # Process payment
+            success = handle_payment_webhook(bot, transaction_id, 'success')
+
+            if success:
+                bot.answer_callback_query(call.id, "✅ Оплата успешна!")
+                # Message is already updated by handle_payment_webhook
+            else:
+                bot.answer_callback_query(call.id, "❌ Ошибка обработки платежа")
+                bot.edit_message_text(
+                    f"❌ Ошибка при обработке транзакции {transaction_id}.\n\nОбратитесь в поддержку: /help",
+                    call.message.chat.id,
+                    call.message.id,
+                    parse_mode='Markdown'
+                )
+
+        except Exception as e:
+            logger.error(f"Error in mock payment callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Произошла ошибка")
             bot.send_message(call.message.chat.id, Messages.ERROR_GENERIC)
 
@@ -173,30 +201,59 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
 
                 days = plan['days']
 
+                # Check if user has active subscription before extending
+                existing_sub = SubscriptionService.get_active_subscription(db, user)
+                is_upgrade_from_test = existing_sub and existing_sub.is_test
+                is_new_subscription = not existing_sub
+
                 # Create or extend subscription
                 subscription = SubscriptionService.create_or_extend_paid_subscription(
                     db, user, days, transaction_id
                 )
 
-                # If upgrading from test, delete test keys
-                if subscription.is_test:
-                    KeyService.delete_subscription_keys(db, subscription)
+                # Check if subscription has active keys
+                from database.models import Key
+                active_keys_count = db.query(Key).filter(
+                    Key.subscription_id == subscription.id,
+                    Key.is_active == True
+                ).count()
 
-                # Create new paid keys
-                try:
-                    KeyService.create_subscription_keys(db, subscription, user.telegram_id)
-                except ValueError as e:
-                    logger.error(f"Error creating keys for transaction {transaction_id}: {e}")
-                    bot.send_message(
-                        user.telegram_id,
-                        Messages.ERROR_KEY_CREATION
-                    )
-                    return False
+                # Handle keys based on subscription state
+                if is_new_subscription or active_keys_count == 0:
+                    # Create new keys for new subscription or if no keys exist
+                    try:
+                        KeyService.create_subscription_keys(db, subscription, user.telegram_id)
+                        logger.info(f"Created new keys for subscription {subscription.id}")
+                    except ValueError as e:
+                        logger.error(f"Error creating keys for transaction {transaction_id}: {e}")
+                        bot.send_message(
+                            user.telegram_id,
+                            Messages.ERROR_KEY_CREATION
+                        )
+                        return False
+                else:
+                    # Update expiry time for existing keys (upgrade from test or extend paid)
+                    try:
+                        updated_count = KeyService.update_subscription_keys_expiry(db, subscription)
+                        logger.info(f"Updated expiry for {updated_count} keys in subscription {subscription.id}")
+                    except ValueError as e:
+                        logger.error(f"Error updating keys for transaction {transaction_id}: {e}")
+                        bot.send_message(
+                            user.telegram_id,
+                            Messages.ERROR_KEY_CREATION
+                        )
+                        return False
 
                 # Mark transaction as completed
                 transaction.complete()
                 transaction.subscription_id = subscription.id
                 db.commit()
+
+                # Invalidate subscription cache after key updates
+                from subscription.cache import invalidate_subscription_cache
+                if subscription.token:
+                    invalidate_subscription_cache(subscription.token)
+                    logger.info(f"Invalidated cache for subscription {subscription.id}")
 
                 # Generate subscription URL and deep link
                 subscription_url = SubscriptionService.get_subscription_url(
@@ -218,7 +275,7 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
                         expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M'),
                         device_limit=DEVICE_LIMIT
                     ),
-                    reply_markup=platform_menu_keyboard(),
+                    reply_markup=key_actions_keyboard(v2raytun_deeplink),
                     parse_mode='Markdown'
                 )
 

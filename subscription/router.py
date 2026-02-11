@@ -22,10 +22,12 @@ def _make_profile_title(subscription: Subscription) -> str:
     """Encode profile title in base64: format for v2ray clients.
 
     Format: "base64:<b64 encoded title>"
-    Title includes service name and short token for identification.
+    Title includes service name and subscription type indicator.
     """
-    token_short = subscription.token[:8] if subscription.token else "unknown"
-    title = f"Clavis VPN\n{token_short}"
+    if subscription.is_test:
+        title = "Clavis v2 (Тест)"
+    else:
+        title = "Clavis v2"
     encoded = base64.b64encode(title.encode("utf-8")).decode("utf-8")
     return f"base64:{encoded}"
 
@@ -61,10 +63,29 @@ async def get_subscription(token: str, request: Request) -> PlainTextResponse:
     if cached:
         logger.debug(f"Cache hit for token={token[:8]}...")
         body, token_short, expires_ts = cached
-        title = f"Clavis VPN\n{token_short}"
-        encoded_title = base64.b64encode(title.encode("utf-8")).decode("utf-8")
+
+        # Still need to get subscription for correct title and fresh expires_ts
+        try:
+            with get_db_session() as db:
+                subscription = db.query(Subscription).filter(
+                    Subscription.token == token
+                ).first()
+
+                if subscription:
+                    profile_title = _make_profile_title(subscription)
+                    # Use fresh expires_ts from database, not from cache
+                    expires_ts = int(subscription.expires_at.timestamp())
+                else:
+                    # Fallback if subscription not found (shouldn't happen)
+                    profile_title = "base64:Q2xhdmlzIHYy"  # "Clavis v2"
+                    # Keep cached expires_ts as fallback
+        except Exception:
+            # Fallback on DB error
+            profile_title = "base64:Q2xhdmlzIHYy"  # "Clavis v2"
+            # Keep cached expires_ts as fallback
+
         headers = {
-            "profile-title": f"base64:{encoded_title}",
+            "profile-title": profile_title,
             "profile-update-interval": "12",
             "subscription-userinfo": f"upload=0; download=0; total=0; expire={expires_ts}",
             "content-disposition": "inline",

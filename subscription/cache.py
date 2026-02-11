@@ -73,6 +73,21 @@ class TTLCache:
             # Add new entry
             self._cache[key] = (value, expiry_time)
 
+    def delete(self, key: str) -> bool:
+        """Delete specific key from cache.
+
+        Args:
+            key: Cache key to delete
+
+        Returns:
+            True if key was found and deleted, False otherwise
+        """
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                return True
+            return False
+
     def clear(self) -> None:
         """Clear all cache entries."""
         with self._lock:
@@ -154,6 +169,19 @@ def cache_subscription_response(token: str, response: str) -> None:
     """
     cache = _get_cache()
     cache.set(token, response)
+
+
+def invalidate_subscription_cache(token: str) -> bool:
+    """Invalidate cache for specific subscription token.
+
+    Args:
+        token: Subscription token to invalidate
+
+    Returns:
+        True if cache entry was found and deleted
+    """
+    cache = _get_cache()
+    return cache.delete(token)
 
 
 def clear_cache() -> None:
