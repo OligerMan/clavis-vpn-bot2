@@ -214,6 +214,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
         bot.send_message(
             message.chat.id,
             "*Admin Commands*\n\n"
+            "*Server management:*\n"
             "`/servers` — list all servers with status and config\n"
             "`/add_server` — add server (dialog: name → domain → auto-setup)\n"
             "`/check_server <id>` — health check (version, uptime, clients)\n"
@@ -221,7 +222,9 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "`/delete_server <id>` — delete server (force delete if keys exist)\n"
             "\n*User management:*\n"
             "`/manage_user <tg_id>` — user info, keys, subscription, actions\n"
-            "\n`/admin_help` — this message",
+            "\n*Other:*\n"
+            "`/check_reminders` — manually run subscription expiry check\n"
+            "`/admin_help` — this message",
             parse_mode='Markdown'
         )
 
@@ -1127,6 +1130,37 @@ You can now start testing from scratch with /start"""
 
         except Exception as e:
             logger.error(f"Error in /delete_admin: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"❌ Error: {e}")
+
+    # ── /check_reminders ──────────────────────────────────────
+    @bot.message_handler(commands=['check_reminders'])
+    def handle_check_reminders(message: Message):
+        """Manually trigger subscription reminder check."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            bot.send_message(message.chat.id, "🔄 Running subscription check...")
+
+            from services import NotificationService
+            with get_db_session() as db:
+                sent_counts = NotificationService.check_and_send_reminders(db, bot)
+
+            summary = (
+                f"✅ **Reminder check completed**\n\n"
+                f"Sent notifications:\n"
+                f"• 7 days: {sent_counts['7d']}\n"
+                f"• 3 days: {sent_counts['3d']}\n"
+                f"• 1 day: {sent_counts['1d']}\n"
+                f"• Expired: {sent_counts['expired']}\n"
+                f"\nTotal: {sum(sent_counts.values())}"
+            )
+
+            bot.send_message(message.chat.id, summary, parse_mode='Markdown')
+            logger.info(f"Manual reminder check triggered by admin {message.from_user.id}: {sent_counts}")
+
+        except Exception as e:
+            logger.error(f"Error in /check_reminders: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"❌ Error: {e}")
 
     logger.info("Admin handlers registered")
