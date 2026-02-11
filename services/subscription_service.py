@@ -46,6 +46,11 @@ class SubscriptionService:
         db.commit()
         db.refresh(subscription)
 
+        # Invalidate cache for new subscription
+        from subscription.cache import invalidate_subscription_cache
+        if subscription.token:
+            invalidate_subscription_cache(subscription.token)
+
         return subscription
 
     @staticmethod
@@ -123,8 +128,18 @@ class SubscriptionService:
 
             # Add days to current expiry
             active_sub.expires_at = active_sub.expires_at + timedelta(days=days)
+
+            # Reset renewal reminder flags
+            active_sub.reset_reminder_flags()
+
             db.commit()
             db.refresh(active_sub)
+
+            # Invalidate cache after extending
+            from subscription.cache import invalidate_subscription_cache
+            if active_sub.token:
+                invalidate_subscription_cache(active_sub.token)
+
             return active_sub
 
         # Check for expired paid subscription
@@ -138,8 +153,18 @@ class SubscriptionService:
             # Extend from now
             expired_sub.is_active = True
             expired_sub.expires_at = datetime.utcnow() + timedelta(days=days)
+
+            # Reset renewal reminder flags
+            expired_sub.reset_reminder_flags()
+
             db.commit()
             db.refresh(expired_sub)
+
+            # Invalidate cache after reactivating
+            from subscription.cache import invalidate_subscription_cache
+            if expired_sub.token:
+                invalidate_subscription_cache(expired_sub.token)
+
             return expired_sub
 
         # Create new paid subscription
@@ -156,6 +181,11 @@ class SubscriptionService:
         db.add(subscription)
         db.commit()
         db.refresh(subscription)
+
+        # Invalidate cache for new subscription
+        from subscription.cache import invalidate_subscription_cache
+        if subscription.token:
+            invalidate_subscription_cache(subscription.token)
 
         return subscription
 

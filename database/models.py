@@ -58,6 +58,12 @@ class Subscription(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    # Renewal reminder tracking
+    reminder_7d_sent = Column(Boolean, default=False)
+    reminder_3d_sent = Column(Boolean, default=False)
+    reminder_1d_sent = Column(Boolean, default=False)
+    expiry_notified = Column(Boolean, default=False)
+
     # Relationships
     user = relationship("User", back_populates="subscriptions")
     keys = relationship("Key", back_populates="subscription", cascade="all, delete-orphan")
@@ -80,6 +86,13 @@ class Subscription(Base):
     def get_subscription_url(self, base_url: str) -> str:
         """Generate full subscription URL."""
         return f"{base_url.rstrip('/')}/sub/{self.token}"
+
+    def reset_reminder_flags(self) -> None:
+        """Reset all renewal reminder flags (call when subscription is extended)."""
+        self.reminder_7d_sent = False
+        self.reminder_3d_sent = False
+        self.reminder_1d_sent = False
+        self.expiry_notified = False
 
 
 @event.listens_for(Subscription, "before_insert")

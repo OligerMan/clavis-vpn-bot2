@@ -2,12 +2,12 @@
 
 import logging
 import sys
-import threading
-import time
 
-from database import init_db
-from bot import register_handlers, start_polling
-from subscription import start_subscription_server
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from database import init_db, get_db_session
+from bot import register_handlers, start_polling, get_bot
+from services import NotificationService
 
 
 def setup_logging():
@@ -20,6 +20,19 @@ def setup_logging():
             logging.FileHandler('clavis_vpn_bot.log', encoding='utf-8')
         ]
     )
+
+
+def check_subscriptions_job():
+    """Periodic job to check subscriptions and send renewal reminders."""
+    logger = logging.getLogger(__name__)
+    try:
+        with get_db_session() as db:
+            bot = get_bot()
+            sent_counts = NotificationService.check_and_send_reminders(db, bot)
+            if sum(sent_counts.values()) > 0:
+                logger.info(f"Renewal check completed: {sent_counts}")
+    except Exception as e:
+        logger.error(f"Error in subscription check job: {e}", exc_info=True)
 
 
 def main():
@@ -37,21 +50,16 @@ def main():
         logger.info("Initializing database...")
         init_db()
 
-        # Start subscription server in background thread
-        logger.info("Starting subscription server in background thread...")
-        subscription_thread = threading.Thread(
-            target=start_subscription_server,
-            daemon=True,
-            name="SubscriptionServer"
-        )
-        subscription_thread.start()
-
-        # Wait for server to start (give it 2 seconds)
-        logger.info("Waiting for subscription server to start...")
-        time.sleep(2)
-
         # Register all handlers
         register_handlers()
+
+        # Start scheduler for renewal reminders
+        logger.info("Starting renewal reminder scheduler...")
+        scheduler = BackgroundScheduler()
+        # Run every hour
+        scheduler.add_job(check_subscriptions_job, 'interval', hours=1, id='subscription_check')
+        scheduler.start()
+        logger.info("Scheduler started (checking subscriptions every hour)")
 
         # Start polling (blocks main thread)
         start_polling()

@@ -25,6 +25,11 @@ apihelper.ENABLE_MIDDLEWARE = True
 bot = TeleBot(BOT_TOKEN, parse_mode='Markdown')
 
 
+def get_bot() -> TeleBot:
+    """Get the bot instance."""
+    return bot
+
+
 def register_handlers() -> None:
     """Register all bot handlers and middlewares."""
     logger.info("Registering bot handlers...")
