@@ -5,6 +5,8 @@ import logging
 import random
 import secrets
 import subprocess
+from datetime import datetime, timedelta
+from typing import Optional
 
 from py3xui import Api, Inbound
 from py3xui.inbound import Settings, Sniffing, StreamSettings
@@ -12,8 +14,9 @@ from telebot import TeleBot
 from telebot.types import Message, CallbackQuery, ForceReply, InlineKeyboardMarkup, InlineKeyboardButton
 
 from database import get_db_session
-from database.models import Server
+from database.models import Server, User, Subscription, Key, Transaction
 from config.settings import ADMIN_IDS
+from services import KeyService
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +26,9 @@ DEFAULT_XUI_PASSWORD = "c7j274yeoq2"
 DEFAULT_XUI_PANEL_PORT = 2053
 DEFAULT_XUI_BASE_PATH = "/dashboard/"
 
-# Temporary storage for add_server dialog state per chat_id
+# Temporary storage for dialog state per chat_id
 _add_server_state = {}
+_manage_user_state = {}  # {chat_id: {"step": ..., "telegram_id": ..., ...}}
 
 
 def is_admin(telegram_id: int) -> bool:
@@ -215,6 +219,8 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "`/check_server <id>` — health check (version, uptime, clients)\n"
             "`/toggle_server <id>` — enable/disable server\n"
             "`/delete_server <id>` — delete server (force delete if keys exist)\n"
+            "\n*User management:*\n"
+            "`/manage_user <tg_id>` — user info, keys, subscription, actions\n"
             "\n`/admin_help` — this message",
             parse_mode='Markdown'
         )
@@ -748,5 +754,379 @@ def register_admin_handlers(bot: TeleBot) -> None:
         """Cancel server deletion."""
         bot.answer_callback_query(call.id, "Cancelled")
         bot.edit_message_text("Deletion cancelled.", call.message.chat.id, call.message.id)
+
+    # ── /manage_user ──────────────────────────────────────────
+    def _format_user_info(db, telegram_id: int) -> tuple[str, Optional[User]]:
+        """Build user info text. Returns (text, user_or_None)."""
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        if not user:
+            return f"User with Telegram ID `{telegram_id}` not found.", None
+
+        lines = [
+            f"*User Management*\n",
+            f"*Telegram ID:* `{user.telegram_id}`",
+            f"*Username:* @{user.username}" if user.username else "*Username:* —",
+            f"*Registered:* {user.created_at.strftime('%d.%m.%Y %H:%M')}",
+        ]
+
+        # Active subscription
+        sub = db.query(Subscription).filter(
+            Subscription.user_id == user.id,
+            Subscription.is_active == True,
+            Subscription.expires_at > datetime.utcnow()
+        ).first()
+
+        if sub:
+            days_left = (sub.expires_at - datetime.utcnow()).days
+            sub_type = "Test" if sub.is_test else "Paid"
+            active_keys = db.query(Key).filter(
+                Key.subscription_id == sub.id,
+                Key.is_active == True
+            ).count()
+            key_servers = db.query(Key.server_id).filter(
+                Key.subscription_id == sub.id,
+                Key.is_active == True
+            ).distinct().all()
+            server_names = []
+            for (sid,) in key_servers:
+                srv = db.query(Server).filter(Server.id == sid).first()
+                if srv:
+                    server_names.append(srv.name)
+
+            lines.append(f"\n*Subscription (id={sub.id}):*")
+            lines.append(f"  Type: {sub_type}")
+            lines.append(f"  Token: `{sub.token[:8]}...`")
+            lines.append(f"  Expires: {sub.expires_at.strftime('%d.%m.%Y %H:%M')}")
+            lines.append(f"  Days left: {days_left}")
+            lines.append(f"  Keys: {active_keys} on {', '.join(server_names) if server_names else '—'}")
+        else:
+            # Check for any subscription (expired)
+            any_sub = db.query(Subscription).filter(
+                Subscription.user_id == user.id
+            ).order_by(Subscription.created_at.desc()).first()
+            if any_sub:
+                lines.append(f"\n*Subscription (id={any_sub.id}):*")
+                lines.append(f"  Type: {'Test' if any_sub.is_test else 'Paid'}")
+                lines.append(f"  Status: EXPIRED ({any_sub.expires_at.strftime('%d.%m.%Y %H:%M')})")
+            else:
+                lines.append("\n*Subscription:* None")
+
+        # Has used test
+        has_test = db.query(Subscription).filter(
+            Subscription.user_id == user.id,
+            Subscription.is_test == True
+        ).first() is not None
+        lines.append(f"*Test used:* {'Yes' if has_test else 'No'}")
+
+        # Last transaction
+        tx = db.query(Transaction).filter(
+            Transaction.user_id == user.id
+        ).order_by(Transaction.created_at.desc()).first()
+        if tx:
+            lines.append(f"\n*Last transaction (id={tx.id}):*")
+            lines.append(f"  Plan: `{tx.plan}` | Amount: {tx.amount_rub}₽")
+            lines.append(f"  Status: `{tx.status}`")
+            lines.append(f"  Date: {tx.created_at.strftime('%d.%m.%Y %H:%M')}")
+
+        return "\n".join(lines), user
+
+    def _manage_user_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+        """Build inline keyboard for user management."""
+        kb = InlineKeyboardMarkup()
+        kb.row(InlineKeyboardButton("Refresh keys", callback_data=f"mu_refresh_{telegram_id}"))
+        kb.row(InlineKeyboardButton("Adjust time", callback_data=f"mu_time_{telegram_id}"))
+        kb.row(InlineKeyboardButton("Reset test period", callback_data=f"mu_resettest_{telegram_id}"))
+        return kb
+
+    @bot.message_handler(commands=['manage_user'])
+    def handle_manage_user(message: Message):
+        """Show user info and management buttons. Usage: /manage_user <telegram_id>"""
+        if not is_admin(message.from_user.id):
+            return
+
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.send_message(message.chat.id, "Usage: `/manage_user <telegram_id>`", parse_mode='Markdown')
+            return
+
+        try:
+            tg_id = int(parts[1])
+        except ValueError:
+            bot.send_message(message.chat.id, "Invalid Telegram ID")
+            return
+
+        try:
+            with get_db_session() as db:
+                text, user = _format_user_info(db, tg_id)
+                if not user:
+                    bot.send_message(message.chat.id, text, parse_mode='Markdown')
+                    return
+
+                bot.send_message(
+                    message.chat.id,
+                    text,
+                    reply_markup=_manage_user_keyboard(tg_id),
+                    parse_mode='Markdown'
+                )
+        except Exception as e:
+            logger.error(f"Error in /manage_user: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── Refresh keys callback ─────────────────────────────────
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_refresh_'))
+    def handle_mu_refresh(call: CallbackQuery):
+        """Delete old keys, create new ones on a random server."""
+        if not is_admin(call.from_user.id):
+            return
+
+        tg_id = int(call.data.replace('mu_refresh_', ''))
+        bot.answer_callback_query(call.id, "Refreshing keys...")
+
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == tg_id).first()
+                if not user:
+                    bot.send_message(call.message.chat.id, "User not found")
+                    return
+
+                sub = db.query(Subscription).filter(
+                    Subscription.user_id == user.id,
+                    Subscription.is_active == True,
+                    Subscription.expires_at > datetime.utcnow()
+                ).first()
+
+                if not sub:
+                    bot.send_message(call.message.chat.id, "No active subscription to refresh keys for.")
+                    return
+
+                # Delete ALL keys (active AND inactive) from x-ui and DB
+                # This handles stale keys that were marked inactive in DB
+                # but still exist on the panel
+                all_keys = db.query(Key).filter(
+                    Key.subscription_id == sub.id
+                ).all()
+
+                from vpn.xui_client import XUIClient
+                for key in all_keys:
+                    if key.server_id:
+                        server = db.query(Server).filter(Server.id == key.server_id).first()
+                        if server:
+                            try:
+                                client = XUIClient(server)
+                                client.delete_key(key)
+                            except Exception as e:
+                                logger.warning(f"Failed to delete key {key.remote_key_id} from server: {e}")
+                    key.is_active = False
+                db.commit()
+
+                # Create new keys
+                keys = KeyService.create_subscription_keys(db, sub, user.telegram_id)
+
+                server_name = "unknown"
+                if keys and keys[0].server_id:
+                    srv = db.query(Server).filter(Server.id == keys[0].server_id).first()
+                    if srv:
+                        server_name = srv.name
+
+                # Refresh the info message
+                text, _ = _format_user_info(db, tg_id)
+                bot.edit_message_text(
+                    text + f"\n\n_Keys refreshed. New server: {server_name}_",
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=_manage_user_keyboard(tg_id),
+                    parse_mode='Markdown'
+                )
+
+        except Exception as e:
+            logger.error(f"Error refreshing keys: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error refreshing keys: {e}")
+
+    # ── Adjust time callback (starts dialog) ──────────────────
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_time_'))
+    def handle_mu_time(call: CallbackQuery):
+        """Start dialog to adjust subscription time."""
+        if not is_admin(call.from_user.id):
+            return
+
+        tg_id = int(call.data.replace('mu_time_', ''))
+        bot.answer_callback_query(call.id)
+
+        msg = bot.send_message(
+            call.message.chat.id,
+            f"Enter hours to add/subtract for user `{tg_id}`.\n"
+            f"Positive = add time, negative = reduce time.\n"
+            f"Example: `48` or `-24`",
+            parse_mode='Markdown',
+        )
+        bot.register_next_step_handler(msg, _process_adjust_time, tg_id)
+
+    def _process_adjust_time(message: Message, tg_id: int):
+        """Process the hours input for time adjustment."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            hours = int(message.text.strip())
+        except (ValueError, AttributeError):
+            bot.send_message(message.chat.id, "Invalid number. Cancelled.")
+            return
+
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == tg_id).first()
+                if not user:
+                    bot.send_message(message.chat.id, "User not found")
+                    return
+
+                sub = db.query(Subscription).filter(
+                    Subscription.user_id == user.id,
+                    Subscription.is_active == True,
+                ).order_by(Subscription.created_at.desc()).first()
+
+                if not sub:
+                    bot.send_message(message.chat.id, "No active subscription found.")
+                    return
+
+                old_expiry = sub.expires_at
+                sub.expires_at = sub.expires_at + timedelta(hours=hours)
+                db.commit()
+
+                sign = "+" if hours >= 0 else ""
+                bot.send_message(
+                    message.chat.id,
+                    f"Subscription adjusted for user `{tg_id}`:\n"
+                    f"  {sign}{hours}h\n"
+                    f"  Old expiry: {old_expiry.strftime('%d.%m.%Y %H:%M')}\n"
+                    f"  New expiry: {sub.expires_at.strftime('%d.%m.%Y %H:%M')}",
+                    parse_mode='Markdown'
+                )
+
+        except Exception as e:
+            logger.error(f"Error adjusting time: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── Reset test period callback ────────────────────────────
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_resettest_'))
+    def handle_mu_resettest(call: CallbackQuery):
+        """Reset test period — delete all test subscriptions so user can get a new test."""
+        if not is_admin(call.from_user.id):
+            return
+
+        tg_id = int(call.data.replace('mu_resettest_', ''))
+        bot.answer_callback_query(call.id)
+
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == tg_id).first()
+                if not user:
+                    bot.send_message(call.message.chat.id, "User not found")
+                    return
+
+                test_subs = db.query(Subscription).filter(
+                    Subscription.user_id == user.id,
+                    Subscription.is_test == True
+                ).all()
+
+                if not test_subs:
+                    bot.edit_message_text(
+                        "User never had a test subscription.",
+                        call.message.chat.id,
+                        call.message.id
+                    )
+                    return
+
+                count = 0
+                for sub in test_subs:
+                    # Delete keys from VPN servers
+                    KeyService.delete_subscription_keys(db, sub)
+                    db.delete(sub)
+                    count += 1
+                db.commit()
+
+                text, _ = _format_user_info(db, tg_id)
+                bot.edit_message_text(
+                    text + f"\n\n_Test period reset. {count} test subscription(s) deleted._",
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=_manage_user_keyboard(tg_id),
+                    parse_mode='Markdown'
+                )
+
+        except Exception as e:
+            logger.error(f"Error resetting test: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: {e}")
+
+    @bot.message_handler(commands=['delete_admin'])
+    def handle_delete_admin(message: Message):
+        """Delete admin user and all related data for testing."""
+        if not is_admin(message.from_user.id):
+            bot.send_message(message.chat.id, "❌ Access denied")
+            return
+
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(
+                    User.telegram_id == message.from_user.id
+                ).first()
+
+                if not user:
+                    bot.send_message(message.chat.id, "✅ User not found (already deleted)")
+                    return
+
+                # Get all keys for deletion from x-ui
+                keys = db.query(Key).filter(Key.subscription_id.in_(
+                    db.query(Subscription.id).filter(Subscription.user_id == user.id)
+                )).all()
+
+                deleted_from_xui = 0
+                failed_xui = 0
+
+                # Delete keys from x-ui panels
+                for key in keys:
+                    try:
+                        from vpn.xui_client import XUIClient
+                        client = XUIClient(key.server)
+                        client.delete_key(key)
+                        deleted_from_xui += 1
+                        logger.info(f"Deleted key {key.remote_key_id} from server {key.server.name}")
+                    except Exception as e:
+                        failed_xui += 1
+                        logger.warning(f"Failed to delete key {key.remote_key_id}: {e}")
+
+                # Delete from database
+                deleted_keys = db.query(Key).filter(Key.subscription_id.in_(
+                    db.query(Subscription.id).filter(Subscription.user_id == user.id)
+                )).delete(synchronize_session=False)
+
+                deleted_transactions = db.query(Transaction).filter(
+                    Transaction.user_id == user.id
+                ).delete()
+
+                deleted_subs = db.query(Subscription).filter(
+                    Subscription.user_id == user.id
+                ).delete()
+
+                # Delete user
+                db.delete(user)
+                db.commit()
+
+                message_text = f"""✅ **Admin user deleted successfully**
+
+**Deleted:**
+• User: {message.from_user.id}
+• Keys from x-ui: {deleted_from_xui} (failed: {failed_xui})
+• Keys from DB: {deleted_keys}
+• Transactions: {deleted_transactions}
+• Subscriptions: {deleted_subs}
+
+You can now start testing from scratch with /start"""
+
+                bot.send_message(message.chat.id, message_text, parse_mode='Markdown')
+                logger.info(f"Admin {message.from_user.id} deleted themselves via /delete_admin")
+
+        except Exception as e:
+            logger.error(f"Error in /delete_admin: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"❌ Error: {e}")
 
     logger.info("Admin handlers registered")
