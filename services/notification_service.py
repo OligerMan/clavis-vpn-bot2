@@ -57,19 +57,23 @@ class NotificationService:
                     sub.expiry_notified = True
                     sent_counts['expired'] += 1
 
-                # Check 1 day reminder
+                # Skip renewal reminders for test subscriptions (only notify when expired)
+                elif sub.is_test:
+                    continue
+
+                # Check 1 day reminder (paid only)
                 elif 0 < days_left <= 1 and not sub.reminder_1d_sent:
                     NotificationService._send_reminder(bot, user, sub, 1)
                     sub.reminder_1d_sent = True
                     sent_counts['1d'] += 1
 
-                # Check 3 day reminder
+                # Check 3 day reminder (paid only)
                 elif 1 < days_left <= 3 and not sub.reminder_3d_sent:
                     NotificationService._send_reminder(bot, user, sub, 3)
                     sub.reminder_3d_sent = True
                     sent_counts['3d'] += 1
 
-                # Check 7 day reminder
+                # Check 7 day reminder (paid only)
                 elif 3 < days_left <= 7 and not sub.reminder_7d_sent:
                     NotificationService._send_reminder(bot, user, sub, 7)
                     sub.reminder_7d_sent = True
@@ -114,7 +118,11 @@ class NotificationService:
         """Send subscription expiry notification to user."""
         expiry_str = subscription.expires_at.strftime('%d.%m.%Y %H:%M')
 
-        message = Messages.SUBSCRIPTION_EXPIRED.format(expiry_date=expiry_str)
+        # Use different message for test subscriptions
+        if subscription.is_test:
+            message = Messages.TEST_SUBSCRIPTION_EXPIRED.format(expiry_date=expiry_str)
+        else:
+            message = Messages.SUBSCRIPTION_EXPIRED.format(expiry_date=expiry_str)
 
         bot.send_message(
             user.telegram_id,
@@ -122,4 +130,5 @@ class NotificationService:
             parse_mode='Markdown'
         )
 
-        logger.info(f"Sent expiry notification to user {user.telegram_id} for subscription {subscription.id}")
+        sub_type = "test" if subscription.is_test else "paid"
+        logger.info(f"Sent expiry notification ({sub_type}) to user {user.telegram_id} for subscription {subscription.id}")

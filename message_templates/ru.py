@@ -168,6 +168,13 @@ class Messages:
 Чтобы возобновить доступ, купите новую подписку:
 /payment"""
 
+    TEST_SUBSCRIPTION_EXPIRED = """⏰ Тестовый период закончился
+
+Ваш 48-часовой тест истёк {expiry_date}.
+
+Понравилось? Купите подписку со скидкой:
+/payment"""
+
     SUPPORT_MESSAGE = """❓ **Помощь и поддержка**
 
 **Ваш Telegram ID:** `{telegram_id}`
