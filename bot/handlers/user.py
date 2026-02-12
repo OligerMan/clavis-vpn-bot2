@@ -364,7 +364,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                     ),
                     call.message.chat.id,
                     call.message.id,
-                    reply_markup=platform_menu_keyboard(),
+                    reply_markup=key_actions_keyboard(v2raytun_deeplink),
                     parse_mode='Markdown'
                 )
 
