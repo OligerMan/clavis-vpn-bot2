@@ -238,13 +238,19 @@ def android_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboa
     return keyboard
 
 
-def ios_instructions_keyboard() -> InlineKeyboardMarkup:
+def ios_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboardMarkup:
     """Generate simplified iOS instructions keyboard."""
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
         InlineKeyboardButton("📥 Скачать v2rayTun", url="https://apps.apple.com/ru/app/v2raytun/id6476628951")
     )
+
+    if v2raytun_deeplink:
+        keyboard.row(
+            InlineKeyboardButton("🚀 Подключить", url=v2raytun_deeplink)
+        )
+
     keyboard.row(
         InlineKeyboardButton("📚 Другие варианты подключения", callback_data="ios_detailed")
     )
@@ -255,13 +261,19 @@ def ios_instructions_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
-def windows_instructions_keyboard() -> InlineKeyboardMarkup:
+def windows_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboardMarkup:
     """Generate simplified Windows instructions keyboard."""
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
         InlineKeyboardButton("📥 Скачать v2rayTun", url="https://github.com/mdf45/v2raytun/releases")
     )
+
+    if v2raytun_deeplink:
+        keyboard.row(
+            InlineKeyboardButton("🚀 Подключить", url=v2raytun_deeplink)
+        )
+
     keyboard.row(
         InlineKeyboardButton("📚 Другие варианты подключения", callback_data="windows_detailed")
     )
@@ -272,13 +284,19 @@ def windows_instructions_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
-def macos_instructions_keyboard() -> InlineKeyboardMarkup:
+def macos_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboardMarkup:
     """Generate simplified macOS instructions keyboard."""
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
         InlineKeyboardButton("📥 Скачать v2rayTun", url="https://apps.apple.com/ru/app/v2raytun/id6476628951")
     )
+
+    if v2raytun_deeplink:
+        keyboard.row(
+            InlineKeyboardButton("🚀 Подключить", url=v2raytun_deeplink)
+        )
+
     keyboard.row(
         InlineKeyboardButton("📚 Другие варианты подключения", callback_data="macos_detailed")
     )
