@@ -4,19 +4,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
-# Import DATABASE_URL from config
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# Extract database path from DATABASE_URL
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///data/clavis.db')
-if DATABASE_URL.startswith('sqlite:///'):
-    DB_PATH = Path(DATABASE_URL.replace('sqlite:///', ''))
-else:
-    print("Error: This migration script only supports SQLite databases")
-    sys.exit(1)
+# Database path (hardcoded in database/connection.py)
+DB_PATH = Path("data/clavis.db")
 
 
 def migrate():
