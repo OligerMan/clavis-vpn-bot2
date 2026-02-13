@@ -207,99 +207,99 @@ def payment_confirmation_keyboard(transaction_id: int) -> InlineKeyboardMarkup:
     return keyboard
 
 
-def android_instructions_keyboard() -> InlineKeyboardMarkup:
+def android_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboardMarkup:
     """
-    Generate Android instructions keyboard with download buttons.
+    Generate simplified Android instructions keyboard.
 
     Buttons:
-    - Google Play
-    - GitHub
-    - Клиент скачан, добавить подписку
-    - Назад в меню
+    - Download v2rayTun
+    - Connect button (if deeplink provided)
+    - Other connection methods
+    - Back
     """
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
-        InlineKeyboardButton("📥 Google Play", url="https://play.google.com/store/apps/details?id=com.v2raytun.android"),
-        InlineKeyboardButton("📥 GitHub", url="https://github.com/DigneZzZ/v2raytun/releases")
+        InlineKeyboardButton("📥 Скачать v2rayTun", url="https://play.google.com/store/apps/details?id=com.v2raytun.android")
+    )
+
+    if v2raytun_deeplink:
+        keyboard.row(
+            InlineKeyboardButton("🚀 Подключить", url=v2raytun_deeplink)
+        )
+
+    keyboard.row(
+        InlineKeyboardButton("📚 Другие варианты подключения", callback_data="android_detailed")
     )
     keyboard.row(
-        InlineKeyboardButton("✅ Клиент скачан, добавить подписку", callback_data="add_subscription_to_client")
-    )
-    keyboard.row(
-        InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
+        InlineKeyboardButton("◀️ Назад", callback_data="show_platforms")
     )
 
     return keyboard
 
 
 def ios_instructions_keyboard() -> InlineKeyboardMarkup:
-    """
-    Generate iOS instructions keyboard with download buttons.
-
-    Buttons:
-    - App Store (v2rayTun)
-    - Клиент скачан, добавить подписку
-    - Назад в меню
-    """
+    """Generate simplified iOS instructions keyboard."""
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
-        InlineKeyboardButton("📥 Скачать v2rayTun (App Store)", url="https://apps.apple.com/ru/app/v2raytun/id6476628951")
+        InlineKeyboardButton("📥 Скачать v2rayTun", url="https://apps.apple.com/ru/app/v2raytun/id6476628951")
     )
     keyboard.row(
-        InlineKeyboardButton("✅ Клиент скачан, добавить подписку", callback_data="add_subscription_to_client")
+        InlineKeyboardButton("📚 Другие варианты подключения", callback_data="ios_detailed")
     )
     keyboard.row(
-        InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
+        InlineKeyboardButton("◀️ Назад", callback_data="show_platforms")
     )
 
     return keyboard
 
 
 def windows_instructions_keyboard() -> InlineKeyboardMarkup:
-    """
-    Generate Windows instructions keyboard with download button.
-
-    Buttons:
-    - GitHub (v2rayTun)
-    - Клиент скачан, добавить подписку
-    - Назад в меню
-    """
+    """Generate simplified Windows instructions keyboard."""
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
-        InlineKeyboardButton("📥 Скачать v2rayTun (GitHub)", url="https://github.com/mdf45/v2raytun/releases")
+        InlineKeyboardButton("📥 Скачать v2rayTun", url="https://github.com/mdf45/v2raytun/releases")
     )
     keyboard.row(
-        InlineKeyboardButton("✅ Клиент скачан, добавить подписку", callback_data="add_subscription_to_client")
+        InlineKeyboardButton("📚 Другие варианты подключения", callback_data="windows_detailed")
     )
     keyboard.row(
-        InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
+        InlineKeyboardButton("◀️ Назад", callback_data="show_platforms")
     )
 
     return keyboard
 
 
 def macos_instructions_keyboard() -> InlineKeyboardMarkup:
-    """
-    Generate macOS instructions keyboard with download button.
+    """Generate simplified macOS instructions keyboard."""
+    keyboard = InlineKeyboardMarkup()
 
-    Buttons:
-    - App Store (v2rayTun)
-    - Клиент скачан, добавить подписку
-    - Назад в меню
+    keyboard.row(
+        InlineKeyboardButton("📥 Скачать v2rayTun", url="https://apps.apple.com/ru/app/v2raytun/id6476628951")
+    )
+    keyboard.row(
+        InlineKeyboardButton("📚 Другие варианты подключения", callback_data="macos_detailed")
+    )
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад", callback_data="show_platforms")
+    )
+
+    return keyboard
+
+
+def detailed_instructions_keyboard(platform: str) -> InlineKeyboardMarkup:
+    """
+    Generate keyboard for detailed instructions with back button.
+
+    Args:
+        platform: Platform name (android, ios, windows, macos)
     """
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
-        InlineKeyboardButton("📥 Скачать v2rayTun (App Store)", url="https://apps.apple.com/ru/app/v2raytun/id6476628951")
-    )
-    keyboard.row(
-        InlineKeyboardButton("✅ Клиент скачан, добавить подписку", callback_data="add_subscription_to_client")
-    )
-    keyboard.row(
-        InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
+        InlineKeyboardButton("◀️ Назад к простой инструкции", callback_data=f"platform_{platform}")
     )
 
     return keyboard

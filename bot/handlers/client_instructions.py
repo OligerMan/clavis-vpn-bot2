@@ -12,7 +12,8 @@ from bot.keyboards.markups import (
     android_instructions_keyboard,
     ios_instructions_keyboard,
     windows_instructions_keyboard,
-    macos_instructions_keyboard
+    macos_instructions_keyboard,
+    detailed_instructions_keyboard
 )
 from config.settings import SUBSCRIPTION_BASE_URL
 
@@ -26,28 +27,40 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
     def handle_platform_selection(call: CallbackQuery):
         """Handle platform selection callbacks."""
         try:
-            # Map callback data to messages and keyboards
-            platform_map = {
-                'platform_android': (Messages.ANDROID_INSTRUCTIONS, android_instructions_keyboard()),
-                'platform_ios': (Messages.IOS_INSTRUCTIONS, ios_instructions_keyboard()),
-                'platform_windows': (Messages.WINDOWS_INSTRUCTIONS, windows_instructions_keyboard()),
-                'platform_macos': (Messages.MACOS_INSTRUCTIONS, macos_instructions_keyboard())
-            }
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == call.from_user.id).first()
 
-            platform_data = platform_map.get(call.data)
+                # Get v2rayTun deep link for Android
+                v2raytun_deeplink = None
+                if user and call.data == 'platform_android':
+                    subscription = SubscriptionService.get_active_subscription(db, user)
+                    if subscription:
+                        v2raytun_deeplink = SubscriptionService.get_v2raytun_deeplink(
+                            subscription, SUBSCRIPTION_BASE_URL
+                        )
 
-            if platform_data:
-                instruction_message, keyboard = platform_data
-                bot.edit_message_text(
-                    instruction_message,
-                    call.message.chat.id,
-                    call.message.id,
-                    reply_markup=keyboard,
-                    parse_mode='Markdown'
-                )
-                bot.answer_callback_query(call.id)
-            else:
-                bot.answer_callback_query(call.id, "Неизвестная платформа")
+                # Map callback data to messages and keyboards
+                platform_map = {
+                    'platform_android': (Messages.ANDROID_INSTRUCTIONS, android_instructions_keyboard(v2raytun_deeplink)),
+                    'platform_ios': (Messages.IOS_INSTRUCTIONS, ios_instructions_keyboard()),
+                    'platform_windows': (Messages.WINDOWS_INSTRUCTIONS, windows_instructions_keyboard()),
+                    'platform_macos': (Messages.MACOS_INSTRUCTIONS, macos_instructions_keyboard())
+                }
+
+                platform_data = platform_map.get(call.data)
+
+                if platform_data:
+                    instruction_message, keyboard = platform_data
+                    bot.edit_message_text(
+                        instruction_message,
+                        call.message.chat.id,
+                        call.message.id,
+                        reply_markup=keyboard,
+                        parse_mode='Markdown'
+                    )
+                    bot.answer_callback_query(call.id)
+                else:
+                    bot.answer_callback_query(call.id, "Неизвестная платформа")
 
         except Exception as e:
             logger.error(f"Error in platform selection callback: {e}", exc_info=True)
@@ -100,6 +113,36 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
 
         except Exception as e:
             logger.error(f"Error in add subscription to client callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data.endswith('_detailed'))
+    def handle_detailed_instructions(call: CallbackQuery):
+        """Handle detailed instructions callbacks."""
+        try:
+            detailed_map = {
+                'android_detailed': (Messages.ANDROID_INSTRUCTIONS_DETAILED, 'android'),
+                'ios_detailed': (Messages.IOS_INSTRUCTIONS_DETAILED, 'ios'),
+                'windows_detailed': (Messages.WINDOWS_INSTRUCTIONS_DETAILED, 'windows'),
+                'macos_detailed': (Messages.MACOS_INSTRUCTIONS_DETAILED, 'macos')
+            }
+
+            detailed_data = detailed_map.get(call.data)
+
+            if detailed_data:
+                message, platform = detailed_data
+                bot.edit_message_text(
+                    message,
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=detailed_instructions_keyboard(platform),
+                    parse_mode='Markdown'
+                )
+                bot.answer_callback_query(call.id)
+            else:
+                bot.answer_callback_query(call.id, "Неизвестная платформа")
+
+        except Exception as e:
+            logger.error(f"Error in detailed instructions callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Произошла ошибка")
 
     logger.info("Client instruction handlers registered")
