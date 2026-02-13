@@ -13,8 +13,8 @@ BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 # Subscription Base URL
 SUBSCRIPTION_BASE_URL = os.getenv('SUBSCRIPTION_BASE_URL', 'https://vpn.example.com')
 
-# Database URL
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///clavis_vpn.db')
+# Database URL (SQLite by default, can be PostgreSQL/MySQL for production)
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///data/clavis.db')
 
 # Admin Telegram IDs
 ADMIN_IDS: List[int] = [

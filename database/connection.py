@@ -1,6 +1,5 @@
 """Database connection and session management."""
 
-import os
 from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
@@ -8,38 +7,37 @@ from contextlib import contextmanager
 
 from .models import Base
 
-# Default database path (can be overridden via environment variable)
-DEFAULT_DB_PATH = Path(__file__).parent.parent / "data" / "clavis.db"
 
-
-def get_database_url(db_path: str | Path | None = None) -> str:
-    """Get SQLite database URL."""
-    if db_path is None:
-        db_path = os.environ.get("CLAVIS_DB_PATH", DEFAULT_DB_PATH)
-    return f"sqlite:///{db_path}"
-
-
-def create_db_engine(db_path: str | Path | None = None, echo: bool = False):
+def create_db_engine(database_url: str | None = None, echo: bool = False):
     """Create database engine.
 
     Args:
-        db_path: Path to SQLite database file. Uses default if not provided.
+        database_url: Database URL. If None, uses DATABASE_URL from config.
         echo: If True, log all SQL statements.
 
     Returns:
         SQLAlchemy engine instance.
     """
-    url = get_database_url(db_path)
+    if database_url is None:
+        from config.settings import DATABASE_URL
+        database_url = DATABASE_URL
 
-    # Ensure directory exists
-    if db_path is None:
-        db_path = DEFAULT_DB_PATH
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    # For SQLite databases, ensure directory exists
+    if database_url.startswith('sqlite:///'):
+        # Extract file path from URL (remove 'sqlite:///' prefix)
+        db_path = database_url.replace('sqlite:///', '')
+        if db_path and db_path != ':memory:':
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    connect_args = {}
+    if database_url.startswith('sqlite'):
+        # SQLite-specific: allow multi-threaded access
+        connect_args["check_same_thread"] = False
 
     return create_engine(
-        url,
+        database_url,
         echo=echo,
-        connect_args={"check_same_thread": False}  # Allow multi-threaded access
+        connect_args=connect_args
     )
 
 
@@ -68,16 +66,16 @@ def get_session_factory():
     return _SessionLocal
 
 
-def init_db(db_path: str | Path | None = None, echo: bool = False):
+def init_db(database_url: str | None = None, echo: bool = False):
     """Initialize database: create engine and all tables.
 
     Args:
-        db_path: Path to SQLite database file.
+        database_url: Database URL. If None, uses DATABASE_URL from config.
         echo: If True, log all SQL statements.
     """
     global _engine, _SessionLocal
 
-    _engine = create_db_engine(db_path, echo)
+    _engine = create_db_engine(database_url, echo)
     _SessionLocal = sessionmaker(
         autocommit=False,
         autoflush=False,
