@@ -336,7 +336,26 @@ def other_connection_methods_keyboard(platform: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton("📋 Вставить ссылку с подпиской", callback_data=f"clipboard_import_{platform}")
     )
     keyboard.row(
+        InlineKeyboardButton("🔑 Отдельные VLESS-ключи", callback_data=f"vless_keys_{platform}")
+    )
+    keyboard.row(
         InlineKeyboardButton("◀️ Назад к инструкции", callback_data=f"platform_{platform}")
+    )
+
+    return keyboard
+
+
+def vless_keys_keyboard(platform: str) -> InlineKeyboardMarkup:
+    """
+    Generate keyboard for VLESS keys page.
+
+    Args:
+        platform: Platform name (android, ios, windows, macos)
+    """
+    keyboard = InlineKeyboardMarkup()
+
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад", callback_data=f"{platform}_other_methods")
     )
 
     return keyboard

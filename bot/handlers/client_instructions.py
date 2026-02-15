@@ -5,7 +5,7 @@ from telebot import TeleBot
 from telebot.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from database import get_db_session
-from database.models import User
+from database.models import User, Key, Subscription, Server
 from services import SubscriptionService
 from message_templates import Messages
 from bot.keyboards.markups import (
@@ -15,7 +15,8 @@ from bot.keyboards.markups import (
     macos_instructions_keyboard,
     detailed_instructions_keyboard,
     other_connection_methods_keyboard,
-    clipboard_import_keyboard
+    clipboard_import_keyboard,
+    vless_keys_keyboard
 )
 from config.settings import SUBSCRIPTION_BASE_URL
 
@@ -241,6 +242,100 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
 
         except Exception as e:
             logger.error(f"Error in clipboard import callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('vless_keys_'))
+    def handle_vless_keys(call: CallbackQuery):
+        """Show individual VLESS keys from user's subscription."""
+        try:
+            platform = call.data.replace('vless_keys_', '')
+
+            platform_names = {
+                'android': 'Android',
+                'ios': 'iOS',
+                'windows': 'Windows',
+                'macos': 'macOS'
+            }
+
+            platform_name = platform_names.get(platform)
+            if not platform_name:
+                bot.answer_callback_query(call.id, "Неизвестная платформа")
+                return
+
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == call.from_user.id).first()
+                if not user:
+                    bot.answer_callback_query(call.id, "Пользователь не найден")
+                    return
+
+                subscription = SubscriptionService.get_active_subscription(db, user)
+                if not subscription:
+                    bot.edit_message_text(
+                        "❌ **Нет активной подписки**\n\n"
+                        "Оформите подписку, чтобы получить VLESS-ключи.",
+                        call.message.chat.id,
+                        call.message.id,
+                        reply_markup=vless_keys_keyboard(platform),
+                        parse_mode='Markdown'
+                    )
+                    bot.answer_callback_query(call.id)
+                    return
+
+                keys = db.query(Key).filter(
+                    Key.subscription_id == subscription.id,
+                    Key.is_active == True
+                ).all()
+
+                if not keys:
+                    bot.edit_message_text(
+                        "❌ **Ключи не найдены**\n\n"
+                        "Попробуйте обновить подписку через /key.",
+                        call.message.chat.id,
+                        call.message.id,
+                        reply_markup=vless_keys_keyboard(platform),
+                        parse_mode='Markdown'
+                    )
+                    bot.answer_callback_query(call.id)
+                    return
+
+                # Build message with keys
+                lines = [f"🔑 **Отдельные VLESS-ключи ({platform_name})**\n"]
+                lines.append(
+                    "Скопируйте ключ, откройте v2rayTun (или похожий клиент), "
+                    "нажмите **+** и выберите **\"Импорт из буфера обмена\"**.\n"
+                )
+
+                for i, key in enumerate(keys, 1):
+                    if not key.key_data or not key.key_data.startswith("vless://"):
+                        continue
+
+                    # Get server name
+                    server_name = f"Сервер {i}"
+                    if key.server_id:
+                        server = db.query(Server).filter(Server.id == key.server_id).first()
+                        if server:
+                            server_name = server.name
+
+                    lines.append(f"**{server_name}:**")
+                    lines.append(f"`{key.key_data}`\n")
+
+                message = "\n".join(lines)
+
+                # Telegram message limit is 4096 chars
+                if len(message) > 4096:
+                    message = message[:4090] + "\n..."
+
+            bot.edit_message_text(
+                message,
+                call.message.chat.id,
+                call.message.id,
+                reply_markup=vless_keys_keyboard(platform),
+                parse_mode='Markdown'
+            )
+            bot.answer_callback_query(call.id)
+
+        except Exception as e:
+            logger.error(f"Error in vless keys callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Произошла ошибка")
 
     logger.info("Client instruction handlers registered")
