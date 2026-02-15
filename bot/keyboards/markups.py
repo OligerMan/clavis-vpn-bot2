@@ -266,7 +266,7 @@ def windows_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboa
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
-        InlineKeyboardButton("📥 Скачать v2rayTun", url="https://github.com/mdf45/v2raytun/releases")
+        InlineKeyboardButton("📥 Скачать v2rayTun", url="https://github.com/mdf45/v2raytun/releases/download/v3.7.10/v2RayTun_Setup.exe")
     )
 
     if v2raytun_deeplink:
