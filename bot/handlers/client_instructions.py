@@ -13,7 +13,9 @@ from bot.keyboards.markups import (
     ios_instructions_keyboard,
     windows_instructions_keyboard,
     macos_instructions_keyboard,
-    detailed_instructions_keyboard
+    detailed_instructions_keyboard,
+    other_connection_methods_keyboard,
+    clipboard_import_keyboard
 )
 from config.settings import SUBSCRIPTION_BASE_URL
 
@@ -117,24 +119,25 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
 
     @bot.callback_query_handler(func=lambda call: call.data.endswith('_detailed'))
     def handle_detailed_instructions(call: CallbackQuery):
-        """Handle detailed instructions callbacks."""
+        """Handle 'other connection methods' menu - shows intermediate menu."""
         try:
-            detailed_map = {
-                'android_detailed': (Messages.ANDROID_INSTRUCTIONS_DETAILED, 'android'),
-                'ios_detailed': (Messages.IOS_INSTRUCTIONS_DETAILED, 'ios'),
-                'windows_detailed': (Messages.WINDOWS_INSTRUCTIONS_DETAILED, 'windows'),
-                'macos_detailed': (Messages.MACOS_INSTRUCTIONS_DETAILED, 'macos')
+            # Map platform to message and platform name
+            platform_map = {
+                'android_detailed': (Messages.OTHER_METHODS_ANDROID, 'android'),
+                'ios_detailed': (Messages.OTHER_METHODS_IOS, 'ios'),
+                'windows_detailed': (Messages.OTHER_METHODS_WINDOWS, 'windows'),
+                'macos_detailed': (Messages.OTHER_METHODS_MACOS, 'macos')
             }
 
-            detailed_data = detailed_map.get(call.data)
+            platform_data = platform_map.get(call.data)
 
-            if detailed_data:
-                message, platform = detailed_data
+            if platform_data:
+                message, platform = platform_data
                 bot.edit_message_text(
                     message,
                     call.message.chat.id,
                     call.message.id,
-                    reply_markup=detailed_instructions_keyboard(platform),
+                    reply_markup=other_connection_methods_keyboard(platform),
                     parse_mode='Markdown'
                 )
                 bot.answer_callback_query(call.id)
@@ -142,7 +145,73 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
                 bot.answer_callback_query(call.id, "Неизвестная платформа")
 
         except Exception as e:
-            logger.error(f"Error in detailed instructions callback: {e}", exc_info=True)
+            logger.error(f"Error in other connection methods callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data.endswith('_other_methods'))
+    def handle_back_to_other_methods(call: CallbackQuery):
+        """Handle back button to other connection methods menu."""
+        try:
+            # Extract platform from callback data (e.g., "android_other_methods" -> "android")
+            platform = call.data.replace('_other_methods', '')
+
+            # Map platform to message
+            message_map = {
+                'android': Messages.OTHER_METHODS_ANDROID,
+                'ios': Messages.OTHER_METHODS_IOS,
+                'windows': Messages.OTHER_METHODS_WINDOWS,
+                'macos': Messages.OTHER_METHODS_MACOS
+            }
+
+            message = message_map.get(platform)
+
+            if message:
+                bot.edit_message_text(
+                    message,
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=other_connection_methods_keyboard(platform),
+                    parse_mode='Markdown'
+                )
+                bot.answer_callback_query(call.id)
+            else:
+                bot.answer_callback_query(call.id, "Неизвестная платформа")
+
+        except Exception as e:
+            logger.error(f"Error in back to other methods callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('clipboard_import_'))
+    def handle_clipboard_import(call: CallbackQuery):
+        """Handle clipboard import instructions."""
+        try:
+            # Extract platform from callback data
+            platform = call.data.replace('clipboard_import_', '')
+
+            # Map platform to message
+            message_map = {
+                'android': Messages.CLIPBOARD_IMPORT_ANDROID,
+                'ios': Messages.CLIPBOARD_IMPORT_IOS,
+                'windows': Messages.CLIPBOARD_IMPORT_WINDOWS,
+                'macos': Messages.CLIPBOARD_IMPORT_MACOS
+            }
+
+            message = message_map.get(platform)
+
+            if message:
+                bot.edit_message_text(
+                    message,
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=clipboard_import_keyboard(platform),
+                    parse_mode='Markdown'
+                )
+                bot.answer_callback_query(call.id)
+            else:
+                bot.answer_callback_query(call.id, "Неизвестная платформа")
+
+        except Exception as e:
+            logger.error(f"Error in clipboard import callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Произошла ошибка")
 
     logger.info("Client instruction handlers registered")

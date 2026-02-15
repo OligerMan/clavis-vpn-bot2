@@ -323,6 +323,41 @@ def detailed_instructions_keyboard(platform: str) -> InlineKeyboardMarkup:
     return keyboard
 
 
+def other_connection_methods_keyboard(platform: str) -> InlineKeyboardMarkup:
+    """
+    Generate keyboard for other connection methods menu.
+
+    Args:
+        platform: Platform name (android, ios, windows, macos)
+    """
+    keyboard = InlineKeyboardMarkup()
+
+    keyboard.row(
+        InlineKeyboardButton("📋 Вставить ссылку с подпиской", callback_data=f"clipboard_import_{platform}")
+    )
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад к инструкции", callback_data=f"platform_{platform}")
+    )
+
+    return keyboard
+
+
+def clipboard_import_keyboard(platform: str) -> InlineKeyboardMarkup:
+    """
+    Generate keyboard for clipboard import instructions.
+
+    Args:
+        platform: Platform name (android, ios, windows, macos)
+    """
+    keyboard = InlineKeyboardMarkup()
+
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад", callback_data=f"{platform}_other_methods")
+    )
+
+    return keyboard
+
+
 def support_actions_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     """
     Generate support actions keyboard.
