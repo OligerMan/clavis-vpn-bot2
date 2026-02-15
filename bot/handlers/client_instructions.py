@@ -183,32 +183,61 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith('clipboard_import_'))
     def handle_clipboard_import(call: CallbackQuery):
-        """Handle clipboard import instructions."""
+        """Handle clipboard import instructions with user's subscription link."""
         try:
-            # Extract platform from callback data
             platform = call.data.replace('clipboard_import_', '')
 
-            # Map platform to message
-            message_map = {
-                'android': Messages.CLIPBOARD_IMPORT_ANDROID,
-                'ios': Messages.CLIPBOARD_IMPORT_IOS,
-                'windows': Messages.CLIPBOARD_IMPORT_WINDOWS,
-                'macos': Messages.CLIPBOARD_IMPORT_MACOS
+            platform_names = {
+                'android': 'Android',
+                'ios': 'iOS',
+                'windows': 'Windows',
+                'macos': 'macOS'
             }
 
-            message = message_map.get(platform)
-
-            if message:
-                bot.edit_message_text(
-                    message,
-                    call.message.chat.id,
-                    call.message.id,
-                    reply_markup=clipboard_import_keyboard(platform),
-                    parse_mode='Markdown'
-                )
-                bot.answer_callback_query(call.id)
-            else:
+            platform_name = platform_names.get(platform)
+            if not platform_name:
                 bot.answer_callback_query(call.id, "Неизвестная платформа")
+                return
+
+            # Get user's subscription link
+            sub_url = None
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == call.from_user.id).first()
+                if user:
+                    subscription = SubscriptionService.get_active_subscription(db, user)
+                    if subscription:
+                        sub_url = subscription.get_subscription_url(SUBSCRIPTION_BASE_URL)
+
+            if sub_url:
+                link_text = f"`{sub_url}`"
+            else:
+                link_text = "Используйте /key чтобы получить ссылку"
+
+            copy_hint = "Выберите ссылку и нажмите Cmd+C" if platform == 'macos' else (
+                "Выберите ссылку и нажмите Ctrl+C" if platform == 'windows' else
+                "Нажмите на ссылку и удерживайте для копирования"
+            )
+
+            message = (
+                f"📋 **Импорт ссылки с подпиской ({platform_name})**\n\n"
+                f"**Шаг 1:** Скопируйте ссылку на подписку\n"
+                f"{link_text}\n"
+                f"_{copy_hint}_\n\n"
+                f"**Шаг 2:** Откройте приложение v2rayTun\n\n"
+                f"**Шаг 3:** Нажмите кнопку **+** (плюс)\n\n"
+                f"**Шаг 4:** Выберите **\"Импорт из буфера обмена\"**\n\n"
+                f"**Шаг 5:** Подтвердите импорт\n\n"
+                f"Готово! Подписка добавлена. Нажмите кнопку подключения. 🎉"
+            )
+
+            bot.edit_message_text(
+                message,
+                call.message.chat.id,
+                call.message.id,
+                reply_markup=clipboard_import_keyboard(platform),
+                parse_mode='Markdown'
+            )
+            bot.answer_callback_query(call.id)
 
         except Exception as e:
             logger.error(f"Error in clipboard import callback: {e}", exc_info=True)
