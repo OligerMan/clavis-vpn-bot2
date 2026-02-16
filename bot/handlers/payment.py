@@ -220,10 +220,10 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
 
                 # Handle keys based on subscription state
                 if is_new_subscription or active_keys_count == 0:
-                    # Create new keys for new subscription or if no keys exist
+                    # Lazy init keys (up to USER_SERVER_LIMIT servers)
                     try:
-                        KeyService.create_subscription_keys(db, subscription, user.telegram_id)
-                        logger.info(f"Created new keys for subscription {subscription.id}")
+                        KeyService.ensure_keys_exist(db, subscription, user.telegram_id)
+                        logger.info(f"Ensured keys for subscription {subscription.id}")
                     except ValueError as e:
                         logger.error(f"Error creating keys for transaction {transaction_id}: {e}")
                         bot.send_message(

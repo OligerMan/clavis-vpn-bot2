@@ -24,17 +24,19 @@ def start_menu_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
-def full_menu_keyboard(hide_test_key: bool = False) -> InlineKeyboardMarkup:
+def full_menu_keyboard(hide_test_key: bool = False, show_old_keys: bool = False) -> InlineKeyboardMarkup:
     """
     Generate full menu keyboard (for back to menu).
 
     Buttons:
     - Row 1: Test Key (if shown) | My Key
     - Row 2: Payment | Status
-    - Row 3: Support
+    - Row 3: Old Keys (if shown)
+    - Row 4: Support
 
     Args:
         hide_test_key: Whether to hide test key button (if user used test OR has paid subscription)
+        show_old_keys: Whether to show old legacy keys button
     """
     keyboard = InlineKeyboardMarkup(row_width=2)
 
@@ -55,11 +57,26 @@ def full_menu_keyboard(hide_test_key: bool = False) -> InlineKeyboardMarkup:
         InlineKeyboardButton("📊 Статус", callback_data="status")
     )
 
-    # Third row - Support
+    # Old keys row (only if user has legacy keys)
+    if show_old_keys:
+        keyboard.row(
+            InlineKeyboardButton("📦 Старые ключи", callback_data="old_keys")
+        )
+
+    # Support row
     keyboard.row(
         InlineKeyboardButton("❓ Поддержка", callback_data="support")
     )
 
+    return keyboard
+
+
+def old_keys_keyboard() -> InlineKeyboardMarkup:
+    """Generate keyboard for old keys page with back button."""
+    keyboard = InlineKeyboardMarkup()
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
+    )
     return keyboard
 
 
@@ -339,6 +356,9 @@ def other_connection_methods_keyboard(platform: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🔑 Отдельные VLESS-ключи", callback_data=f"vless_keys_{platform}")
     )
     keyboard.row(
+        InlineKeyboardButton("🔑 Outline-ключ (legacy)", callback_data=f"outline_key_{platform}")
+    )
+    keyboard.row(
         InlineKeyboardButton("◀️ Назад к инструкции", callback_data=f"platform_{platform}")
     )
 
@@ -348,6 +368,22 @@ def other_connection_methods_keyboard(platform: str) -> InlineKeyboardMarkup:
 def vless_keys_keyboard(platform: str) -> InlineKeyboardMarkup:
     """
     Generate keyboard for VLESS keys page.
+
+    Args:
+        platform: Platform name (android, ios, windows, macos)
+    """
+    keyboard = InlineKeyboardMarkup()
+
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад", callback_data=f"{platform}_other_methods")
+    )
+
+    return keyboard
+
+
+def outline_key_keyboard(platform: str) -> InlineKeyboardMarkup:
+    """
+    Generate keyboard for Outline key page.
 
     Args:
         platform: Platform name (android, ios, windows, macos)

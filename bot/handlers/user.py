@@ -21,7 +21,8 @@ from bot.keyboards.markups import (
     android_instructions_keyboard,
     ios_instructions_keyboard,
     windows_instructions_keyboard,
-    macos_instructions_keyboard
+    macos_instructions_keyboard,
+    old_keys_keyboard,
 )
 from config.settings import SUBSCRIPTION_BASE_URL, DEVICE_LIMIT
 
@@ -56,6 +57,7 @@ def register_user_handlers(bot: TeleBot) -> None:
 
                 # Hide test key button if user already used test OR has paid subscription
                 hide_test_key = False
+                show_old_keys = False
                 if user:
                     # Check if already used test
                     if SubscriptionService.has_test_subscription(db, user):
@@ -64,11 +66,13 @@ def register_user_handlers(bot: TeleBot) -> None:
                     active_sub = SubscriptionService.get_active_subscription(db, user)
                     if active_sub and not active_sub.is_test:
                         hide_test_key = True
+                    # Check for legacy keys
+                    show_old_keys = KeyService.has_legacy_keys(db, user)
 
                 bot.send_message(
                     message.chat.id,
                     Messages.MENU,
-                    reply_markup=full_menu_keyboard(hide_test_key),
+                    reply_markup=full_menu_keyboard(hide_test_key, show_old_keys=show_old_keys),
                     parse_mode='Markdown'
                 )
         except Exception as e:
@@ -132,6 +136,9 @@ def register_user_handlers(bot: TeleBot) -> None:
                         parse_mode='Markdown'
                     )
                     return
+
+                # Lazy init: ensure keys exist for migrated/new users
+                KeyService.ensure_keys_exist(db, subscription, user.telegram_id)
 
                 # Calculate days left
                 days_left = (subscription.expires_at - datetime.utcnow()).days
@@ -330,9 +337,9 @@ def register_user_handlers(bot: TeleBot) -> None:
                 # Create test subscription
                 subscription = SubscriptionService.create_test_subscription(db, user)
 
-                # Create keys
+                # Create keys (lazy init — up to USER_SERVER_LIMIT servers)
                 try:
-                    KeyService.create_subscription_keys(db, subscription, user.telegram_id)
+                    KeyService.ensure_keys_exist(db, subscription, user.telegram_id)
                 except ValueError as e:
                     logger.error(f"Error creating test key: {e}", exc_info=True)
                     bot.answer_callback_query(call.id, "Ошибка создания ключа")
@@ -432,6 +439,7 @@ def register_user_handlers(bot: TeleBot) -> None:
 
                 # Hide test key button if user already used test OR has paid subscription
                 hide_test_key = False
+                show_old_keys = False
                 if user:
                     # Check if already used test
                     if SubscriptionService.has_test_subscription(db, user):
@@ -440,18 +448,59 @@ def register_user_handlers(bot: TeleBot) -> None:
                     active_sub = SubscriptionService.get_active_subscription(db, user)
                     if active_sub and not active_sub.is_test:
                         hide_test_key = True
+                    # Check for legacy keys
+                    show_old_keys = KeyService.has_legacy_keys(db, user)
 
                 bot.edit_message_text(
                     Messages.WELCOME,
                     call.message.chat.id,
                     call.message.id,
-                    reply_markup=full_menu_keyboard(hide_test_key),
+                    reply_markup=full_menu_keyboard(hide_test_key, show_old_keys=show_old_keys),
                     parse_mode='Markdown'
                 )
                 bot.answer_callback_query(call.id)
         except Exception as e:
             logger.error(f"Error in back_to_menu callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'old_keys')
+    def callback_old_keys(call: CallbackQuery):
+        """Handle old_keys callback - show legacy keys with deprecation notice."""
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(
+                    User.telegram_id == call.from_user.id
+                ).first()
+
+                if not user:
+                    bot.answer_callback_query(call.id, "Ошибка: пользователь не найден")
+                    return
+
+                legacy_keys = KeyService.get_legacy_keys(db, user)
+                if not legacy_keys:
+                    bot.answer_callback_query(call.id, "У вас нет старых ключей")
+                    return
+
+                # Format key list
+                lines = []
+                for i, key in enumerate(legacy_keys, 1):
+                    protocol = "Outline" if key.protocol == "outline" else "VLESS"
+                    label = key.remarks or key.key_data[:40] + "..."
+                    lines.append(f"{i}. `{protocol}` — {label}")
+
+                keys_list = "\n".join(lines)
+
+                bot.edit_message_text(
+                    Messages.OLD_KEYS_INFO.format(keys_list=keys_list),
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=old_keys_keyboard(),
+                    parse_mode='Markdown'
+                )
+                bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in old_keys callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
 
     @bot.callback_query_handler(func=lambda call: call.data == 'show_platforms')
     def callback_show_platforms(call: CallbackQuery):

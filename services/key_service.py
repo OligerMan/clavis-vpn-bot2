@@ -1,10 +1,13 @@
 """Key management and traffic aggregation service."""
 
 import logging
+import random
+from collections import defaultdict
 from typing import Dict, List
 
 from sqlalchemy.orm import Session
 
+from config.settings import USER_SERVER_LIMIT
 from database.models import Key, Server, Subscription
 from vpn.xui_client import XUIClient
 
@@ -39,18 +42,95 @@ class KeyService:
         return servers
 
     @staticmethod
+    def select_servers_for_user(
+        db: Session,
+        subscription: Subscription,
+        limit: int = USER_SERVER_LIMIT,
+    ) -> List[Server]:
+        """
+        Select servers for a user, respecting server sets and limit.
+
+        Round-robins across server_set groups: picks 1 from each set
+        (randomized within set) before picking a 2nd from any set, etc.
+
+        Args:
+            db: Database session
+            subscription: Subscription to check existing keys for
+            limit: Maximum number of servers to return
+
+        Returns:
+            List of Server objects to create keys on (may be empty)
+        """
+        all_servers = db.query(Server).filter(
+            Server.protocol == 'xui',
+            Server.is_active == True,
+        ).all()
+
+        if not all_servers:
+            return []
+
+        # Servers user already has active managed keys on
+        existing_server_ids = set(
+            sid for (sid,) in db.query(Key.server_id).filter(
+                Key.subscription_id == subscription.id,
+                Key.server_id.isnot(None),
+                Key.is_active == True,
+            ).distinct().all()
+        )
+
+        # Group available (not yet assigned) servers by set
+        sets: Dict[str, List[Server]] = defaultdict(list)
+        for server in all_servers:
+            if server.id not in existing_server_ids and server.has_capacity:
+                sets[server.server_set or "default"].append(server)
+
+        # Shuffle within each set for randomness
+        for servers_in_set in sets.values():
+            random.shuffle(servers_in_set)
+
+        # Round-robin across sets
+        selected: List[Server] = []
+        remaining = limit - len(existing_server_ids)
+
+        while remaining > 0 and sets:
+            picked_this_round = False
+            empty_sets = []
+            for set_name, servers_in_set in sets.items():
+                if remaining <= 0:
+                    break
+                if servers_in_set:
+                    selected.append(servers_in_set.pop(0))
+                    remaining -= 1
+                    picked_this_round = True
+                if not servers_in_set:
+                    empty_sets.append(set_name)
+
+            # Remove exhausted sets
+            for set_name in empty_sets:
+                del sets[set_name]
+
+            if not picked_this_round:
+                break
+
+        return selected
+
+    @staticmethod
     def create_subscription_keys(
         db: Session,
         subscription: Subscription,
-        user_telegram_id: int
+        user_telegram_id: int,
+        servers: List[Server] = None,
     ) -> List[Key]:
         """
-        Create VPN keys on all active servers for a subscription.
+        Create VPN keys on selected servers for a subscription.
+
+        If servers is None, uses select_servers_for_user() to pick them.
 
         Args:
             db: Database session
             subscription: Subscription object
             user_telegram_id: User's Telegram ID
+            servers: Optional explicit list of servers to create keys on
 
         Returns:
             List of created Key objects
@@ -58,7 +138,11 @@ class KeyService:
         Raises:
             ValueError: If no servers available or all servers failed
         """
-        servers = KeyService.get_all_active_servers(db)
+        if servers is None:
+            servers = KeyService.select_servers_for_user(db, subscription)
+
+        if not servers:
+            raise ValueError("No available servers")
 
         created_keys = []
         errors = []
@@ -82,6 +166,50 @@ class KeyService:
             db.refresh(key)
 
         return created_keys
+
+    @staticmethod
+    def ensure_keys_exist(
+        db: Session,
+        subscription: Subscription,
+        user_telegram_id: int,
+    ) -> List[Key]:
+        """
+        Ensure the subscription has keys up to USER_SERVER_LIMIT.
+
+        Idempotent: if enough managed keys already exist, returns them as-is.
+        Otherwise creates keys on additional servers to fill the gap.
+
+        Args:
+            db: Database session
+            subscription: Subscription object
+            user_telegram_id: User's Telegram ID
+
+        Returns:
+            List of all active keys for this subscription
+        """
+        # Count active managed keys (server_id IS NOT NULL)
+        managed_keys_count = db.query(Key).filter(
+            Key.subscription_id == subscription.id,
+            Key.server_id.isnot(None),
+            Key.is_active == True,
+        ).count()
+
+        if managed_keys_count < USER_SERVER_LIMIT:
+            # Need more keys — select_servers_for_user already excludes existing
+            servers = KeyService.select_servers_for_user(db, subscription)
+            if servers:
+                try:
+                    KeyService.create_subscription_keys(
+                        db, subscription, user_telegram_id, servers=servers,
+                    )
+                except ValueError as e:
+                    logger.warning(f"Could not create all keys for sub {subscription.id}: {e}")
+
+        # Return all active keys (managed + legacy)
+        return db.query(Key).filter(
+            Key.subscription_id == subscription.id,
+            Key.is_active == True,
+        ).all()
 
     @staticmethod
     def get_subscription_traffic(db: Session, subscription: Subscription) -> Dict[str, float]:
@@ -179,6 +307,24 @@ class KeyService:
                     key.is_active = False
 
         db.commit()
+
+    @staticmethod
+    def has_legacy_keys(db: Session, user) -> bool:
+        """Check if user has any active legacy keys (server_id IS NULL)."""
+        return db.query(Key).join(Subscription).filter(
+            Subscription.user_id == user.id,
+            Key.server_id.is_(None),
+            Key.is_active == True,
+        ).first() is not None
+
+    @staticmethod
+    def get_legacy_keys(db: Session, user) -> List[Key]:
+        """Get all active legacy keys for a user (server_id IS NULL)."""
+        return db.query(Key).join(Subscription).filter(
+            Subscription.user_id == user.id,
+            Key.server_id.is_(None),
+            Key.is_active == True,
+        ).all()
 
     @staticmethod
     def update_subscription_keys_expiry(db: Session, subscription: Subscription) -> int:

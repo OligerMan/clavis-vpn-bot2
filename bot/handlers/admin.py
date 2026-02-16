@@ -1,10 +1,13 @@
 """Admin command handlers for Telegram bot."""
 
+import csv
+import io
 import json
 import logging
 import random
 import secrets
 import subprocess
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -222,6 +225,9 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "`/delete_server <id>` — delete server (force delete if keys exist)\n"
             "\n*User management:*\n"
             "`/manage_user <tg_id>` — user info, keys, subscription, actions\n"
+            "\n*Legacy keys:*\n"
+            "`/add_old_keys` — import legacy keys from CSV\n"
+            "`/remove_old_keys` — soft-delete all legacy keys\n"
             "\n*Other:*\n"
             "`/check_reminders` — manually run subscription expiry check\n"
             "`/admin_help` — this message",
@@ -922,14 +928,16 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     key.is_active = False
                 db.commit()
 
-                # Create new keys
-                keys = KeyService.create_subscription_keys(db, sub, user.telegram_id)
+                # Create new keys (lazy init — up to USER_SERVER_LIMIT)
+                keys = KeyService.ensure_keys_exist(db, sub, user.telegram_id)
 
-                server_name = "unknown"
-                if keys and keys[0].server_id:
-                    srv = db.query(Server).filter(Server.id == keys[0].server_id).first()
-                    if srv:
-                        server_name = srv.name
+                server_names_list = []
+                for key in keys:
+                    if key.server_id:
+                        srv = db.query(Server).filter(Server.id == key.server_id).first()
+                        if srv and srv.name not in server_names_list:
+                            server_names_list.append(srv.name)
+                server_name = ", ".join(server_names_list) if server_names_list else "unknown"
 
                 # Refresh the info message
                 text, _ = _format_user_info(db, tg_id)
@@ -1162,5 +1170,243 @@ You can now start testing from scratch with /start"""
         except Exception as e:
             logger.error(f"Error in /check_reminders: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"❌ Error: {e}")
+
+    # ── /add_old_keys ──────────────────────────────────────
+    _add_old_keys_state = {}  # {chat_id: True} — waiting for CSV upload
+
+    @bot.message_handler(commands=['add_old_keys'])
+    def handle_add_old_keys(message: Message):
+        """Start old keys import flow — ask admin to upload CSV."""
+        if not is_admin(message.from_user.id):
+            return
+
+        _add_old_keys_state[message.chat.id] = True
+        bot.send_message(
+            message.chat.id,
+            "Upload `user_info.csv` file.\n\n"
+            "Expected format (no headers):\n"
+            "`telegram_id, server_ip, outline_key1, outline_key1_id, payment_until, bool, outline_key2, outline_key2_id, something, vless_uri`\n\n"
+            "Use `nokey`/`noid` for missing values.",
+            parse_mode='Markdown',
+            reply_markup=ForceReply(selective=True)
+        )
+
+    @bot.message_handler(
+        content_types=['document'],
+        func=lambda m: m.chat.id in _add_old_keys_state and is_admin(m.from_user.id)
+    )
+    def handle_old_keys_csv_upload(message: Message):
+        """Process uploaded CSV with old keys."""
+        _add_old_keys_state.pop(message.chat.id, None)
+
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            file_bytes = bot.download_file(file_info.file_path)
+            content = file_bytes.decode('utf-8-sig')
+
+            reader = csv.reader(io.StringIO(content))
+            stats = {"users": 0, "outline_keys": 0, "vless_keys": 0, "skipped_dup": 0, "errors": 0}
+
+            with get_db_session() as db:
+                for row_num, row in enumerate(reader, 1):
+                    row = [c.strip() for c in row]
+                    if len(row) < 10:
+                        stats["errors"] += 1
+                        continue
+
+                    try:
+                        telegram_id = int(row[0])
+                    except ValueError:
+                        stats["errors"] += 1
+                        continue
+
+                    # Parse payment_until
+                    try:
+                        payment_until = int(row[4])
+                    except ValueError:
+                        payment_until = 0
+
+                    if payment_until > 0:
+                        expiry = datetime.utcfromtimestamp(payment_until)
+                    else:
+                        expiry = datetime.utcnow() + timedelta(days=90)
+
+                    # Find or create user
+                    user = db.query(User).filter(User.telegram_id == telegram_id).first()
+                    if not user:
+                        user = User(telegram_id=telegram_id)
+                        db.add(user)
+                        db.flush()
+
+                    # Find active subscription or create legacy one
+                    sub = db.query(Subscription).filter(
+                        Subscription.user_id == user.id,
+                        Subscription.is_active == True,
+                    ).first()
+
+                    if not sub:
+                        sub = Subscription(
+                            user_id=user.id,
+                            name="Legacy",
+                            token=str(uuid.uuid4()),
+                            expires_at=expiry,
+                            is_test=False,
+                            is_active=True,
+                        )
+                        db.add(sub)
+                        db.flush()
+
+                    user_created = False
+
+                    # Outline key 1
+                    outline1 = row[2] if row[2].lower() not in ('nokey', '') else None
+                    if outline1:
+                        exists = db.query(Key).filter(Key.key_data == outline1).first()
+                        if exists:
+                            stats["skipped_dup"] += 1
+                        else:
+                            db.add(Key(
+                                subscription_id=sub.id,
+                                server_id=None,
+                                protocol="outline",
+                                key_data=outline1,
+                                remarks="Outline (legacy)",
+                                is_active=True,
+                            ))
+                            stats["outline_keys"] += 1
+                            user_created = True
+
+                    # Outline key 2
+                    outline2 = row[6] if row[6].lower() not in ('nokey', '') else None
+                    if outline2:
+                        exists = db.query(Key).filter(Key.key_data == outline2).first()
+                        if exists:
+                            stats["skipped_dup"] += 1
+                        else:
+                            db.add(Key(
+                                subscription_id=sub.id,
+                                server_id=None,
+                                protocol="outline",
+                                key_data=outline2,
+                                remarks="Outline (legacy)",
+                                is_active=True,
+                            ))
+                            stats["outline_keys"] += 1
+                            user_created = True
+
+                    # VLESS key
+                    vless = row[9] if row[9].lower() not in ('nokey', '') else None
+                    if vless:
+                        exists = db.query(Key).filter(Key.key_data == vless).first()
+                        if exists:
+                            stats["skipped_dup"] += 1
+                        else:
+                            # Extract host from vless URI for remarks
+                            host = "unknown"
+                            try:
+                                at_idx = vless.index('@')
+                                colon_idx = vless.index(':', at_idx)
+                                host = vless[at_idx + 1:colon_idx]
+                            except (ValueError, IndexError):
+                                pass
+                            db.add(Key(
+                                subscription_id=sub.id,
+                                server_id=None,
+                                protocol="xui",
+                                key_data=vless,
+                                remarks=f"{host} (old key)",
+                                is_active=True,
+                            ))
+                            stats["vless_keys"] += 1
+                            user_created = True
+
+                    if user_created:
+                        stats["users"] += 1
+
+                db.commit()
+
+            bot.send_message(
+                message.chat.id,
+                f"*Import complete*\n\n"
+                f"Users with keys: {stats['users']}\n"
+                f"Outline keys: {stats['outline_keys']}\n"
+                f"VLESS keys: {stats['vless_keys']}\n"
+                f"Skipped (duplicate): {stats['skipped_dup']}\n"
+                f"Errors (bad rows): {stats['errors']}",
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.error(f"Error importing old keys: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error importing CSV: `{e}`", parse_mode='Markdown')
+
+    # ── /remove_old_keys ─────────────────────────────────
+    @bot.message_handler(commands=['remove_old_keys'])
+    def handle_remove_old_keys(message: Message):
+        """Show count of legacy keys and ask for confirmation."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            with get_db_session() as db:
+                count = db.query(Key).filter(
+                    Key.server_id.is_(None),
+                    Key.is_active == True,
+                ).count()
+
+                if count == 0:
+                    bot.send_message(message.chat.id, "No active legacy keys found.")
+                    return
+
+                keyboard = InlineKeyboardMarkup()
+                keyboard.row(
+                    InlineKeyboardButton(f"Delete {count} legacy keys", callback_data="confirm_remove_old_keys"),
+                    InlineKeyboardButton("Cancel", callback_data="cancel_remove_old_keys")
+                )
+
+                bot.send_message(
+                    message.chat.id,
+                    f"Found *{count}* active legacy keys (`server_id=NULL`).\n\n"
+                    f"This will soft-delete them (mark `is_active=False`). "
+                    f"Keys will NOT be removed from VPN servers.",
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+
+        except Exception as e:
+            logger.error(f"Error in /remove_old_keys: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'confirm_remove_old_keys')
+    def handle_confirm_remove_old_keys(call: CallbackQuery):
+        """Soft-delete all legacy keys."""
+        if not is_admin(call.from_user.id):
+            return
+
+        try:
+            with get_db_session() as db:
+                count = db.query(Key).filter(
+                    Key.server_id.is_(None),
+                    Key.is_active == True,
+                ).update({Key.is_active: False})
+                db.commit()
+
+            bot.answer_callback_query(call.id)
+            bot.edit_message_text(
+                f"Done. {count} legacy keys marked inactive.",
+                call.message.chat.id,
+                call.message.id
+            )
+
+        except Exception as e:
+            logger.error(f"Error removing old keys: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Error")
+            bot.send_message(call.message.chat.id, f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'cancel_remove_old_keys')
+    def handle_cancel_remove_old_keys(call: CallbackQuery):
+        """Cancel old keys removal."""
+        bot.answer_callback_query(call.id, "Cancelled")
+        bot.edit_message_text("Removal cancelled.", call.message.chat.id, call.message.id)
 
     logger.info("Admin handlers registered")

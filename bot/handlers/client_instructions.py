@@ -16,7 +16,8 @@ from bot.keyboards.markups import (
     detailed_instructions_keyboard,
     other_connection_methods_keyboard,
     clipboard_import_keyboard,
-    vless_keys_keyboard
+    vless_keys_keyboard,
+    outline_key_keyboard,
 )
 from config.settings import SUBSCRIPTION_BASE_URL
 
@@ -336,6 +337,68 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
 
         except Exception as e:
             logger.error(f"Error in vless keys callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('outline_key_'))
+    def handle_outline_key(call: CallbackQuery):
+        """Show user's Outline (legacy) key if available."""
+        try:
+            platform = call.data.replace('outline_key_', '')
+
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == call.from_user.id).first()
+                if not user:
+                    bot.answer_callback_query(call.id, "Пользователь не найден")
+                    return
+
+                # Find any subscription with an Outline key
+                outline_keys = (
+                    db.query(Key)
+                    .join(Subscription)
+                    .filter(
+                        Subscription.user_id == user.id,
+                        Key.protocol == "outline",
+                        Key.is_active == True,
+                    )
+                    .all()
+                )
+
+                if not outline_keys:
+                    bot.edit_message_text(
+                        "❌ **Outline-ключ не найден**\n\n"
+                        "У вас нет сохранённого Outline-ключа.\n"
+                        "Используйте подписку VLESS для подключения.",
+                        call.message.chat.id,
+                        call.message.id,
+                        reply_markup=outline_key_keyboard(platform),
+                        parse_mode='Markdown',
+                    )
+                    bot.answer_callback_query(call.id)
+                    return
+
+                lines = ["🔑 **Outline-ключ (legacy)**\n"]
+                for key in outline_keys:
+                    lines.append(f"`{key.key_data}`\n")
+                lines.append(
+                    "⚠️ _Этот ключ работает в Outline/Shadowsocks клиенте. "
+                    "Поддержка прекратится в будущем — рекомендуем перейти на VLESS-подписку._"
+                )
+
+                message = "\n".join(lines)
+                if len(message) > 4096:
+                    message = message[:4090] + "\n..."
+
+            bot.edit_message_text(
+                message,
+                call.message.chat.id,
+                call.message.id,
+                reply_markup=outline_key_keyboard(platform),
+                parse_mode='Markdown',
+            )
+            bot.answer_callback_query(call.id)
+
+        except Exception as e:
+            logger.error(f"Error in outline key callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Произошла ошибка")
 
     logger.info("Client instruction handlers registered")

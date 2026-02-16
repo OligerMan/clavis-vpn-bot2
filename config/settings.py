@@ -45,6 +45,9 @@ TEST_SUBSCRIPTION_HOURS = 48
 # Device limit for subscriptions
 DEVICE_LIMIT = 5
 
+# Max number of servers a user gets keys on (lazy init)
+USER_SERVER_LIMIT = int(os.getenv('USER_SERVER_LIMIT', '2'))
+
 # Subscription server settings
 SUBSCRIPTION_PORT = int(os.getenv('SUBSCRIPTION_PORT', 8080))
 SUBSCRIPTION_CACHE_TTL = int(os.getenv('SUBSCRIPTION_CACHE_TTL', 300))

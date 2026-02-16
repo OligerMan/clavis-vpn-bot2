@@ -157,6 +157,7 @@ class Server(Base):
     api_credentials = Column(Text, nullable=True)  # Encrypted JSON
     capacity = Column(Integer, default=100)
     is_active = Column(Boolean, default=True)
+    server_set = Column(String(50), default="default")
 
     # Relationships
     keys = relationship("Key", back_populates="server")
