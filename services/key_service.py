@@ -226,17 +226,17 @@ class KeyService:
         total_upload = 0
         total_download = 0
 
+        # Only query managed keys (legacy keys have no server to fetch traffic from)
         keys = db.query(Key).filter(
             Key.subscription_id == subscription.id,
+            Key.server_id.isnot(None),
             Key.is_active == True
         ).all()
 
         # Group keys by server to reuse XUIClient connections
         keys_by_server: Dict[int, list] = {}
         for key in keys:
-            if key.server_id not in keys_by_server:
-                keys_by_server[key.server_id] = []
-            keys_by_server[key.server_id].append(key)
+            keys_by_server.setdefault(key.server_id, []).append(key)
 
         for server_id, server_keys in keys_by_server.items():
             server = db.query(Server).filter(Server.id == server_id).first()
@@ -341,13 +341,15 @@ class KeyService:
         Raises:
             ValueError: If subscription has no active keys
         """
+        # Only update managed keys (server_id IS NOT NULL); legacy keys are unmanaged
         keys = db.query(Key).filter(
             Key.subscription_id == subscription.id,
+            Key.server_id.isnot(None),
             Key.is_active == True
         ).all()
 
         if not keys:
-            raise ValueError("No active keys found for subscription")
+            raise ValueError("No active managed keys found for subscription")
 
         new_expiry_ms = int(subscription.expires_at.timestamp() * 1000)
         updated_count = 0

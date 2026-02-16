@@ -481,14 +481,14 @@ def register_user_handlers(bot: TeleBot) -> None:
                     bot.answer_callback_query(call.id, "У вас нет старых ключей")
                     return
 
-                # Format key list
+                # Format key list — each key as copyable code block
                 lines = []
                 for i, key in enumerate(legacy_keys, 1):
                     protocol = "Outline" if key.protocol == "outline" else "VLESS"
-                    label = key.remarks or key.key_data[:40] + "..."
-                    lines.append(f"{i}. `{protocol}` — {label}")
+                    label = key.remarks or protocol
+                    lines.append(f"{i}. *{label}*\n`{key.key_data}`")
 
-                keys_list = "\n".join(lines)
+                keys_list = "\n\n".join(lines)
 
                 bot.edit_message_text(
                     Messages.OLD_KEYS_INFO.format(keys_list=keys_list),

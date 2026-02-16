@@ -211,38 +211,32 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
                     db, user, days, transaction_id
                 )
 
-                # Check if subscription has active keys
+                # Ensure managed keys exist (creates if needed)
                 from database.models import Key
-                active_keys_count = db.query(Key).filter(
+                try:
+                    KeyService.ensure_keys_exist(db, subscription, user.telegram_id)
+                    logger.info(f"Ensured keys for subscription {subscription.id}")
+                except ValueError as e:
+                    logger.error(f"Error creating keys for transaction {transaction_id}: {e}")
+                    bot.send_message(
+                        user.telegram_id,
+                        Messages.ERROR_KEY_CREATION
+                    )
+                    return False
+
+                # Update expiry on all managed keys
+                managed_keys_count = db.query(Key).filter(
                     Key.subscription_id == subscription.id,
-                    Key.is_active == True
+                    Key.server_id.isnot(None),
+                    Key.is_active == True,
                 ).count()
 
-                # Handle keys based on subscription state
-                if is_new_subscription or active_keys_count == 0:
-                    # Lazy init keys (up to USER_SERVER_LIMIT servers)
-                    try:
-                        KeyService.ensure_keys_exist(db, subscription, user.telegram_id)
-                        logger.info(f"Ensured keys for subscription {subscription.id}")
-                    except ValueError as e:
-                        logger.error(f"Error creating keys for transaction {transaction_id}: {e}")
-                        bot.send_message(
-                            user.telegram_id,
-                            Messages.ERROR_KEY_CREATION
-                        )
-                        return False
-                else:
-                    # Update expiry time for existing keys (upgrade from test or extend paid)
+                if managed_keys_count > 0:
                     try:
                         updated_count = KeyService.update_subscription_keys_expiry(db, subscription)
                         logger.info(f"Updated expiry for {updated_count} keys in subscription {subscription.id}")
                     except ValueError as e:
-                        logger.error(f"Error updating keys for transaction {transaction_id}: {e}")
-                        bot.send_message(
-                            user.telegram_id,
-                            Messages.ERROR_KEY_CREATION
-                        )
-                        return False
+                        logger.warning(f"Could not update key expiry for transaction {transaction_id}: {e}")
 
                 # Mark transaction as completed
                 transaction.complete()
