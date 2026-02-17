@@ -164,7 +164,7 @@ def _create_vless_reality_inbound(api: Api, remark: str = "clavis") -> dict:
     )
 
     sniffing = Sniffing(enabled=True)
-    settings = Settings()
+    settings = Settings(decryption="none")
 
     inbound = Inbound(
         enable=True,
@@ -218,8 +218,10 @@ def register_admin_handlers(bot: TeleBot) -> None:
             message.chat.id,
             "*Admin Commands*\n\n"
             "*Server management:*\n"
-            "`/servers` — list all servers with status and config\n"
-            "`/add_server` — add server (dialog: name → domain → auto-setup)\n"
+            "`/servers` — list all servers grouped by server set\n"
+            "`/groups` — quick overview of server groups\n"
+            "`/add_server` — add server (dialog: name → group → domain → auto-setup)\n"
+            "`/activate_group` — bulk-create keys for a group for all active subs\n"
             "`/check_server <id>` — health check (version, uptime, clients)\n"
             "`/toggle_server <id>` — enable/disable server\n"
             "`/delete_server <id>` — delete server (force delete if keys exist)\n"
@@ -237,7 +239,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
     # ── /servers ──────────────────────────────────────────────
     @bot.message_handler(commands=['servers'])
     def handle_servers(message: Message):
-        """List all servers with status info."""
+        """List all servers grouped by server_set."""
         if not is_admin(message.from_user.id):
             return
 
@@ -249,34 +251,41 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     bot.send_message(message.chat.id, "No servers configured.")
                     return
 
-                lines = ["*Servers:*\n"]
+                # Group by server_set
+                from collections import defaultdict as _defaultdict
+                groups: dict = _defaultdict(list)
                 for s in servers:
-                    status = "ON" if s.is_active else "OFF"
-                    keys_count = len([k for k in s.keys if k.is_active])
+                    groups[s.server_set or "default"].append(s)
 
-                    creds_info = ""
-                    if s.api_credentials:
-                        try:
-                            creds = json.loads(s.api_credentials)
-                            inbound = creds.get("inbound_id", "?")
-                            user = creds.get("username", "?")
-                            conn = creds.get("connection_settings", {})
-                            port = conn.get("port", "?")
-                            sni = conn.get("sni", "?")
-                            creds_info = (
-                                f"  user: `{user}`, inbound: `{inbound}`\n"
-                                f"  port: `{port}`, sni: `{sni}`"
-                            )
-                        except json.JSONDecodeError:
-                            creds_info = "  credentials: invalid JSON"
+                lines = ["*Servers:*\n"]
+                for group_name in sorted(groups.keys()):
+                    lines.append(f"*Group: {group_name}*")
+                    for s in groups[group_name]:
+                        status = "ON" if s.is_active else "OFF"
+                        keys_count = len([k for k in s.keys if k.is_active])
 
-                    lines.append(
-                        f"*{s.id}.* `{s.name}` [{status}]\n"
-                        f"  host: `{s.host}`\n"
-                        f"  api: `{s.api_url}`\n"
-                        f"{creds_info}\n"
-                        f"  keys: {keys_count}/{s.capacity}\n"
-                    )
+                        creds_info = ""
+                        if s.api_credentials:
+                            try:
+                                creds = json.loads(s.api_credentials)
+                                inbound = creds.get("inbound_id", "?")
+                                conn = creds.get("connection_settings", {})
+                                port = conn.get("port", "?")
+                                sni = conn.get("sni", "?")
+                                creds_info = (
+                                    f"  inbound: `{inbound}` | "
+                                    f"port: `{port}` | sni: `{sni}`"
+                                )
+                            except json.JSONDecodeError:
+                                creds_info = "  credentials: invalid JSON"
+
+                        lines.append(
+                            f"  *{s.id}.* `{s.name}` [{status}]\n"
+                            f"  host: `{s.host}`\n"
+                            f"{creds_info}\n"
+                            f"  keys: {keys_count}/{s.capacity}"
+                        )
+                    lines.append("")  # blank line between groups
 
                 bot.send_message(
                     message.chat.id,
@@ -298,7 +307,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
         _add_server_state[message.chat.id] = {"step": "name"}
         msg = bot.send_message(
             message.chat.id,
-            "*Add Server — Step 1/3*\n\nEnter a short name for this server (e.g. `cl24`):",
+            "*Add Server — Step 1/4*\n\nEnter a short name for this server (e.g. `cl24`):",
             parse_mode='Markdown',
             reply_markup=ForceReply(selective=True)
         )
@@ -312,7 +321,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
         )
     )
     def handle_add_server_name(message: Message):
-        """Step 2: Got name, ask for domain."""
+        """Step 2: Got name, ask for group."""
         if not is_admin(message.from_user.id):
             return
 
@@ -323,16 +332,98 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         state = _add_server_state[message.chat.id]
         state["name"] = name
+        state["step"] = "group"
+
+        # Get existing groups
+        try:
+            with get_db_session() as db:
+                groups = db.query(Server.server_set).filter(
+                    Server.is_active == True
+                ).distinct().all()
+                existing_groups = sorted(set(g[0] or "default" for g in groups))
+        except Exception:
+            existing_groups = []
+
+        keyboard = InlineKeyboardMarkup()
+        for group in existing_groups:
+            keyboard.row(InlineKeyboardButton(group, callback_data=f"addsvr_group_{group}"))
+        keyboard.row(InlineKeyboardButton("+ New group", callback_data="addsvr_group_new"))
+
+        bot.send_message(
+            message.chat.id,
+            f"*Add Server — Step 2/4*\n\n"
+            f"Name: `{name}`\n\n"
+            f"Select a server group:",
+            parse_mode='Markdown',
+            reply_markup=keyboard,
+        )
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('addsvr_group_'))
+    def handle_add_server_group_select(call: CallbackQuery):
+        """Handle group selection for add_server."""
+        if not is_admin(call.from_user.id):
+            return
+
+        state = _add_server_state.get(call.message.chat.id)
+        if not state or state.get("step") != "group":
+            bot.answer_callback_query(call.id, "Session expired. Run /add_server again.")
+            return
+
+        bot.answer_callback_query(call.id)
+        group_value = call.data.replace('addsvr_group_', '', 1)
+
+        if group_value == "new":
+            state["step"] = "group_name"
+            msg = bot.send_message(
+                call.message.chat.id,
+                "Enter a name for the new group (e.g. `Germany`, `Switzerland`):",
+                parse_mode='Markdown',
+                reply_markup=ForceReply(selective=True),
+            )
+            state["prompt_id"] = msg.id
+        else:
+            state["group"] = group_value
+            state["step"] = "domain"
+            msg = bot.send_message(
+                call.message.chat.id,
+                f"*Add Server — Step 3/4*\n\n"
+                f"Name: `{state['name']}` | Group: `{group_value}`\n\n"
+                f"Enter the domain where 3x-ui is running\n"
+                f"(e.g. `cl24.clavisdashboard.ru`):",
+                parse_mode='Markdown',
+                reply_markup=ForceReply(selective=True),
+            )
+            state["prompt_id"] = msg.id
+
+    @bot.message_handler(
+        func=lambda m: (
+            m.chat.id in _add_server_state
+            and _add_server_state[m.chat.id].get("step") == "group_name"
+            and m.reply_to_message is not None
+        )
+    )
+    def handle_add_server_group_name(message: Message):
+        """Got new group name, ask for domain."""
+        if not is_admin(message.from_user.id):
+            return
+
+        group_name = message.text.strip()
+        if not group_name or len(group_name) > 50:
+            bot.send_message(message.chat.id, "Group name must be 1-50 characters. Try again.")
+            return
+
+        state = _add_server_state[message.chat.id]
+        state["group"] = group_name
         state["step"] = "domain"
 
         msg = bot.send_message(
             message.chat.id,
-            f"*Add Server — Step 2/3*\n\n"
-            f"Name: `{name}`\n\n"
+            f"*Add Server — Step 3/4*\n\n"
+            f"Name: `{state['name']}` | Group: `{group_name}`\n\n"
             f"Enter the domain where 3x-ui is running\n"
             f"(e.g. `cl24.clavisdashboard.ru`):",
             parse_mode='Markdown',
-            reply_markup=ForceReply(selective=True)
+            reply_markup=ForceReply(selective=True),
         )
         state["prompt_id"] = msg.id
 
@@ -344,7 +435,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
         )
     )
     def handle_add_server_domain(message: Message):
-        """Step 3: Got domain, connect to panel, discover inbounds, ask which one."""
+        """Step 4: Got domain, connect to panel, discover inbounds, ask which one."""
         if not is_admin(message.from_user.id):
             return
 
@@ -367,8 +458,9 @@ def register_admin_handlers(bot: TeleBot) -> None:
             return
 
         state["api_url"] = result["api_url"]
+        state["step"] = "no_inbound"  # Always create new inbound
 
-        # Find VLESS Reality inbounds
+        # Show existing inbounds as info (never reuse — protects old keys)
         vless_inbounds = []
         for ib in result["inbounds"]:
             if ib.protocol == "vless":
@@ -376,70 +468,36 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 if getattr(ss, 'security', '') == 'reality':
                     vless_inbounds.append(ib)
 
-        if not vless_inbounds:
-            state["step"] = "no_inbound"
+        lines = ["*Add Server — Step 3/3*\n"]
 
-            if result["inbounds"]:
-                lines = ["No VLESS Reality inbounds found.\n\nExisting inbounds:"]
-                for ib in result["inbounds"]:
-                    lines.append(f"  id={ib.id} protocol=`{ib.protocol}` port=`{ib.port}`")
-                text = "\n".join(lines)
-            else:
-                text = "No inbounds found on this panel."
-
-            keyboard = InlineKeyboardMarkup()
-            keyboard.row(InlineKeyboardButton("Create inbound", callback_data="create_inbound"))
-            keyboard.row(InlineKeyboardButton("Cancel", callback_data="cancel_add_server"))
-
-            bot.send_message(
-                message.chat.id,
-                f"{text}\n\nCreate a new VLESS Reality inbound?",
-                reply_markup=keyboard,
-                parse_mode='Markdown'
-            )
-            return
-
-        if len(vless_inbounds) == 1:
-            # Single inbound — auto-select
-            _finish_add_server(bot, message.chat.id, state, vless_inbounds[0])
-        else:
-            # Multiple inbounds — ask which one
-            state["step"] = "pick_inbound"
-            state["inbounds"] = {ib.id: ib for ib in vless_inbounds}
-
-            keyboard = InlineKeyboardMarkup()
+        if vless_inbounds:
+            lines.append(f"Found {len(vless_inbounds)} existing VLESS Reality inbound(s):")
             for ib in vless_inbounds:
                 cfg = _extract_inbound_config(ib)
-                label = f"id={ib.id} port={cfg['port']} sni={cfg['sni']} ({cfg['clients_count']} clients)"
-                keyboard.row(InlineKeyboardButton(label, callback_data=f"pick_inbound_{ib.id}"))
-            keyboard.row(InlineKeyboardButton("Cancel", callback_data="cancel_add_server"))
+                lines.append(
+                    f"  id={ib.id} port=`{cfg['port']}` sni=`{cfg['sni']}` "
+                    f"({cfg['clients_count']} clients)"
+                )
+            lines.append("\n⚠️ Existing inbounds will NOT be reused (to protect old keys).")
+        elif result["inbounds"]:
+            lines.append("No VLESS Reality inbounds found.\nExisting inbounds:")
+            for ib in result["inbounds"]:
+                lines.append(f"  id={ib.id} protocol=`{ib.protocol}` port=`{ib.port}`")
+        else:
+            lines.append("No inbounds found on this panel.")
 
-            bot.send_message(
-                message.chat.id,
-                "*Add Server — Step 3/3*\n\nMultiple VLESS Reality inbounds found. Pick one:",
-                reply_markup=keyboard,
-                parse_mode='Markdown'
-            )
+        lines.append("\nA *new* VLESS Reality inbound will be created.")
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith('pick_inbound_'))
-    def handle_pick_inbound(call: CallbackQuery):
-        """Handle inbound selection callback."""
-        if not is_admin(call.from_user.id):
-            return
+        keyboard = InlineKeyboardMarkup()
+        keyboard.row(InlineKeyboardButton("Create new inbound", callback_data="create_inbound"))
+        keyboard.row(InlineKeyboardButton("Cancel", callback_data="cancel_add_server"))
 
-        state = _add_server_state.get(call.message.chat.id)
-        if not state or state.get("step") != "pick_inbound":
-            bot.answer_callback_query(call.id, "Session expired. Run /add_server again.")
-            return
-
-        inbound_id = int(call.data.replace('pick_inbound_', ''))
-        inbound = state["inbounds"].get(inbound_id)
-        if not inbound:
-            bot.answer_callback_query(call.id, "Inbound not found")
-            return
-
-        bot.answer_callback_query(call.id)
-        _finish_add_server(bot, call.message.chat.id, state, inbound)
+        bot.send_message(
+            message.chat.id,
+            "\n".join(lines),
+            reply_markup=keyboard,
+            parse_mode='Markdown'
+        )
 
     @bot.callback_query_handler(func=lambda call: call.data == 'cancel_add_server')
     def handle_cancel_add_server(call: CallbackQuery):
@@ -489,6 +547,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 }
             }
 
+            group = state.get("group", "default")
             with get_db_session() as db:
                 server = Server(
                     name=state["name"],
@@ -498,6 +557,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     api_credentials=json.dumps(credentials),
                     capacity=100,
                     is_active=True,
+                    server_set=group,
                 )
                 db.add(server)
                 db.flush()
@@ -508,6 +568,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 f"*Server added successfully!*\n\n"
                 f"ID: `{server_id}`\n"
                 f"Name: `{state['name']}`\n"
+                f"Group: `{group}`\n"
                 f"Domain: `{state['domain']}`\n"
                 f"Inbound: `{cfg['inbound_id']}` (newly created)\n\n"
                 f"*Connection settings:*\n"
@@ -521,57 +582,186 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         _add_server_state.pop(call.message.chat.id, None)
 
-    def _finish_add_server(bot_instance: TeleBot, chat_id: int, state: dict, inbound):
-        """Save server to DB with auto-discovered config."""
-        cfg = _extract_inbound_config(inbound)
-
-        credentials = {
-            "username": DEFAULT_XUI_USERNAME,
-            "password": DEFAULT_XUI_PASSWORD,
-            "inbound_id": cfg["inbound_id"],
-            "use_tls_verify": True,
-            "connection_settings": {
-                "port": cfg["port"],
-                "sni": cfg["sni"],
-                "pbk": cfg["pbk"],
-                "sid": cfg["sid"],
-                "flow": cfg["flow"],
-                "fingerprint": cfg["fingerprint"],
-            }
-        }
+    # ── /groups ───────────────────────────────────────────────
+    @bot.message_handler(commands=['groups'])
+    def handle_groups(message: Message):
+        """Quick overview of server groups."""
+        if not is_admin(message.from_user.id):
+            return
 
         try:
             with get_db_session() as db:
-                server = Server(
-                    name=state["name"],
-                    host=state["domain"],
-                    protocol="xui",
-                    api_url=state["api_url"],
-                    api_credentials=json.dumps(credentials),
-                    capacity=100,
-                    is_active=True,
-                )
-                db.add(server)
-                db.flush()
-                server_id = server.id
+                servers = db.query(Server).all()
+                if not servers:
+                    bot.send_message(message.chat.id, "No servers configured.")
+                    return
 
-            bot_instance.send_message(
-                chat_id,
-                f"*Server added successfully!*\n\n"
-                f"ID: `{server_id}`\n"
-                f"Name: `{state['name']}`\n"
-                f"Domain: `{state['domain']}`\n"
-                f"Inbound: `{cfg['inbound_id']}`\n\n"
-                f"*Connection settings:*\n"
-                f"{_format_inbound_info(cfg)}",
-                parse_mode='Markdown'
+                from collections import defaultdict as _defaultdict
+                groups: dict = _defaultdict(lambda: {"servers": 0, "active": 0, "keys": 0})
+                for s in servers:
+                    g = groups[s.server_set or "default"]
+                    g["servers"] += 1
+                    if s.is_active:
+                        g["active"] += 1
+                    g["keys"] += len([k for k in s.keys if k.is_active])
+
+                lines = ["*Server Groups:*\n"]
+                for name in sorted(groups.keys()):
+                    g = groups[name]
+                    lines.append(
+                        f"*{name}*: {g['active']}/{g['servers']} servers active, "
+                        f"{g['keys']} keys"
+                    )
+
+                bot.send_message(message.chat.id, "\n".join(lines), parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"Error in /groups: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── /activate_group ──────────────────────────────────────
+    @bot.message_handler(commands=['activate_group'])
+    def handle_activate_group(message: Message):
+        """Bulk-create keys for a group for all active subscriptions."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            with get_db_session() as db:
+                # Get groups that have active servers
+                groups = db.query(Server.server_set).filter(
+                    Server.is_active == True,
+                    Server.protocol == 'xui',
+                ).distinct().all()
+                group_names = sorted(set(g[0] or "default" for g in groups))
+
+            if not group_names:
+                bot.send_message(message.chat.id, "No active server groups found.")
+                return
+
+            keyboard = InlineKeyboardMarkup()
+            for name in group_names:
+                keyboard.row(InlineKeyboardButton(name, callback_data=f"actgrp_select_{name}"))
+            keyboard.row(InlineKeyboardButton("Cancel", callback_data="actgrp_cancel"))
+
+            bot.send_message(
+                message.chat.id,
+                "*Activate Group*\n\nSelect a group to activate for all active subscriptions:",
+                parse_mode='Markdown',
+                reply_markup=keyboard,
             )
 
         except Exception as e:
-            logger.error(f"Error saving server: {e}", exc_info=True)
-            bot_instance.send_message(chat_id, f"Error saving server: {e}")
+            logger.error(f"Error in /activate_group: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
 
-        _add_server_state.pop(chat_id, None)
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('actgrp_select_'))
+    def handle_activate_group_select(call: CallbackQuery):
+        """Show confirmation before activating group."""
+        if not is_admin(call.from_user.id):
+            return
+
+        group_name = call.data.replace('actgrp_select_', '', 1)
+        bot.answer_callback_query(call.id)
+
+        try:
+            with get_db_session() as db:
+                server_count = db.query(Server).filter(
+                    Server.is_active == True,
+                    Server.protocol == 'xui',
+                    Server.server_set == group_name,
+                ).count()
+
+                # Count active subs with managed keys that DON'T have a key in this group
+                from datetime import datetime as _dt
+                active_subs = db.query(Subscription).filter(
+                    Subscription.is_active == True,
+                    Subscription.expires_at > _dt.utcnow(),
+                ).all()
+
+                need_keys = 0
+                not_interacted = 0
+                for sub in active_subs:
+                    # Only count subs that have at least one managed key
+                    has_managed = db.query(Key).filter(
+                        Key.subscription_id == sub.id,
+                        Key.server_id.isnot(None),
+                        Key.is_active == True,
+                    ).first()
+                    if not has_managed:
+                        not_interacted += 1
+                        continue
+
+                    has_key = db.query(Key).join(Server).filter(
+                        Key.subscription_id == sub.id,
+                        Key.is_active == True,
+                        Key.server_id.isnot(None),
+                        Server.server_set == group_name,
+                    ).first()
+                    if not has_key:
+                        need_keys += 1
+
+            keyboard = InlineKeyboardMarkup()
+            keyboard.row(
+                InlineKeyboardButton("Confirm", callback_data=f"actgrp_confirm_{group_name}"),
+                InlineKeyboardButton("Cancel", callback_data="actgrp_cancel"),
+            )
+
+            bot.edit_message_text(
+                f"*Activate Group: {group_name}*\n\n"
+                f"Servers in group: {server_count}\n"
+                f"Interacted users needing keys: {need_keys}\n"
+                f"Not yet interacted (will get keys lazily): {not_interacted}\n\n"
+                f"This will create 1 key per interacted user on a random server from this group.",
+                call.message.chat.id,
+                call.message.id,
+                parse_mode='Markdown',
+                reply_markup=keyboard,
+            )
+
+        except Exception as e:
+            logger.error(f"Error in activate_group select: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('actgrp_confirm_'))
+    def handle_activate_group_confirm(call: CallbackQuery):
+        """Execute group activation."""
+        if not is_admin(call.from_user.id):
+            return
+
+        group_name = call.data.replace('actgrp_confirm_', '', 1)
+        bot.answer_callback_query(call.id)
+
+        bot.edit_message_text(
+            f"Activating group `{group_name}`... Please wait.",
+            call.message.chat.id,
+            call.message.id,
+            parse_mode='Markdown',
+        )
+
+        try:
+            with get_db_session() as db:
+                stats = KeyService.activate_group_for_all(db, group_name)
+
+            bot.send_message(
+                call.message.chat.id,
+                f"*Group `{group_name}` activated!*\n\n"
+                f"Created: {stats['created']} keys\n"
+                f"Skipped (already had key): {stats['skipped']}\n"
+                f"Skipped (not interacted yet): {stats['skipped_no_keys']}\n"
+                f"Failed: {stats['failed']}",
+                parse_mode='Markdown',
+            )
+
+        except Exception as e:
+            logger.error(f"Error activating group: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'actgrp_cancel')
+    def handle_activate_group_cancel(call: CallbackQuery):
+        """Cancel group activation."""
+        bot.answer_callback_query(call.id, "Cancelled")
+        bot.edit_message_text("Group activation cancelled.", call.message.chat.id, call.message.id)
 
     # ── /toggle_server ───────────────────────────────────────
     @bot.message_handler(commands=['toggle_server'])
@@ -1205,31 +1395,51 @@ You can now start testing from scratch with /start"""
             content = file_bytes.decode('utf-8-sig')
 
             reader = csv.reader(io.StringIO(content))
-            stats = {"users": 0, "outline_keys": 0, "vless_keys": 0, "skipped_dup": 0, "errors": 0}
+            stats = {
+                "users": 0, "outline_keys": 0, "vless_keys": 0,
+                "skipped_dup": 0, "errors": 0,
+                "skipped_no_payment": 0, "skipped_expired": 0,
+                "total_rows": 0, "skipped_no_keys": 0,
+            }
 
             with get_db_session() as db:
                 for row_num, row in enumerate(reader, 1):
+                    stats["total_rows"] += 1
                     row = [c.strip() for c in row]
                     if len(row) < 10:
                         stats["errors"] += 1
+                        logger.info(f"Row {row_num}: bad format ({len(row)} cols)")
                         continue
 
                     try:
                         telegram_id = int(row[0])
                     except ValueError:
                         stats["errors"] += 1
+                        logger.info(f"Row {row_num}: bad telegram_id '{row[0]}'")
                         continue
 
-                    # Parse payment_until
+                    # Parse payment_until — skip users with no active payment
                     try:
-                        payment_until = int(row[4])
+                        payment_until = float(row[4])
                     except ValueError:
                         payment_until = 0
 
-                    if payment_until > 0:
-                        expiry = datetime.utcfromtimestamp(payment_until)
-                    else:
-                        expiry = datetime.utcnow() + timedelta(days=90)
+                    if payment_until <= 0:
+                        stats["skipped_no_payment"] += 1
+                        continue
+
+                    expiry = datetime.utcfromtimestamp(int(payment_until))
+                    if expiry < datetime.utcnow():
+                        stats["skipped_expired"] += 1
+                        continue
+
+                    # Check if row has any actual keys
+                    has_outline1 = row[2].lower() not in ('nokey', '')
+                    has_outline2 = row[6].lower() not in ('nokey', '')
+                    has_vless = row[9].lower() not in ('nokey', '')
+                    if not has_outline1 and not has_outline2 and not has_vless:
+                        stats["skipped_no_keys"] += 1
+                        continue
 
                     # Find or create user
                     user = db.query(User).filter(User.telegram_id == telegram_id).first()
@@ -1328,11 +1538,16 @@ You can now start testing from scratch with /start"""
             bot.send_message(
                 message.chat.id,
                 f"*Import complete*\n\n"
+                f"Total rows: {stats['total_rows']}\n"
                 f"Users with keys: {stats['users']}\n"
                 f"Outline keys: {stats['outline_keys']}\n"
                 f"VLESS keys: {stats['vless_keys']}\n"
-                f"Skipped (duplicate): {stats['skipped_dup']}\n"
-                f"Errors (bad rows): {stats['errors']}",
+                f"\n*Skipped:*\n"
+                f"Never paid: {stats['skipped_no_payment']}\n"
+                f"Payment expired: {stats['skipped_expired']}\n"
+                f"No keys in row: {stats['skipped_no_keys']}\n"
+                f"Duplicate keys: {stats['skipped_dup']}\n"
+                f"Bad rows: {stats['errors']}",
                 parse_mode='Markdown'
             )
 

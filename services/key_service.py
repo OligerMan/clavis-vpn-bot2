@@ -3,6 +3,7 @@
 import logging
 import random
 from collections import defaultdict
+from datetime import datetime
 from typing import Dict, List
 
 from sqlalchemy.orm import Session
@@ -42,21 +43,36 @@ class KeyService:
         return servers
 
     @staticmethod
+    def get_activated_groups(db: Session) -> List[str]:
+        """
+        Get distinct server_set names that have at least one active server.
+
+        Returns:
+            List of group names
+        """
+        rows = db.query(Server.server_set).filter(
+            Server.protocol == 'xui',
+            Server.is_active == True,
+        ).distinct().all()
+        return [r[0] or "default" for r in rows]
+
+    @staticmethod
     def select_servers_for_user(
         db: Session,
         subscription: Subscription,
-        limit: int = USER_SERVER_LIMIT,
+        limit: int = None,
     ) -> List[Server]:
         """
-        Select servers for a user, respecting server sets and limit.
+        Select servers for a user — 1 per activated group.
 
-        Round-robins across server_set groups: picks 1 from each set
-        (randomized within set) before picking a 2nd from any set, etc.
+        If limit is None, computes it as number of distinct activated groups.
+        Picks 1 random server from each group the user doesn't already have
+        a key in.
 
         Args:
             db: Database session
             subscription: Subscription to check existing keys for
-            limit: Maximum number of servers to return
+            limit: Maximum number of servers to return (default: 1 per group)
 
         Returns:
             List of Server objects to create keys on (may be empty)
@@ -78,39 +94,34 @@ class KeyService:
             ).distinct().all()
         )
 
+        # Groups user already has keys in
+        existing_groups = set()
+        for server in all_servers:
+            if server.id in existing_server_ids:
+                existing_groups.add(server.server_set or "default")
+
         # Group available (not yet assigned) servers by set
         sets: Dict[str, List[Server]] = defaultdict(list)
         for server in all_servers:
-            if server.id not in existing_server_ids and server.has_capacity:
-                sets[server.server_set or "default"].append(server)
+            group = server.server_set or "default"
+            if group not in existing_groups and server.has_capacity:
+                sets[group].append(server)
+
+        if limit is None:
+            # 1 per group: only fill groups user is missing
+            limit = len(sets)
 
         # Shuffle within each set for randomness
         for servers_in_set in sets.values():
             random.shuffle(servers_in_set)
 
-        # Round-robin across sets
+        # Pick 1 from each group (up to limit)
         selected: List[Server] = []
-        remaining = limit - len(existing_server_ids)
-
-        while remaining > 0 and sets:
-            picked_this_round = False
-            empty_sets = []
-            for set_name, servers_in_set in sets.items():
-                if remaining <= 0:
-                    break
-                if servers_in_set:
-                    selected.append(servers_in_set.pop(0))
-                    remaining -= 1
-                    picked_this_round = True
-                if not servers_in_set:
-                    empty_sets.append(set_name)
-
-            # Remove exhausted sets
-            for set_name in empty_sets:
-                del sets[set_name]
-
-            if not picked_this_round:
+        for group_name, servers_in_set in sets.items():
+            if len(selected) >= limit:
                 break
+            if servers_in_set:
+                selected.append(servers_in_set[0])
 
         return selected
 
@@ -174,10 +185,13 @@ class KeyService:
         user_telegram_id: int,
     ) -> List[Key]:
         """
-        Ensure the subscription has keys up to USER_SERVER_LIMIT.
+        Ensure the subscription has keys in all activated groups.
 
-        Idempotent: if enough managed keys already exist, returns them as-is.
-        Otherwise creates keys on additional servers to fill the gap.
+        Idempotent: if user already has a key in every activated group,
+        returns existing keys. Otherwise creates keys to fill missing groups.
+
+        Note: keys are NOT auto-created for newly added groups.
+        Use /activate_group for that.
 
         Args:
             db: Database session
@@ -187,23 +201,15 @@ class KeyService:
         Returns:
             List of all active keys for this subscription
         """
-        # Count active managed keys (server_id IS NOT NULL)
-        managed_keys_count = db.query(Key).filter(
-            Key.subscription_id == subscription.id,
-            Key.server_id.isnot(None),
-            Key.is_active == True,
-        ).count()
-
-        if managed_keys_count < USER_SERVER_LIMIT:
-            # Need more keys — select_servers_for_user already excludes existing
-            servers = KeyService.select_servers_for_user(db, subscription)
-            if servers:
-                try:
-                    KeyService.create_subscription_keys(
-                        db, subscription, user_telegram_id, servers=servers,
-                    )
-                except ValueError as e:
-                    logger.warning(f"Could not create all keys for sub {subscription.id}: {e}")
+        # select_servers_for_user already computes which groups are missing
+        servers = KeyService.select_servers_for_user(db, subscription)
+        if servers:
+            try:
+                KeyService.create_subscription_keys(
+                    db, subscription, user_telegram_id, servers=servers,
+                )
+            except ValueError as e:
+                logger.warning(f"Could not create all keys for sub {subscription.id}: {e}")
 
         # Return all active keys (managed + legacy)
         return db.query(Key).filter(
@@ -325,6 +331,93 @@ class KeyService:
             Key.server_id.is_(None),
             Key.is_active == True,
         ).all()
+
+    @staticmethod
+    def activate_group_for_all(
+        db: Session,
+        group_name: str,
+    ) -> Dict[str, int]:
+        """
+        Create 1 key from the specified group for every active subscription
+        that doesn't already have a key in that group.
+
+        Args:
+            db: Database session
+            group_name: Server set / group name
+
+        Returns:
+            Dict with created, skipped, failed counts
+        """
+        # Get servers in this group
+        group_servers = db.query(Server).filter(
+            Server.protocol == 'xui',
+            Server.is_active == True,
+            Server.server_set == group_name,
+        ).all()
+
+        if not group_servers:
+            raise ValueError(f"No active servers in group '{group_name}'")
+
+        # Get active, non-expired subscriptions that already have managed keys
+        # (user interacted with new bot). Users without managed keys get keys
+        # lazily via ensure_keys_exist when they interact.
+        active_subs = db.query(Subscription).filter(
+            Subscription.is_active == True,
+            Subscription.expires_at > datetime.utcnow(),
+        ).all()
+
+        # Filter to subs that have at least one managed key (server_id not null)
+        subs_with_keys = []
+        for sub in active_subs:
+            has_managed = db.query(Key).filter(
+                Key.subscription_id == sub.id,
+                Key.server_id.isnot(None),
+                Key.is_active == True,
+            ).first()
+            if has_managed:
+                subs_with_keys.append(sub)
+
+        stats = {"created": 0, "skipped": 0, "skipped_no_keys": len(active_subs) - len(subs_with_keys), "failed": 0}
+
+        for sub in subs_with_keys:
+            # Check if user already has a key in this group
+            existing = db.query(Key).join(Server).filter(
+                Key.subscription_id == sub.id,
+                Key.is_active == True,
+                Key.server_id.isnot(None),
+                Server.server_set == group_name,
+            ).first()
+
+            if existing:
+                stats["skipped"] += 1
+                continue
+
+            # Pick random server from group with capacity
+            candidates = [s for s in group_servers if s.has_capacity]
+            if not candidates:
+                stats["failed"] += 1
+                continue
+
+            server = random.choice(candidates)
+            try:
+                client = XUIClient(server)
+                key = client.create_key(sub, sub.user.telegram_id)
+                db.add(key)
+                db.commit()
+                db.refresh(key)
+                stats["created"] += 1
+                logger.info(
+                    f"activate_group: created key on {server.name} "
+                    f"for sub {sub.id} (user {sub.user.telegram_id})"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"activate_group: failed to create key on {server.name} "
+                    f"for sub {sub.id}: {e}"
+                )
+                stats["failed"] += 1
+
+        return stats
 
     @staticmethod
     def update_subscription_keys_expiry(db: Session, subscription: Subscription) -> int:
