@@ -205,20 +205,31 @@ def status_actions_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
-def payment_confirmation_keyboard(transaction_id: int) -> InlineKeyboardMarkup:
+def payment_help_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     """
-    Generate payment confirmation keyboard with mock payment button.
+    Generate payment help keyboard shown after invoice is sent.
 
     Buttons:
-    - Оплатить (simulates successful payment)
+    - Попробовать снова (retry payment)
+    - Связаться с поддержкой (URL to support)
 
     Args:
-        transaction_id: Transaction ID to confirm
+        telegram_id: User's Telegram ID to include in support message
     """
+    import urllib.parse
+
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
-        InlineKeyboardButton("💳 Оплатить", callback_data=f"mock_pay_{transaction_id}")
+        InlineKeyboardButton("🔄 Попробовать снова", callback_data="payment")
+    )
+
+    support_message = f"Здравствуйте! Мой ID: {telegram_id}. Оплата прошла, но подписка не активирована."
+    encoded_message = urllib.parse.quote(support_message)
+    support_url = f"https://t.me/clavis_support?text={encoded_message}"
+
+    keyboard.row(
+        InlineKeyboardButton("💬 Связаться с поддержкой", url=support_url)
     )
 
     return keyboard

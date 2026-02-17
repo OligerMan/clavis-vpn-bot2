@@ -10,6 +10,9 @@ load_dotenv()
 # Bot Token
 BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 
+# Telegram Payment Provider Token (YooKassa via Telegram Payments)
+TELEGRAM_PAYMENT_TOKEN = os.getenv('TELEGRAM_PAYMENT_TOKEN', '')
+
 # Subscription Base URL
 SUBSCRIPTION_BASE_URL = os.getenv('SUBSCRIPTION_BASE_URL', 'https://vpn.example.com')
 

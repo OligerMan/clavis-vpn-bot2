@@ -1,15 +1,16 @@
-"""Payment flow handlers for Telegram bot."""
+"""Payment flow handlers for Telegram bot using Telegram native payments."""
 
+import json
 import logging
 from telebot import TeleBot
-from telebot.types import Message, CallbackQuery
+from telebot.types import Message, CallbackQuery, LabeledPrice, PreCheckoutQuery
 
 from database import get_db_session
 from database.models import User, Transaction
 from services import SubscriptionService, KeyService
 from message_templates import Messages
-from bot.keyboards.markups import payment_plans_keyboard, key_actions_keyboard, payment_confirmation_keyboard
-from config.settings import PLANS, ADMIN_IDS, SUBSCRIPTION_BASE_URL, DEVICE_LIMIT
+from bot.keyboards.markups import payment_plans_keyboard, key_actions_keyboard, payment_help_keyboard
+from config.settings import PLANS, ADMIN_IDS, SUBSCRIPTION_BASE_URL, DEVICE_LIMIT, TELEGRAM_PAYMENT_TOKEN
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +40,8 @@ def register_payment_handlers(bot: TeleBot) -> None:
 
     @bot.callback_query_handler(func=lambda call: call.data in ['plan_90', 'plan_365'])
     def handle_plan_selection(call: CallbackQuery):
-        """Handle plan selection callback."""
+        """Handle plan selection — send Telegram native invoice."""
         try:
-            # Parse plan
             plan_key = '90_days' if call.data == 'plan_90' else '365_days'
             plan = PLANS[plan_key]
 
@@ -61,54 +61,129 @@ def register_payment_handlers(bot: TeleBot) -> None:
                     status='pending',
                     plan=plan_key
                 )
-
                 db.add(transaction)
                 db.commit()
                 db.refresh(transaction)
+                transaction_id = transaction.id
 
-                # Send payment pending message
-                bot.answer_callback_query(call.id, "Создана транзакция")
-                bot.edit_message_text(
-                    Messages.PAYMENT_PENDING.format(transaction_id=transaction.id),
-                    call.message.chat.id,
-                    call.message.id,
-                    reply_markup=payment_confirmation_keyboard(transaction.id),
-                    parse_mode='Markdown'
-                )
+                logger.info(f"Created transaction {transaction_id} for user {user.telegram_id}, plan {plan_key}")
 
-                logger.info(f"Created transaction {transaction.id} for user {user.telegram_id}, plan {plan_key}")
+            bot.answer_callback_query(call.id)
+
+            # Build YooKassa receipt via provider_data
+            provider_data = json.dumps({
+                "receipt": {
+                    "items": [
+                        {
+                            "description": f"VPN подписка на {plan['description']}",
+                            "quantity": "1.00",
+                            "amount": {
+                                "value": f"{plan['amount'] / 100:.2f}",
+                                "currency": "RUB"
+                            },
+                            "vat_code": 1
+                        }
+                    ]
+                }
+            })
+
+            # Send Telegram native invoice
+            bot.send_invoice(
+                chat_id=call.message.chat.id,
+                title="Оплата VPN",
+                description=f"VPN подписка на {plan['description']}",
+                invoice_payload=f"{plan_key}#{transaction_id}",
+                provider_token=TELEGRAM_PAYMENT_TOKEN,
+                currency="RUB",
+                prices=[LabeledPrice(label=f"VPN {plan['description']}", amount=plan['amount'])],
+                need_email=True,
+                send_email_to_provider=True,
+                provider_data=provider_data
+            )
+
+            # Send help message after the invoice
+            bot.send_message(
+                call.message.chat.id,
+                Messages.PAYMENT_HELP,
+                reply_markup=payment_help_keyboard(call.from_user.id),
+                parse_mode='Markdown'
+            )
 
         except Exception as e:
             logger.error(f"Error in plan selection callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Произошла ошибка")
             bot.send_message(call.message.chat.id, Messages.ERROR_GENERIC)
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith('mock_pay_'))
-    def handle_mock_payment(call: CallbackQuery):
-        """Handle mock payment button - simulates successful payment."""
+    @bot.pre_checkout_query_handler(func=lambda query: True)
+    def handle_pre_checkout(query: PreCheckoutQuery):
+        """Validate pre-checkout — do NOT activate subscription here."""
         try:
-            # Extract transaction ID from callback data
-            transaction_id = int(call.data.split('_')[2])
+            payload = query.invoice_payload
+            parts = payload.split('#')
+            if len(parts) != 2:
+                bot.answer_pre_checkout_query(query.id, ok=False, error_message="Неверные данные платежа")
+                return
 
-            # Process payment
+            plan_key, transaction_id_str = parts
+
+            if plan_key not in PLANS:
+                bot.answer_pre_checkout_query(query.id, ok=False, error_message="Неверный тарифный план")
+                return
+
+            try:
+                transaction_id = int(transaction_id_str)
+            except ValueError:
+                bot.answer_pre_checkout_query(query.id, ok=False, error_message="Неверный ID транзакции")
+                return
+
+            with get_db_session() as db:
+                transaction = db.query(Transaction).filter(
+                    Transaction.id == transaction_id
+                ).first()
+
+                if not transaction:
+                    bot.answer_pre_checkout_query(query.id, ok=False, error_message="Транзакция не найдена")
+                    return
+
+                if transaction.status != 'pending':
+                    bot.answer_pre_checkout_query(query.id, ok=False, error_message="Транзакция уже обработана")
+                    return
+
+            # All checks passed — allow the payment to proceed
+            bot.answer_pre_checkout_query(query.id, ok=True)
+            logger.info(f"Pre-checkout approved for transaction {transaction_id}")
+
+        except Exception as e:
+            logger.error(f"Error in pre_checkout handler: {e}", exc_info=True)
+            bot.answer_pre_checkout_query(query.id, ok=False, error_message="Внутренняя ошибка")
+
+    @bot.message_handler(content_types=['successful_payment'])
+    def handle_successful_payment(message: Message):
+        """Handle confirmed successful payment — activate subscription here."""
+        try:
+            payload = message.successful_payment.invoice_payload
+            parts = payload.split('#')
+            if len(parts) != 2:
+                logger.error(f"Invalid payload in successful_payment: {payload}")
+                return
+
+            _, transaction_id_str = parts
+            transaction_id = int(transaction_id_str)
+
             success = handle_payment_webhook(bot, transaction_id, 'success')
 
             if success:
-                bot.answer_callback_query(call.id, "✅ Оплата успешна!")
-                # Message is already updated by handle_payment_webhook
+                logger.info(f"Successful payment processed for transaction {transaction_id}")
             else:
-                bot.answer_callback_query(call.id, "❌ Ошибка обработки платежа")
-                bot.edit_message_text(
-                    f"❌ Ошибка при обработке транзакции {transaction_id}.\n\nОбратитесь в поддержку: /help",
-                    call.message.chat.id,
-                    call.message.id,
-                    parse_mode='Markdown'
+                logger.error(f"Failed to process successful payment for transaction {transaction_id}")
+                bot.send_message(
+                    message.chat.id,
+                    "Платёж получен, но произошла ошибка активации. Обратитесь в поддержку: /support"
                 )
 
         except Exception as e:
-            logger.error(f"Error in mock payment callback: {e}", exc_info=True)
-            bot.answer_callback_query(call.id, "Произошла ошибка")
-            bot.send_message(call.message.chat.id, Messages.ERROR_GENERIC)
+            logger.error(f"Error in successful_payment handler: {e}", exc_info=True)
+            bot.send_message(message.chat.id, Messages.ERROR_GENERIC)
 
     @bot.message_handler(commands=['confirm_payment'])
     def handle_confirm_payment(message: Message):
