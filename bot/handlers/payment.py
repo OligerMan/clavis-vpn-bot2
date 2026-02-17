@@ -70,32 +70,31 @@ def register_payment_handlers(bot: TeleBot) -> None:
 
             bot.answer_callback_query(call.id)
 
-            # Build YooKassa receipt via provider_data
+            price_rub = f"{plan['amount'] / 100:.2f}"
+
             provider_data = json.dumps({
                 "receipt": {
-                    "items": [
-                        {
-                            "description": f"VPN подписка на {plan['description']}",
-                            "quantity": "1.00",
-                            "amount": {
-                                "value": f"{plan['amount'] / 100:.2f}",
-                                "currency": "RUB"
-                            },
-                            "vat_code": 1
-                        }
-                    ]
+                    "items": [{
+                        "description": f"Оплата услуг Clavis на {plan['days']} дней",
+                        "quantity": "1.00",
+                        "amount": {
+                            "value": price_rub,
+                            "currency": "RUB"
+                        },
+                        "vat_code": 1
+                    }]
                 }
             })
 
             # Send Telegram native invoice
             bot.send_invoice(
-                chat_id=call.message.chat.id,
-                title="Оплата VPN",
-                description=f"VPN подписка на {plan['description']}",
-                invoice_payload=f"{plan_key}#{transaction_id}",
-                provider_token=TELEGRAM_PAYMENT_TOKEN,
-                currency="RUB",
-                prices=[LabeledPrice(label=f"VPN {plan['description']}", amount=plan['amount'])],
+                call.message.chat.id,
+                "Оплата VPN",
+                f"Оплата VPN на {plan['days']} дней",
+                f"{plan_key}#{transaction_id}",
+                TELEGRAM_PAYMENT_TOKEN,
+                "RUB",
+                [LabeledPrice(f"{price_rub} рублей", plan['amount'])],
                 need_email=True,
                 send_email_to_provider=True,
                 provider_data=provider_data
@@ -116,7 +115,12 @@ def register_payment_handlers(bot: TeleBot) -> None:
 
     @bot.pre_checkout_query_handler(func=lambda query: True)
     def handle_pre_checkout(query: PreCheckoutQuery):
-        """Validate pre-checkout — do NOT activate subscription here."""
+        """
+        Handle pre-checkout: activate subscription, then confirm.
+
+        Same approach as v1 bot — process payment in pre_checkout because
+        YooKassa does not send successful_payment callback via Telegram.
+        """
         try:
             payload = query.invoice_payload
             parts = payload.split('#')
@@ -136,22 +140,16 @@ def register_payment_handlers(bot: TeleBot) -> None:
                 bot.answer_pre_checkout_query(query.id, ok=False, error_message="Неверный ID транзакции")
                 return
 
-            with get_db_session() as db:
-                transaction = db.query(Transaction).filter(
-                    Transaction.id == transaction_id
-                ).first()
+            # Activate subscription before answering (same as v1)
+            success = handle_payment_webhook(bot, transaction_id, 'success')
 
-                if not transaction:
-                    bot.answer_pre_checkout_query(query.id, ok=False, error_message="Транзакция не найдена")
-                    return
+            if not success:
+                bot.answer_pre_checkout_query(query.id, ok=False, error_message="Ошибка активации подписки")
+                return
 
-                if transaction.status != 'pending':
-                    bot.answer_pre_checkout_query(query.id, ok=False, error_message="Транзакция уже обработана")
-                    return
-
-            # All checks passed — allow the payment to proceed
+            # Confirm payment after activation
             bot.answer_pre_checkout_query(query.id, ok=True)
-            logger.info(f"Pre-checkout approved for transaction {transaction_id}")
+            logger.info(f"Pre-checkout processed and subscription activated for transaction {transaction_id}")
 
         except Exception as e:
             logger.error(f"Error in pre_checkout handler: {e}", exc_info=True)
@@ -159,31 +157,31 @@ def register_payment_handlers(bot: TeleBot) -> None:
 
     @bot.message_handler(content_types=['successful_payment'])
     def handle_successful_payment(message: Message):
-        """Handle confirmed successful payment — activate subscription here."""
+        """Handle successful_payment if it arrives (belt-and-suspenders)."""
         try:
             payload = message.successful_payment.invoice_payload
             parts = payload.split('#')
             if len(parts) != 2:
-                logger.error(f"Invalid payload in successful_payment: {payload}")
                 return
 
             _, transaction_id_str = parts
             transaction_id = int(transaction_id_str)
 
-            success = handle_payment_webhook(bot, transaction_id, 'success')
+            # Check if already processed in pre_checkout
+            with get_db_session() as db:
+                transaction = db.query(Transaction).filter(
+                    Transaction.id == transaction_id
+                ).first()
+                if transaction and transaction.status == 'completed':
+                    logger.info(f"Transaction {transaction_id} already completed in pre_checkout, skipping")
+                    return
 
-            if success:
-                logger.info(f"Successful payment processed for transaction {transaction_id}")
-            else:
-                logger.error(f"Failed to process successful payment for transaction {transaction_id}")
-                bot.send_message(
-                    message.chat.id,
-                    "Платёж получен, но произошла ошибка активации. Обратитесь в поддержку: /support"
-                )
+            # Process if not yet completed (shouldn't normally happen)
+            handle_payment_webhook(bot, transaction_id, 'success')
+            logger.info(f"Successful payment processed for transaction {transaction_id} via successful_payment handler")
 
         except Exception as e:
             logger.error(f"Error in successful_payment handler: {e}", exc_info=True)
-            bot.send_message(message.chat.id, Messages.ERROR_GENERIC)
 
     @bot.message_handler(commands=['confirm_payment'])
     def handle_confirm_payment(message: Message):
@@ -237,9 +235,6 @@ def register_payment_handlers(bot: TeleBot) -> None:
 def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bool:
     """
     Handle payment webhook (or manual confirmation).
-
-    This function processes payment confirmations from payment gateways
-    or manual admin confirmations.
 
     Args:
         bot: TeleBot instance

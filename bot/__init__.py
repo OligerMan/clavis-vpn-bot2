@@ -50,7 +50,11 @@ def start_polling() -> None:
     """Start bot polling loop."""
     logger.info("Starting bot polling...")
     try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        bot.infinity_polling(
+            timeout=60,
+            long_polling_timeout=60,
+            allowed_updates=["message", "callback_query", "pre_checkout_query"]
+        )
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
