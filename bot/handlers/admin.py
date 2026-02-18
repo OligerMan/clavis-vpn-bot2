@@ -18,14 +18,11 @@ from telebot.types import Message, CallbackQuery, ForceReply, InlineKeyboardMark
 
 from database import get_db_session
 from database.models import Server, User, Subscription, Key, Transaction
-from config.settings import ADMIN_IDS
+from config.settings import ADMIN_IDS, XUI_USERNAME, XUI_PASSWORD
 from services import KeyService
 
 logger = logging.getLogger(__name__)
 
-# Default x-ui credentials
-DEFAULT_XUI_USERNAME = "oligerman"
-DEFAULT_XUI_PASSWORD = "c7j274yeoq2"
 DEFAULT_XUI_PANEL_PORT = 2053
 DEFAULT_XUI_BASE_PATH = "/dashboard/"
 
@@ -45,7 +42,7 @@ def _discover_inbounds(domain: str, base_path: str = DEFAULT_XUI_BASE_PATH) -> d
     Returns dict with api, inbounds list, and api_url.
     """
     api_url = f"https://{domain}:{DEFAULT_XUI_PANEL_PORT}{base_path}"
-    api = Api(api_url, username=DEFAULT_XUI_USERNAME, password=DEFAULT_XUI_PASSWORD, use_tls_verify=True)
+    api = Api(api_url, username=XUI_USERNAME, password=XUI_PASSWORD, use_tls_verify=True)
     api.login()
     inbounds = api.inbound.get_list()
     return {"api": api, "api_url": api_url, "inbounds": inbounds}
@@ -526,15 +523,15 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         try:
             api_url = state["api_url"]
-            api = Api(api_url, username=DEFAULT_XUI_USERNAME, password=DEFAULT_XUI_PASSWORD, use_tls_verify=True)
+            api = Api(api_url, username=XUI_USERNAME, password=XUI_PASSWORD, use_tls_verify=True)
             api.login()
 
             cfg = _create_vless_reality_inbound(api, remark=state["name"])
 
             # Save server to DB
             credentials = {
-                "username": DEFAULT_XUI_USERNAME,
-                "password": DEFAULT_XUI_PASSWORD,
+                "username": XUI_USERNAME,
+                "password": XUI_PASSWORD,
                 "inbound_id": cfg["inbound_id"],
                 "use_tls_verify": True,
                 "connection_settings": {

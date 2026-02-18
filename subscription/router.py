@@ -2,6 +2,7 @@
 
 import base64
 import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -13,9 +14,16 @@ from vpn.xui_uri_builder import parse_vless_uri
 from subscription.cache import (
     get_cached_subscription,
     cache_subscription_response,
-    get_cache_stats,
 )
 from subscription.formatter import format_subscription_response
+
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+
+
+def _validate_token(token: str) -> None:
+    """Raise 404 if token is not a valid UUID format."""
+    if not _UUID_RE.match(token):
+        raise HTTPException(status_code=404, detail="Not found")
 
 
 def _make_profile_title(subscription: Subscription) -> str:
@@ -51,6 +59,8 @@ async def get_subscription(token: str, request: Request) -> PlainTextResponse:
     Raises:
         HTTPException: 404 if subscription not found or has no keys
     """
+    _validate_token(token)
+
     # Log access for analytics
     client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent", "unknown")
@@ -185,6 +195,8 @@ async def get_subscription_info(token: str) -> JSONResponse:
     Raises:
         HTTPException: 404 if subscription not found
     """
+    _validate_token(token)
+
     try:
         with get_db_session() as db:
             # Get subscription
@@ -237,17 +249,6 @@ async def get_subscription_info(token: str) -> JSONResponse:
         )
 
 
-@router.get("/cache/stats")
-async def get_cache_statistics() -> JSONResponse:
-    """Get cache statistics.
-
-    Returns:
-        JSONResponse with cache statistics
-    """
-    stats = get_cache_stats()
-    return JSONResponse(content=stats)
-
-
 @router.get("/raw/{token}")
 async def get_subscription_raw(token: str, request: Request) -> PlainTextResponse:
     """Serve subscription as raw VLESS URIs (not base64).
@@ -264,6 +265,8 @@ async def get_subscription_raw(token: str, request: Request) -> PlainTextRespons
     Raises:
         HTTPException: 404 if subscription not found or has no keys
     """
+    _validate_token(token)
+
     # Log access
     client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent", "unknown")
@@ -306,6 +309,8 @@ async def get_subscription_raw(token: str, request: Request) -> PlainTextRespons
             # Get raw URIs (not base64 encoded)
             from subscription.formatter import modify_vless_remark
 
+            from subscription.formatter import _extract_server_name
+
             uris = []
             for key in keys:
                 uri = key.key_data
@@ -314,10 +319,17 @@ async def get_subscription_raw(token: str, request: Request) -> PlainTextRespons
 
                 # Modify remark if expired
                 if is_expired:
-                    from subscription.formatter import _extract_server_name
                     server_name = _extract_server_name(uri)
                     expired_remark = f"⏰ Clavis {server_name} - Expired, please renew subscription"
                     uri = modify_vless_remark(uri, expired_remark)
+                elif key.server_id is None:
+                    uri = modify_vless_remark(uri, "Clavis v1 (старый ключ)")
+                else:
+                    from subscription.formatter import _extract_remark, _country_flag
+                    remark = _extract_remark(uri)
+                    flag = _country_flag(remark)
+                    if flag:
+                        uri = modify_vless_remark(uri, f"{remark} {flag}")
 
                 uris.append(uri)
 
@@ -363,6 +375,8 @@ async def get_subscription_raw(token: str, request: Request) -> PlainTextRespons
 @router.get("/json/{token}")
 async def get_subscription_json(token: str, request: Request) -> JSONResponse:
     """Serve subscription as JSON for v2raytun."""
+    _validate_token(token)
+
     client_ip = request.client.host if request.client else "unknown"
     user_agent = request.headers.get("user-agent", "unknown")
     logger.info(f"JSON subscription access: token={token[:8]}..., ip={client_ip}, ua={user_agent[:50]}")
@@ -447,6 +461,8 @@ async def v2raytun_redirect(token: str, request: Request):
         token: Subscription token (UUID)
         request: FastAPI request object
     """
+    _validate_token(token)
+
     from config.settings import SUBSCRIPTION_BASE_URL
 
     client_ip = request.client.host if request.client else "unknown"

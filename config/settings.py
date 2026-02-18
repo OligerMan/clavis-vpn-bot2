@@ -13,6 +13,10 @@ BOT_TOKEN = os.getenv('BOT_TOKEN', '')
 # Telegram Payment Provider Token (YooKassa via Telegram Payments)
 TELEGRAM_PAYMENT_TOKEN = os.getenv('TELEGRAM_PAYMENT_TOKEN', '')
 
+# YooKassa API credentials (for payment verification)
+YOOKASSA_SHOP_ID = os.getenv('YOOKASSA_SHOP_ID', '')
+YOOKASSA_SECRET_KEY = os.getenv('YOOKASSA_SECRET_KEY', '')
+
 # Subscription Base URL
 SUBSCRIPTION_BASE_URL = os.getenv('SUBSCRIPTION_BASE_URL', 'https://vpn.example.com')
 
@@ -30,14 +34,14 @@ ADMIN_IDS: List[int] = [
 PLANS: Dict[str, Dict[str, any]] = {
     '90_days': {
         'days': 90,
-        'amount': 17500,  # 175 rubles in kopeks
-        'price_display': '175₽',
+        'amount': 27500,  # 275 rubles in kopeks
+        'price_display': '275₽',
         'description': '3 месяца'
     },
     '365_days': {
         'days': 365,
-        'amount': 60000,  # 600 rubles in kopeks
-        'price_display': '600₽',
+        'amount': 92500,  # 925 rubles in kopeks
+        'price_display': '925₽',
         'description': '1 год'
     }
 }
@@ -50,6 +54,10 @@ DEVICE_LIMIT = 5
 
 # Max number of servers a user gets keys on (lazy init)
 USER_SERVER_LIMIT = int(os.getenv('USER_SERVER_LIMIT', '2'))
+
+# X-UI panel credentials
+XUI_USERNAME = os.getenv('XUI_USERNAME', '')
+XUI_PASSWORD = os.getenv('XUI_PASSWORD', '')
 
 # Subscription server settings
 SUBSCRIPTION_PORT = int(os.getenv('SUBSCRIPTION_PORT', 8080))

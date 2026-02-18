@@ -19,8 +19,9 @@ def create_app() -> FastAPI:
     """
     app = FastAPI(
         title="Clavis VPN Subscription Server",
-        description="Serves VLESS URIs to v2ray clients (v2rayNG, v2raytun, v2rayN)",
-        version="2.0.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
 
     # Add CORS middleware (allow all origins for subscription access)
@@ -44,18 +45,8 @@ def create_app() -> FastAPI:
     # Root endpoint
     @app.get("/")
     async def root():
-        """Root endpoint with API info."""
-        return {
-            "name": "Clavis VPN Subscription Server",
-            "version": "2.0.0",
-            "endpoints": {
-                "subscription": "/sub/{token}",
-                "info": "/info/{token}",
-                "cache_stats": "/cache/stats",
-                "health": "/health",
-                "docs": "/docs",
-            }
-        }
+        """Root endpoint."""
+        return {"status": "ok"}
 
     logger.info("FastAPI application created")
     return app
