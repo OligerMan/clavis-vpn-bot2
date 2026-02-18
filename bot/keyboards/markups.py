@@ -103,16 +103,16 @@ def payment_plans_keyboard() -> InlineKeyboardMarkup:
     Generate payment plans keyboard.
 
     Buttons:
-    - 90 дней - 175₽
-    - 365 дней - 600₽
+    - 90 дней — 275₽
+    - 365 дней — 925₽
     """
     keyboard = InlineKeyboardMarkup(row_width=1)
 
     keyboard.row(
-        InlineKeyboardButton("📅 90 дней - 175₽", callback_data="plan_90")
+        InlineKeyboardButton("📅 90 дней — 275₽", callback_data="plan_90")
     )
     keyboard.row(
-        InlineKeyboardButton("📅 365 дней - 600₽ (Выгоднее!)", callback_data="plan_365")
+        InlineKeyboardButton("📅 365 дней — 925₽ (Выгоднее!)", callback_data="plan_365")
     )
     keyboard.row(
         InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")
@@ -137,6 +137,9 @@ def key_actions_keyboard(v2raytun_deeplink: str) -> InlineKeyboardMarkup:
     )
     keyboard.row(
         InlineKeyboardButton("📲 Установить клиент", callback_data="show_platforms")
+    )
+    keyboard.row(
+        InlineKeyboardButton("📚 Другие варианты подключения", callback_data="show_platforms_detailed")
     )
     keyboard.row(
         InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
@@ -168,6 +171,23 @@ def platform_menu_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
     )
 
+    return keyboard
+
+
+def platform_detailed_menu_keyboard() -> InlineKeyboardMarkup:
+    """Platform selection that leads to 'other connection methods' for each platform."""
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        InlineKeyboardButton("📱 Android", callback_data="android_detailed"),
+        InlineKeyboardButton("📱 iOS", callback_data="ios_detailed")
+    )
+    keyboard.row(
+        InlineKeyboardButton("💻 Windows", callback_data="windows_detailed"),
+        InlineKeyboardButton("💻 macOS", callback_data="macos_detailed")
+    )
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
+    )
     return keyboard
 
 
@@ -351,12 +371,14 @@ def detailed_instructions_keyboard(platform: str) -> InlineKeyboardMarkup:
     return keyboard
 
 
-def other_connection_methods_keyboard(platform: str) -> InlineKeyboardMarkup:
+def other_connection_methods_keyboard(platform: str, show_outline: bool = False, back_callback: str = None) -> InlineKeyboardMarkup:
     """
     Generate keyboard for other connection methods menu.
 
     Args:
         platform: Platform name (android, ios, windows, macos)
+        show_outline: Whether to show Outline key button (only if user has legacy keys)
+        back_callback: Custom callback for back button (default: platform_{platform})
     """
     keyboard = InlineKeyboardMarkup()
 
@@ -366,11 +388,12 @@ def other_connection_methods_keyboard(platform: str) -> InlineKeyboardMarkup:
     keyboard.row(
         InlineKeyboardButton("🔑 Отдельные VLESS-ключи", callback_data=f"vless_keys_{platform}")
     )
+    if show_outline:
+        keyboard.row(
+            InlineKeyboardButton("🔑 Outline-ключ (legacy)", callback_data=f"outline_key_{platform}")
+        )
     keyboard.row(
-        InlineKeyboardButton("🔑 Outline-ключ (legacy)", callback_data=f"outline_key_{platform}")
-    )
-    keyboard.row(
-        InlineKeyboardButton("◀️ Назад к инструкции", callback_data=f"platform_{platform}")
+        InlineKeyboardButton("◀️ Назад", callback_data=back_callback or f"platform_{platform}")
     )
 
     return keyboard

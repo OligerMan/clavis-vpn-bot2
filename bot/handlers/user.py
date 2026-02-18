@@ -15,6 +15,7 @@ from bot.keyboards.markups import (
     test_key_confirmation_keyboard,
     key_actions_keyboard,
     platform_menu_keyboard,
+    platform_detailed_menu_keyboard,
     status_actions_keyboard,
     back_button_keyboard,
     support_actions_keyboard,
@@ -36,17 +37,37 @@ def register_user_handlers(bot: TeleBot) -> None:
     def handle_start(message: Message):
         """Handle /start command - show welcome message."""
         try:
-            bot.send_message(
-                message.chat.id,
-                Messages.WELCOME,
-                reply_markup=start_menu_keyboard(),
-                parse_mode='Markdown'
-            )
+            with get_db_session() as db:
+                user = db.query(User).filter(
+                    User.telegram_id == message.from_user.id
+                ).first()
+
+                # Legacy or paid users get full menu right away
+                if user:
+                    has_legacy = KeyService.has_legacy_keys(db, user)
+                    active_sub = SubscriptionService.get_active_subscription(db, user)
+                    if has_legacy or (active_sub and not active_sub.is_test):
+                        hide_test_key = active_sub is not None
+                        welcome_text = Messages.WELCOME_LEGACY if has_legacy else Messages.WELCOME
+                        bot.send_message(
+                            message.chat.id,
+                            welcome_text,
+                            reply_markup=full_menu_keyboard(hide_test_key, show_old_keys=has_legacy),
+                            parse_mode='Markdown'
+                        )
+                        return
+
+                bot.send_message(
+                    message.chat.id,
+                    Messages.WELCOME,
+                    reply_markup=start_menu_keyboard(),
+                    parse_mode='Markdown'
+                )
         except Exception as e:
             logger.error(f"Error in /start handler: {e}", exc_info=True)
             bot.send_message(message.chat.id, Messages.ERROR_GENERIC)
 
-    @bot.message_handler(commands=['menu'])
+    @bot.message_handler(commands=['menu', 'help'])
     def handle_menu(message: Message):
         """Handle /menu command - show all commands."""
         try:
@@ -202,13 +223,6 @@ def register_user_handlers(bot: TeleBot) -> None:
                 # Calculate days left
                 days_left = (subscription.expires_at - datetime.utcnow()).days
 
-                # Get device count (number of active keys)
-                from database.models import Key
-                device_count = db.query(Key).filter(
-                    Key.subscription_id == subscription.id,
-                    Key.is_active == True
-                ).count()
-
                 # Get renewal reminder
                 renewal_reminder = SubscriptionService.get_renewal_reminder(subscription)
 
@@ -225,8 +239,6 @@ def register_user_handlers(bot: TeleBot) -> None:
                         upload_gb=traffic['upload_gb'],
                         download_gb=traffic['download_gb'],
                         total_gb=traffic['total_gb'],
-                        device_count=device_count,
-                        device_limit=DEVICE_LIMIT,
                         renewal_reminder=renewal_reminder
                     ),
                     parse_mode='Markdown'
@@ -514,6 +526,20 @@ def register_user_handlers(bot: TeleBot) -> None:
             bot.answer_callback_query(call.id)
         except Exception as e:
             logger.error(f"Error in show_platforms callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'show_platforms_detailed')
+    def callback_show_platforms_detailed(call: CallbackQuery):
+        """Handle show_platforms_detailed — platform selection for 'other methods'."""
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.id,
+                reply_markup=platform_detailed_menu_keyboard()
+            )
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in show_platforms_detailed callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Ошибка")
 
     @bot.callback_query_handler(func=lambda call: call.data == 'cancel')

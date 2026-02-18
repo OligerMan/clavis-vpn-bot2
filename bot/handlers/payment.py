@@ -2,6 +2,9 @@
 
 import json
 import logging
+import threading
+import time
+import requests
 from telebot import TeleBot
 from telebot.types import Message, CallbackQuery, LabeledPrice, PreCheckoutQuery
 
@@ -10,9 +13,133 @@ from database.models import User, Transaction
 from services import SubscriptionService, KeyService
 from message_templates import Messages
 from bot.keyboards.markups import payment_plans_keyboard, key_actions_keyboard, payment_help_keyboard
-from config.settings import PLANS, ADMIN_IDS, SUBSCRIPTION_BASE_URL, DEVICE_LIMIT, TELEGRAM_PAYMENT_TOKEN
+from config.settings import (
+    PLANS, ADMIN_IDS, SUBSCRIPTION_BASE_URL, DEVICE_LIMIT,
+    TELEGRAM_PAYMENT_TOKEN, YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY,
+)
 
 logger = logging.getLogger(__name__)
+
+# YooKassa API base URL
+YOOKASSA_API_URL = "https://api.yookassa.ru/v3/payments"
+
+# Verification settings
+VERIFY_DELAY_SECONDS = 5
+VERIFY_RETRIES = 30
+VERIFY_RETRY_INTERVAL = 10  # seconds between retries (~5 min total)
+
+
+def verify_payment_via_yookassa(
+    bot: TeleBot,
+    transaction_id: int,
+    telegram_id: int,
+    amount_kopeks: int,
+    created_after: str,
+) -> None:
+    """
+    Background task: poll YooKassa API to verify payment succeeded.
+
+    Searches for a recent payment matching telegram_id (in description),
+    amount, and created after a given timestamp. When found with
+    status 'succeeded', activates subscription.
+
+    Args:
+        bot: TeleBot instance
+        transaction_id: Our internal transaction ID
+        telegram_id: User's Telegram ID (YooKassa stores it in description)
+        amount_kopeks: Expected payment amount in kopeks
+        created_after: ISO timestamp — only consider payments created after this time
+    """
+    amount_rub = f"{amount_kopeks / 100:.2f}"
+    logger.info(
+        f"Starting YooKassa verification for transaction {transaction_id}, "
+        f"telegram_id={telegram_id}, amount={amount_rub} RUB, after={created_after}"
+    )
+
+    time.sleep(VERIFY_DELAY_SECONDS)
+
+    for attempt in range(1, VERIFY_RETRIES + 1):
+        try:
+            # Check if transaction was already completed (e.g. by successful_payment handler)
+            with get_db_session() as db:
+                transaction = db.query(Transaction).filter(
+                    Transaction.id == transaction_id
+                ).first()
+                if transaction and transaction.status == 'completed':
+                    logger.info(f"Transaction {transaction_id} already completed, stopping verification")
+                    return
+
+            # Query YooKassa for recent payments created after our transaction
+            response = requests.get(
+                YOOKASSA_API_URL,
+                params={
+                    "limit": 10,
+                    "created_at.gte": created_after,
+                },
+                auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY),
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Find matching payment by telegram_id and amount
+            for payment in data.get("items", []):
+                if (
+                    payment.get("description") == str(telegram_id)
+                    and payment.get("amount", {}).get("value") == amount_rub
+                ):
+                    status = payment.get("status")
+
+                    if status == "succeeded" and payment.get("paid") is True:
+                        logger.info(
+                            f"YooKassa payment confirmed: {payment['id']}, "
+                            f"transaction {transaction_id}, attempt {attempt}"
+                        )
+                        handle_payment_webhook(bot, transaction_id, 'success')
+                        return
+
+                    if status == "canceled":
+                        logger.info(
+                            f"YooKassa payment canceled: {payment['id']}, "
+                            f"transaction {transaction_id}, attempt {attempt}"
+                        )
+                        handle_payment_webhook(bot, transaction_id, 'failed')
+                        return
+
+            logger.info(
+                f"YooKassa verification attempt {attempt}/{VERIFY_RETRIES} "
+                f"for transaction {transaction_id}: no matching final payment found"
+            )
+
+        except Exception as e:
+            logger.error(
+                f"YooKassa verification error for transaction {transaction_id}, "
+                f"attempt {attempt}: {e}", exc_info=True
+            )
+
+        if attempt < VERIFY_RETRIES:
+            time.sleep(VERIFY_RETRY_INTERVAL)
+
+    # All retries exhausted — payment status unknown
+    logger.warning(f"YooKassa verification failed for transaction {transaction_id} after {VERIFY_RETRIES} attempts")
+
+    # Mark as failed so delayed help message won't fire either
+    with get_db_session() as db:
+        txn = db.query(Transaction).filter(Transaction.id == transaction_id).first()
+        if txn and txn.status == 'pending':
+            txn.fail()
+            db.commit()
+
+    try:
+        bot.send_message(
+            telegram_id,
+            "Не удалось подтвердить оплату. Если деньги были списаны, "
+            "свяжитесь с поддержкой — мы всё решим.\n\n/payment",
+            reply_markup=payment_help_keyboard(telegram_id),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"Error notifying user {telegram_id} about failed verification: {e}")
 
 
 def register_payment_handlers(bot: TeleBot) -> None:
@@ -100,13 +227,6 @@ def register_payment_handlers(bot: TeleBot) -> None:
                 provider_data=provider_data
             )
 
-            # Send help message after the invoice
-            bot.send_message(
-                call.message.chat.id,
-                Messages.PAYMENT_HELP,
-                reply_markup=payment_help_keyboard(call.from_user.id),
-                parse_mode='Markdown'
-            )
 
         except Exception as e:
             logger.error(f"Error in plan selection callback: {e}", exc_info=True)
@@ -116,10 +236,9 @@ def register_payment_handlers(bot: TeleBot) -> None:
     @bot.pre_checkout_query_handler(func=lambda query: True)
     def handle_pre_checkout(query: PreCheckoutQuery):
         """
-        Handle pre-checkout: activate subscription, then confirm.
+        Handle pre-checkout: validate and confirm, then verify payment via YooKassa API.
 
-        Same approach as v1 bot — process payment in pre_checkout because
-        YooKassa does not send successful_payment callback via Telegram.
+        Does NOT activate subscription here — waits for YooKassa confirmation.
         """
         try:
             payload = query.invoice_payload
@@ -140,16 +259,23 @@ def register_payment_handlers(bot: TeleBot) -> None:
                 bot.answer_pre_checkout_query(query.id, ok=False, error_message="Неверный ID транзакции")
                 return
 
-            # Activate subscription before answering (same as v1)
-            success = handle_payment_webhook(bot, transaction_id, 'success')
-
-            if not success:
-                bot.answer_pre_checkout_query(query.id, ok=False, error_message="Ошибка активации подписки")
-                return
-
-            # Confirm payment after activation
+            # Confirm pre-checkout (allow payment to proceed)
             bot.answer_pre_checkout_query(query.id, ok=True)
-            logger.info(f"Pre-checkout processed and subscription activated for transaction {transaction_id}")
+
+            # Record current time — only look for YooKassa payments created after this moment
+            from datetime import datetime, timezone
+            created_after = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+            logger.info(f"Pre-checkout confirmed for transaction {transaction_id}, starting YooKassa verification (after {created_after})")
+
+            # Start background verification via YooKassa API
+            plan = PLANS[plan_key]
+            thread = threading.Thread(
+                target=verify_payment_via_yookassa,
+                args=(bot, transaction_id, query.from_user.id, plan['amount'], created_after),
+                daemon=True,
+            )
+            thread.start()
 
         except Exception as e:
             logger.error(f"Error in pre_checkout handler: {e}", exc_info=True)
@@ -158,6 +284,7 @@ def register_payment_handlers(bot: TeleBot) -> None:
     @bot.message_handler(content_types=['successful_payment'])
     def handle_successful_payment(message: Message):
         """Handle successful_payment if it arrives (belt-and-suspenders)."""
+        logger.info(">>> successful_payment RECEIVED!")
         try:
             payload = message.successful_payment.invoice_payload
             parts = payload.split('#')
@@ -167,16 +294,16 @@ def register_payment_handlers(bot: TeleBot) -> None:
             _, transaction_id_str = parts
             transaction_id = int(transaction_id_str)
 
-            # Check if already processed in pre_checkout
+            # Check if already processed by YooKassa verification
             with get_db_session() as db:
                 transaction = db.query(Transaction).filter(
                     Transaction.id == transaction_id
                 ).first()
                 if transaction and transaction.status == 'completed':
-                    logger.info(f"Transaction {transaction_id} already completed in pre_checkout, skipping")
+                    logger.info(f"Transaction {transaction_id} already completed, skipping")
                     return
 
-            # Process if not yet completed (shouldn't normally happen)
+            # Process if not yet completed
             handle_payment_webhook(bot, transaction_id, 'success')
             logger.info(f"Successful payment processed for transaction {transaction_id} via successful_payment handler")
 
@@ -201,14 +328,14 @@ def register_payment_handlers(bot: TeleBot) -> None:
             if len(parts) != 2:
                 bot.send_message(
                     message.chat.id,
-                    "Использование: /confirm_payment <transaction_id>"
+                    "Usage: /confirm_payment <transaction_id>"
                 )
                 return
 
             try:
                 transaction_id = int(parts[1])
             except ValueError:
-                bot.send_message(message.chat.id, "❌ Неверный ID транзакции")
+                bot.send_message(message.chat.id, "Invalid transaction ID")
                 return
 
             # Process payment
@@ -217,12 +344,12 @@ def register_payment_handlers(bot: TeleBot) -> None:
             if success:
                 bot.send_message(
                     message.chat.id,
-                    f"✅ Транзакция {transaction_id} подтверждена"
+                    f"Transaction {transaction_id} confirmed"
                 )
             else:
                 bot.send_message(
                     message.chat.id,
-                    f"❌ Ошибка при обработке транзакции {transaction_id}"
+                    f"Error processing transaction {transaction_id}"
                 )
 
         except Exception as e:
@@ -254,6 +381,11 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
             if not transaction:
                 logger.error(f"Transaction {transaction_id} not found")
                 return False
+
+            # Skip if already completed (idempotency)
+            if transaction.status == 'completed':
+                logger.info(f"Transaction {transaction_id} already completed, skipping")
+                return True
 
             # Get user
             user = db.query(User).filter(User.id == transaction.user_id).first()
@@ -337,7 +469,6 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
                         v2raytun_deeplink=v2raytun_deeplink,
                         plan_description=plan['description'],
                         expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M'),
-                        device_limit=DEVICE_LIMIT
                     ),
                     reply_markup=key_actions_keyboard(v2raytun_deeplink),
                     parse_mode='Markdown'
@@ -354,7 +485,9 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
                 # Notify user
                 bot.send_message(
                     user.telegram_id,
-                    "❌ Платёж не прошёл. Попробуйте снова или обратитесь в поддержку.\n\n/payment"
+                    "❌ Платёж не прошёл. Попробуйте снова или обратитесь в поддержку.",
+                    reply_markup=payment_help_keyboard(user.telegram_id),
+                    parse_mode='Markdown'
                 )
 
                 logger.info(f"Payment failed for transaction {transaction_id}")

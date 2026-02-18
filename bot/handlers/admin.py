@@ -228,6 +228,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "`/add_old_keys` — import legacy keys from CSV\n"
             "`/remove_old_keys` — soft-delete all legacy keys\n"
             "\n*Other:*\n"
+            "`/broadcast` — interactive broadcast to a list of users\n"
             "`/check_reminders` — manually run subscription expiry check\n"
             "`/admin_help` — this message",
             parse_mode='Markdown'

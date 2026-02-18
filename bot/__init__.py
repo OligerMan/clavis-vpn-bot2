@@ -9,6 +9,7 @@ from bot.handlers.user import register_user_handlers
 from bot.handlers.payment import register_payment_handlers
 from bot.handlers.client_instructions import register_client_instruction_handlers
 from bot.handlers.admin import register_admin_handlers
+from bot.handlers.broadcast import register_broadcast_handlers
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ def register_handlers() -> None:
     register_payment_handlers(bot)
     register_client_instruction_handlers(bot)
     register_admin_handlers(bot)
+    register_broadcast_handlers(bot)
 
     logger.info("All handlers registered successfully")
 

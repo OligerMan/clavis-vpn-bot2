@@ -24,6 +24,25 @@ from config.settings import SUBSCRIPTION_BASE_URL
 logger = logging.getLogger(__name__)
 
 
+def _has_outline_keys(telegram_id: int) -> bool:
+    """Check if user has any active Outline (legacy) keys."""
+    with get_db_session() as db:
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        if not user:
+            return False
+        return (
+            db.query(Key)
+            .join(Subscription)
+            .filter(
+                Subscription.user_id == user.id,
+                Key.protocol == "outline",
+                Key.is_active == True,
+            )
+            .count()
+            > 0
+        )
+
+
 def register_client_instruction_handlers(bot: TeleBot) -> None:
     """Register all client instruction callback handlers."""
 
@@ -135,11 +154,16 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
 
             if platform_data:
                 message, platform = platform_data
+                show_outline = _has_outline_keys(call.from_user.id)
                 bot.edit_message_text(
                     message,
                     call.message.chat.id,
                     call.message.id,
-                    reply_markup=other_connection_methods_keyboard(platform),
+                    reply_markup=other_connection_methods_keyboard(
+                        platform,
+                        show_outline=show_outline,
+                        back_callback="show_platforms_detailed",
+                    ),
                     parse_mode='Markdown'
                 )
                 bot.answer_callback_query(call.id)
@@ -168,11 +192,12 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
             message = message_map.get(platform)
 
             if message:
+                show_outline = _has_outline_keys(call.from_user.id)
                 bot.edit_message_text(
                     message,
                     call.message.chat.id,
                     call.message.id,
-                    reply_markup=other_connection_methods_keyboard(platform),
+                    reply_markup=other_connection_methods_keyboard(platform, show_outline=show_outline),
                     parse_mode='Markdown'
                 )
                 bot.answer_callback_query(call.id)
