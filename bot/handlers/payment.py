@@ -12,7 +12,7 @@ from database import get_db_session
 from database.models import User, Transaction
 from services import SubscriptionService, KeyService
 from message_templates import Messages
-from bot.keyboards.markups import payment_plans_keyboard, key_actions_keyboard, payment_help_keyboard
+from bot.keyboards.markups import payment_plans_keyboard, key_actions_keyboard, key_platform_keyboard, payment_help_keyboard
 from config.settings import (
     PLANS, ADMIN_IDS, SUBSCRIPTION_BASE_URL, DEVICE_LIMIT,
     TELEGRAM_PAYMENT_TOKEN, YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY,
@@ -451,26 +451,14 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
                     invalidate_subscription_cache(subscription.token)
                     logger.info(f"Invalidated cache for subscription {subscription.id}")
 
-                # Generate subscription URL and deep link
-                subscription_url = SubscriptionService.get_subscription_url(
-                    subscription,
-                    SUBSCRIPTION_BASE_URL
-                )
-                v2raytun_deeplink = SubscriptionService.get_v2raytun_deeplink(
-                    subscription,
-                    SUBSCRIPTION_BASE_URL
-                )
-
-                # Send success message to user
+                # Send success message to user with platform selection
                 bot.send_message(
                     user.telegram_id,
                     Messages.PAYMENT_SUCCESS.format(
-                        subscription_url=subscription_url,
-                        v2raytun_deeplink=v2raytun_deeplink,
                         plan_description=plan['description'],
                         expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M'),
                     ),
-                    reply_markup=key_actions_keyboard(v2raytun_deeplink),
+                    reply_markup=key_platform_keyboard(),
                     parse_mode='Markdown'
                 )
 

@@ -148,6 +148,32 @@ def key_actions_keyboard(v2raytun_deeplink: str) -> InlineKeyboardMarkup:
     return keyboard
 
 
+def key_platform_keyboard() -> InlineKeyboardMarkup:
+    """
+    Generate OS selection keyboard for /key flow.
+
+    Buttons:
+    - Android | iOS
+    - Windows | macOS
+    - Back to menu
+    """
+    keyboard = InlineKeyboardMarkup(row_width=2)
+
+    keyboard.row(
+        InlineKeyboardButton("📱 Android", callback_data="platform_android:key"),
+        InlineKeyboardButton("📱 iOS", callback_data="platform_ios:key")
+    )
+    keyboard.row(
+        InlineKeyboardButton("💻 Windows", callback_data="platform_windows:key"),
+        InlineKeyboardButton("💻 macOS", callback_data="platform_macos:key")
+    )
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
+    )
+
+    return keyboard
+
+
 def platform_menu_keyboard() -> InlineKeyboardMarkup:
     """
     Generate platform selection keyboard.
@@ -207,6 +233,26 @@ def back_button_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
+def faq_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+    """Generate FAQ keyboard with support contact and back button."""
+    import urllib.parse
+
+    keyboard = InlineKeyboardMarkup()
+
+    support_message = f"Здравствуйте! Мой ID(для поддержки): {telegram_id}. У меня есть вопрос: "
+    encoded_message = urllib.parse.quote(support_message)
+    support_url = f"https://t.me/clavis_support?text={encoded_message}"
+
+    keyboard.row(
+        InlineKeyboardButton("💬 Написать в поддержку", url=support_url)
+    )
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
+    )
+
+    return keyboard
+
+
 def status_actions_keyboard() -> InlineKeyboardMarkup:
     """
     Generate status actions keyboard (for users without subscription).
@@ -255,7 +301,7 @@ def payment_help_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     return keyboard
 
 
-def android_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboardMarkup:
+def android_instructions_keyboard(v2raytun_deeplink: str = None, source: str = "key") -> InlineKeyboardMarkup:
     """
     Generate simplified Android instructions keyboard.
 
@@ -263,7 +309,7 @@ def android_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboa
     - Download v2rayTun
     - Connect button (if deeplink provided)
     - Other connection methods
-    - Back
+    - Back (to key or support depending on source)
     """
     keyboard = InlineKeyboardMarkup()
 
@@ -279,14 +325,16 @@ def android_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboa
     keyboard.row(
         InlineKeyboardButton("📚 Другие варианты подключения", callback_data="android_detailed")
     )
+
+    back_callback = "back_to_key" if source == "key" else "show_platforms_support"
     keyboard.row(
-        InlineKeyboardButton("◀️ Назад", callback_data="show_platforms")
+        InlineKeyboardButton("◀️ Назад", callback_data=back_callback)
     )
 
     return keyboard
 
 
-def ios_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboardMarkup:
+def ios_instructions_keyboard(v2raytun_deeplink: str = None, source: str = "key") -> InlineKeyboardMarkup:
     """Generate simplified iOS instructions keyboard."""
     keyboard = InlineKeyboardMarkup()
 
@@ -302,14 +350,16 @@ def ios_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboardMa
     keyboard.row(
         InlineKeyboardButton("📚 Другие варианты подключения", callback_data="ios_detailed")
     )
+
+    back_callback = "back_to_key" if source == "key" else "show_platforms_support"
     keyboard.row(
-        InlineKeyboardButton("◀️ Назад", callback_data="show_platforms")
+        InlineKeyboardButton("◀️ Назад", callback_data=back_callback)
     )
 
     return keyboard
 
 
-def windows_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboardMarkup:
+def windows_instructions_keyboard(v2raytun_deeplink: str = None, source: str = "key") -> InlineKeyboardMarkup:
     """Generate simplified Windows instructions keyboard."""
     keyboard = InlineKeyboardMarkup()
 
@@ -325,14 +375,16 @@ def windows_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboa
     keyboard.row(
         InlineKeyboardButton("📚 Другие варианты подключения", callback_data="windows_detailed")
     )
+
+    back_callback = "back_to_key" if source == "key" else "show_platforms_support"
     keyboard.row(
-        InlineKeyboardButton("◀️ Назад", callback_data="show_platforms")
+        InlineKeyboardButton("◀️ Назад", callback_data=back_callback)
     )
 
     return keyboard
 
 
-def macos_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboardMarkup:
+def macos_instructions_keyboard(v2raytun_deeplink: str = None, source: str = "key") -> InlineKeyboardMarkup:
     """Generate simplified macOS instructions keyboard."""
     keyboard = InlineKeyboardMarkup()
 
@@ -348,8 +400,10 @@ def macos_instructions_keyboard(v2raytun_deeplink: str = None) -> InlineKeyboard
     keyboard.row(
         InlineKeyboardButton("📚 Другие варианты подключения", callback_data="macos_detailed")
     )
+
+    back_callback = "back_to_key" if source == "key" else "show_platforms_support"
     keyboard.row(
-        InlineKeyboardButton("◀️ Назад", callback_data="show_platforms")
+        InlineKeyboardButton("◀️ Назад", callback_data=back_callback)
     )
 
     return keyboard
@@ -452,8 +506,8 @@ def support_actions_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     Generate support actions keyboard.
 
     Buttons:
+    - Инструкции по подключению (opens platform selection)
     - FAQ (Частые вопросы)
-    - Инструкции по подключению
     - Связаться с поддержкой (URL to @clavis_support with pre-filled message)
     - Назад в меню
 
@@ -463,10 +517,10 @@ def support_actions_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
-        InlineKeyboardButton("❔ Частые вопросы", callback_data="faq")
+        InlineKeyboardButton("📲 Инструкции по подключению", callback_data="show_platforms_support")
     )
     keyboard.row(
-        InlineKeyboardButton("📲 Инструкции по подключению", callback_data="show_platforms")
+        InlineKeyboardButton("❔ Частые вопросы", callback_data="faq")
     )
 
     # URL to open chat with support with pre-filled message
@@ -480,6 +534,32 @@ def support_actions_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     )
     keyboard.row(
         InlineKeyboardButton("◀️ Назад в меню", callback_data="back_to_menu")
+    )
+
+    return keyboard
+
+
+def support_platform_keyboard() -> InlineKeyboardMarkup:
+    """
+    Generate OS selection keyboard for support flow.
+
+    Buttons:
+    - Android | iOS
+    - Windows | macOS
+    - Back to support
+    """
+    keyboard = InlineKeyboardMarkup(row_width=2)
+
+    keyboard.row(
+        InlineKeyboardButton("📱 Android", callback_data="platform_android:support"),
+        InlineKeyboardButton("📱 iOS", callback_data="platform_ios:support")
+    )
+    keyboard.row(
+        InlineKeyboardButton("💻 Windows", callback_data="platform_windows:support"),
+        InlineKeyboardButton("💻 macOS", callback_data="platform_macos:support")
+    )
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад", callback_data="back_to_support")
     )
 
     return keyboard

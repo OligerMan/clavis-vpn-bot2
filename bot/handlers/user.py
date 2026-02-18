@@ -14,11 +14,14 @@ from bot.keyboards.markups import (
     full_menu_keyboard,
     test_key_confirmation_keyboard,
     key_actions_keyboard,
+    key_platform_keyboard,
     platform_menu_keyboard,
     platform_detailed_menu_keyboard,
     status_actions_keyboard,
     back_button_keyboard,
     support_actions_keyboard,
+    support_platform_keyboard,
+    faq_keyboard,
     android_instructions_keyboard,
     ios_instructions_keyboard,
     windows_instructions_keyboard,
@@ -164,27 +167,14 @@ def register_user_handlers(bot: TeleBot) -> None:
                 # Calculate days left
                 days_left = (subscription.expires_at - datetime.utcnow()).days
 
-                # Generate subscription URL and deep link
-                subscription_url = SubscriptionService.get_subscription_url(
-                    subscription,
-                    SUBSCRIPTION_BASE_URL
-                )
-                v2raytun_deeplink = SubscriptionService.get_v2raytun_deeplink(
-                    subscription,
-                    SUBSCRIPTION_BASE_URL
-                )
-
-                # Send key
+                # Send key with platform selection
                 bot.send_message(
                     message.chat.id,
-                    Messages.KEY_SUCCESS.format(
-                        subscription_url=subscription_url,
-                        v2raytun_deeplink=v2raytun_deeplink,
+                    Messages.KEY_WITH_PLATFORMS.format(
                         expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M'),
                         days_left=days_left,
-                        device_limit=DEVICE_LIMIT
                     ),
-                    reply_markup=key_actions_keyboard(v2raytun_deeplink),
+                    reply_markup=key_platform_keyboard(),
                     parse_mode='Markdown'
                 )
 
@@ -363,27 +353,15 @@ def register_user_handlers(bot: TeleBot) -> None:
                     )
                     return
 
-                # Generate subscription URL and deep link
-                subscription_url = SubscriptionService.get_subscription_url(
-                    subscription,
-                    SUBSCRIPTION_BASE_URL
-                )
-                v2raytun_deeplink = SubscriptionService.get_v2raytun_deeplink(
-                    subscription,
-                    SUBSCRIPTION_BASE_URL
-                )
-
-                # Send success message
+                # Send success message with platform selection
                 bot.answer_callback_query(call.id, "Тестовый ключ создан!")
                 bot.edit_message_text(
                     Messages.TEST_KEY_SUCCESS.format(
-                        subscription_url=subscription_url,
-                        v2raytun_deeplink=v2raytun_deeplink,
                         expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M')
                     ),
                     call.message.chat.id,
                     call.message.id,
-                    reply_markup=key_actions_keyboard(v2raytun_deeplink),
+                    reply_markup=key_platform_keyboard(),
                     parse_mode='Markdown'
                 )
 
@@ -432,7 +410,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                 Messages.FAQ_MESSAGE,
                 call.message.chat.id,
                 call.message.id,
-                reply_markup=back_button_keyboard(),
+                reply_markup=faq_keyboard(call.from_user.id),
                 parse_mode='Markdown'
             )
             bot.answer_callback_query(call.id)
@@ -497,8 +475,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                 lines = []
                 for i, key in enumerate(legacy_keys, 1):
                     protocol = "Outline" if key.protocol == "outline" else "VLESS"
-                    label = key.remarks or protocol
-                    lines.append(f"{i}. *{label}*\n`{key.key_data}`")
+                    lines.append(f"{i}. *{protocol}(старый ключ):*\n`{key.key_data}`")
 
                 keys_list = "\n\n".join(lines)
 
@@ -513,6 +490,97 @@ def register_user_handlers(bot: TeleBot) -> None:
         except Exception as e:
             logger.error(f"Error in old_keys callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Произошла ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'back_to_key')
+    def callback_back_to_key(call: CallbackQuery):
+        """Handle back_to_key callback - rebuild subscription info + OS selection."""
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(
+                    User.telegram_id == call.from_user.id
+                ).first()
+
+                if not user:
+                    bot.answer_callback_query(call.id, "Ошибка")
+                    return
+
+                subscription = SubscriptionService.get_active_subscription(db, user)
+
+                if not subscription:
+                    bot.edit_message_text(
+                        Messages.NO_ACTIVE_SUBSCRIPTION,
+                        call.message.chat.id,
+                        call.message.id,
+                        parse_mode='Markdown'
+                    )
+                    bot.answer_callback_query(call.id)
+                    return
+
+                days_left = (subscription.expires_at - datetime.utcnow()).days
+
+                bot.edit_message_text(
+                    Messages.KEY_WITH_PLATFORMS.format(
+                        expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M'),
+                        days_left=days_left,
+                    ),
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=key_platform_keyboard(),
+                    parse_mode='Markdown'
+                )
+                bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in back_to_key callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'back_to_support')
+    def callback_back_to_support(call: CallbackQuery):
+        """Handle back_to_support callback - rebuild support info + keyboard."""
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(
+                    User.telegram_id == call.from_user.id
+                ).first()
+
+                # Get subscription status
+                subscription_status = "**Статус подписки:** Не оплачена"
+                if user:
+                    subscription = SubscriptionService.get_active_subscription(db, user)
+                    if subscription:
+                        days_left = (subscription.expires_at - datetime.utcnow()).days
+                        sub_type = "Тестовая" if subscription.is_test else "Платная"
+                        subscription_status = f"**Статус подписки:** {sub_type} (осталось {days_left} дней)"
+
+                bot.edit_message_text(
+                    Messages.SUPPORT_MESSAGE.format(
+                        telegram_id=call.from_user.id,
+                        subscription_status=subscription_status
+                    ),
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=support_actions_keyboard(call.from_user.id),
+                    parse_mode='Markdown'
+                )
+                bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in back_to_support callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'show_platforms_support')
+    def callback_show_platforms_support(call: CallbackQuery):
+        """Handle show_platforms_support — platform selection within support flow."""
+        try:
+            bot.edit_message_text(
+                "📲 **Инструкции по подключению**\n\nВыберите вашу платформу:",
+                call.message.chat.id,
+                call.message.id,
+                reply_markup=support_platform_keyboard(),
+                parse_mode='Markdown'
+            )
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in show_platforms_support callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Ошибка")
 
     @bot.callback_query_handler(func=lambda call: call.data == 'show_platforms')
     def callback_show_platforms(call: CallbackQuery):

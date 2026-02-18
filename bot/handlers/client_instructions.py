@@ -48,8 +48,19 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith('platform_'))
     def handle_platform_selection(call: CallbackQuery):
-        """Handle platform selection callbacks."""
+        """Handle platform selection callbacks.
+
+        Callback format: platform_<name> or platform_<name>:<source>
+        where source is 'key' or 'support'. Defaults to 'key'.
+        """
         try:
+            # Parse callback data: "platform_android:key" → platform="platform_android", source="key"
+            raw = call.data
+            if ':' in raw:
+                platform_key, source = raw.split(':', 1)
+            else:
+                platform_key, source = raw, 'key'
+
             with get_db_session() as db:
                 user = db.query(User).filter(User.telegram_id == call.from_user.id).first()
 
@@ -64,13 +75,13 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
 
                 # Map callback data to messages and keyboards
                 platform_map = {
-                    'platform_android': (Messages.ANDROID_INSTRUCTIONS, android_instructions_keyboard(v2raytun_deeplink)),
-                    'platform_ios': (Messages.IOS_INSTRUCTIONS, ios_instructions_keyboard(v2raytun_deeplink)),
-                    'platform_windows': (Messages.WINDOWS_INSTRUCTIONS, windows_instructions_keyboard(v2raytun_deeplink)),
-                    'platform_macos': (Messages.MACOS_INSTRUCTIONS, macos_instructions_keyboard(v2raytun_deeplink))
+                    'platform_android': (Messages.ANDROID_INSTRUCTIONS, android_instructions_keyboard(v2raytun_deeplink, source=source)),
+                    'platform_ios': (Messages.IOS_INSTRUCTIONS, ios_instructions_keyboard(v2raytun_deeplink, source=source)),
+                    'platform_windows': (Messages.WINDOWS_INSTRUCTIONS, windows_instructions_keyboard(v2raytun_deeplink, source=source)),
+                    'platform_macos': (Messages.MACOS_INSTRUCTIONS, macos_instructions_keyboard(v2raytun_deeplink, source=source))
                 }
 
-                platform_data = platform_map.get(call.data)
+                platform_data = platform_map.get(platform_key)
 
                 if platform_data:
                     instruction_message, keyboard = platform_data
@@ -324,26 +335,32 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
                     bot.answer_callback_query(call.id)
                     return
 
-                # Build message with keys
-                lines = [f"🔑 **Отдельные VLESS-ключи ({platform_name})**\n"]
-                lines.append(
-                    "Скопируйте ключ, откройте v2rayTun (или похожий клиент), "
-                    "нажмите **+** и выберите **\"Импорт из буфера обмена\"**.\n"
-                )
-
+                # Build list of (server_name, key_data) and sort alphabetically
+                key_entries = []
                 for i, key in enumerate(keys, 1):
                     if not key.key_data or not key.key_data.startswith("vless://"):
                         continue
 
-                    # Get server name
                     server_name = f"Сервер {i}"
                     if key.server_id:
                         server = db.query(Server).filter(Server.id == key.server_id).first()
                         if server:
                             server_name = server.name
 
+                    key_entries.append((server_name, key.key_data))
+
+                key_entries.sort(key=lambda e: e[0].lower())
+
+                # Build message
+                lines = [f"🔑 **Отдельные VLESS-ключи ({platform_name})**\n"]
+                lines.append(
+                    "Скопируйте ключ, откройте v2rayTun (или похожий клиент), "
+                    "нажмите **+** и выберите **\"Импорт из буфера обмена\"**.\n"
+                )
+
+                for server_name, key_data in key_entries:
                     lines.append(f"**{server_name}:**")
-                    lines.append(f"`{key.key_data}`\n")
+                    lines.append(f"`{key_data}`\n")
 
                 message = "\n".join(lines)
 
