@@ -18,6 +18,7 @@ from bot.keyboards.markups import (
     platform_menu_keyboard,
     platform_detailed_menu_keyboard,
     status_actions_keyboard,
+    status_with_sub_keyboard,
     back_button_keyboard,
     support_actions_keyboard,
     support_platform_keyboard,
@@ -28,7 +29,7 @@ from bot.keyboards.markups import (
     macos_instructions_keyboard,
     old_keys_keyboard,
 )
-from config.settings import SUBSCRIPTION_BASE_URL, DEVICE_LIMIT
+from config.settings import SUBSCRIPTION_BASE_URL, DEVICE_LIMIT, format_msk
 
 logger = logging.getLogger(__name__)
 
@@ -161,17 +162,14 @@ def register_user_handlers(bot: TeleBot) -> None:
                     )
                     return
 
-                # Lazy init: ensure keys exist for migrated/new users
-                KeyService.ensure_keys_exist(db, subscription, user.telegram_id)
-
                 # Calculate days left
-                days_left = (subscription.expires_at - datetime.utcnow()).days
+                days_left = max(0, (subscription.expires_at - datetime.utcnow()).days)
 
                 # Send key with platform selection
                 bot.send_message(
                     message.chat.id,
                     Messages.KEY_WITH_PLATFORMS.format(
-                        expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M'),
+                        expiry_date=format_msk(subscription.expires_at),
                         days_left=days_left,
                     ),
                     reply_markup=key_platform_keyboard(),
@@ -211,7 +209,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                 traffic = KeyService.get_subscription_traffic(db, subscription)
 
                 # Calculate days left
-                days_left = (subscription.expires_at - datetime.utcnow()).days
+                days_left = max(0, (subscription.expires_at - datetime.utcnow()).days)
 
                 # Get renewal reminder
                 renewal_reminder = SubscriptionService.get_renewal_reminder(subscription)
@@ -224,13 +222,14 @@ def register_user_handlers(bot: TeleBot) -> None:
                     message.chat.id,
                     Messages.STATUS_INFO.format(
                         subscription_type=subscription_type,
-                        expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M'),
+                        expiry_date=format_msk(subscription.expires_at),
                         days_left=days_left,
                         upload_gb=traffic['upload_gb'],
                         download_gb=traffic['download_gb'],
                         total_gb=traffic['total_gb'],
                         renewal_reminder=renewal_reminder
                     ),
+                    reply_markup=status_with_sub_keyboard(),
                     parse_mode='Markdown'
                 )
 
@@ -252,7 +251,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                 if user:
                     subscription = SubscriptionService.get_active_subscription(db, user)
                     if subscription:
-                        days_left = (subscription.expires_at - datetime.utcnow()).days
+                        days_left = max(0, (subscription.expires_at - datetime.utcnow()).days)
                         sub_type = "Тестовая" if subscription.is_test else "Платная"
                         subscription_status = f"**Статус подписки:** {sub_type} (осталось {days_left} дней)"
 
@@ -357,7 +356,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                 bot.answer_callback_query(call.id, "Тестовый ключ создан!")
                 bot.edit_message_text(
                     Messages.TEST_KEY_SUCCESS.format(
-                        expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M')
+                        expiry_date=format_msk(subscription.expires_at)
                     ),
                     call.message.chat.id,
                     call.message.id,
@@ -516,11 +515,11 @@ def register_user_handlers(bot: TeleBot) -> None:
                     bot.answer_callback_query(call.id)
                     return
 
-                days_left = (subscription.expires_at - datetime.utcnow()).days
+                days_left = max(0, (subscription.expires_at - datetime.utcnow()).days)
 
                 bot.edit_message_text(
                     Messages.KEY_WITH_PLATFORMS.format(
-                        expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M'),
+                        expiry_date=format_msk(subscription.expires_at),
                         days_left=days_left,
                     ),
                     call.message.chat.id,
@@ -547,7 +546,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                 if user:
                     subscription = SubscriptionService.get_active_subscription(db, user)
                     if subscription:
-                        days_left = (subscription.expires_at - datetime.utcnow()).days
+                        days_left = max(0, (subscription.expires_at - datetime.utcnow()).days)
                         sub_type = "Тестовая" if subscription.is_test else "Платная"
                         subscription_status = f"**Статус подписки:** {sub_type} (осталось {days_left} дней)"
 

@@ -9,7 +9,7 @@ from telebot import TeleBot
 
 from database.models import Subscription, User
 from message_templates import Messages
-from config.settings import SUBSCRIPTION_BASE_URL
+from config.settings import SUBSCRIPTION_BASE_URL, format_msk
 
 logger = logging.getLogger(__name__)
 
@@ -63,19 +63,19 @@ class NotificationService:
 
                 # Check 1 day reminder (paid only)
                 elif 0 < days_left <= 1 and not sub.reminder_1d_sent:
-                    NotificationService._send_reminder(bot, user, sub, 1)
+                    NotificationService._send_reminder(bot, user, sub, 1, days_left)
                     sub.reminder_1d_sent = True
                     sent_counts['1d'] += 1
 
                 # Check 3 day reminder (paid only)
                 elif 1 < days_left <= 3 and not sub.reminder_3d_sent:
-                    NotificationService._send_reminder(bot, user, sub, 3)
+                    NotificationService._send_reminder(bot, user, sub, 3, days_left)
                     sub.reminder_3d_sent = True
                     sent_counts['3d'] += 1
 
                 # Check 7 day reminder (paid only)
                 elif 3 < days_left <= 7 and not sub.reminder_7d_sent:
-                    NotificationService._send_reminder(bot, user, sub, 7)
+                    NotificationService._send_reminder(bot, user, sub, 7, days_left)
                     sub.reminder_7d_sent = True
                     sent_counts['7d'] += 1
 
@@ -92,16 +92,31 @@ class NotificationService:
         return sent_counts
 
     @staticmethod
-    def _send_reminder(bot: TeleBot, user: User, subscription: Subscription, days: int) -> None:
+    def _pluralize_days(n: int) -> str:
+        """Return Russian plural form for 'день/дня/дней'."""
+        n = abs(n)
+        if 11 <= n % 100 <= 19:
+            return "дней"
+        mod10 = n % 10
+        if mod10 == 1:
+            return "день"
+        if 2 <= mod10 <= 4:
+            return "дня"
+        return "дней"
+
+    @staticmethod
+    def _send_reminder(bot: TeleBot, user: User, subscription: Subscription, days: int, days_left: float) -> None:
         """Send renewal reminder to user."""
-        expiry_str = subscription.expires_at.strftime('%d.%m.%Y %H:%M')
+        expiry_str = format_msk(subscription.expires_at)
+        actual_days = max(1, int(days_left))
+        days_word = NotificationService._pluralize_days(actual_days)
 
         if days == 7:
-            message = Messages.RENEWAL_REMINDER_7.format(expiry_date=expiry_str)
+            message = Messages.RENEWAL_REMINDER_7.format(expiry_date=expiry_str, days_left=actual_days, days_word=days_word)
         elif days == 3:
-            message = Messages.RENEWAL_REMINDER_3.format(expiry_date=expiry_str)
+            message = Messages.RENEWAL_REMINDER_3.format(expiry_date=expiry_str, days_left=actual_days, days_word=days_word)
         elif days == 1:
-            message = Messages.RENEWAL_REMINDER_1.format(expiry_date=expiry_str)
+            message = Messages.RENEWAL_REMINDER_1.format(expiry_date=expiry_str, days_left=actual_days, days_word=days_word)
         else:
             return
 
@@ -116,7 +131,7 @@ class NotificationService:
     @staticmethod
     def _send_expiry_notification(bot: TeleBot, user: User, subscription: Subscription) -> None:
         """Send subscription expiry notification to user."""
-        expiry_str = subscription.expires_at.strftime('%d.%m.%Y %H:%M')
+        expiry_str = format_msk(subscription.expires_at)
 
         # Use different message for test subscriptions
         if subscription.is_test:

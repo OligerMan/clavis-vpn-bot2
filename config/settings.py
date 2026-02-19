@@ -1,6 +1,7 @@
 """Configuration settings loader for Clavis VPN Bot v2."""
 
 import os
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict
 from dotenv import load_dotenv
 
@@ -58,6 +59,15 @@ USER_SERVER_LIMIT = int(os.getenv('USER_SERVER_LIMIT', '2'))
 # X-UI panel credentials
 XUI_USERNAME = os.getenv('XUI_USERNAME', '')
 XUI_PASSWORD = os.getenv('XUI_PASSWORD', '')
+
+# Moscow timezone (UTC+3)
+MSK = timezone(timedelta(hours=3))
+
+
+def format_msk(dt: datetime, fmt: str = '%d.%m.%Y %H:%M') -> str:
+    """Format a naive UTC datetime as Moscow time (UTC+3)."""
+    return dt.replace(tzinfo=timezone.utc).astimezone(MSK).strftime(fmt) + ' МСК'
+
 
 # Subscription server settings
 SUBSCRIPTION_PORT = int(os.getenv('SUBSCRIPTION_PORT', 8080))

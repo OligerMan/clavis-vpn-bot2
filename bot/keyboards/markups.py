@@ -271,6 +271,14 @@ def status_actions_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
+def status_with_sub_keyboard() -> InlineKeyboardMarkup:
+    """Status keyboard for users WITH an active subscription."""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.row(InlineKeyboardButton("💳 Купить подписку", callback_data="payment"))
+    keyboard.row(InlineKeyboardButton("◀️ Вернуться в меню", callback_data="back_to_menu"))
+    return keyboard
+
+
 def payment_help_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     """
     Generate payment help keyboard shown after invoice is sent.

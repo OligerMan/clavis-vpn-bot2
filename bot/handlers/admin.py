@@ -18,7 +18,7 @@ from telebot.types import Message, CallbackQuery, ForceReply, InlineKeyboardMark
 
 from database import get_db_session
 from database.models import Server, User, Subscription, Key, Transaction
-from config.settings import ADMIN_IDS, XUI_USERNAME, XUI_PASSWORD
+from config.settings import ADMIN_IDS, XUI_USERNAME, XUI_PASSWORD, format_msk
 from services import KeyService
 
 logger = logging.getLogger(__name__)
@@ -963,7 +963,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             f"*User Management*\n",
             f"*Telegram ID:* `{user.telegram_id}`",
             f"*Username:* @{user.username}" if user.username else "*Username:* —",
-            f"*Registered:* {user.created_at.strftime('%d.%m.%Y %H:%M')}",
+            f"*Registered:* {format_msk(user.created_at)}",
         ]
 
         # Active subscription
@@ -993,7 +993,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             lines.append(f"\n*Subscription (id={sub.id}):*")
             lines.append(f"  Type: {sub_type}")
             lines.append(f"  Token: `{sub.token[:8]}...`")
-            lines.append(f"  Expires: {sub.expires_at.strftime('%d.%m.%Y %H:%M')}")
+            lines.append(f"  Expires: {format_msk(sub.expires_at)}")
             lines.append(f"  Days left: {days_left}")
             lines.append(f"  Keys: {active_keys} on {', '.join(server_names) if server_names else '—'}")
         else:
@@ -1004,7 +1004,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             if any_sub:
                 lines.append(f"\n*Subscription (id={any_sub.id}):*")
                 lines.append(f"  Type: {'Test' if any_sub.is_test else 'Paid'}")
-                lines.append(f"  Status: EXPIRED ({any_sub.expires_at.strftime('%d.%m.%Y %H:%M')})")
+                lines.append(f"  Status: EXPIRED ({format_msk(any_sub.expires_at)})")
             else:
                 lines.append("\n*Subscription:* None")
 
@@ -1023,7 +1023,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             lines.append(f"\n*Last transaction (id={tx.id}):*")
             lines.append(f"  Plan: `{tx.plan}` | Amount: {tx.amount_rub}₽")
             lines.append(f"  Status: `{tx.status}`")
-            lines.append(f"  Date: {tx.created_at.strftime('%d.%m.%Y %H:%M')}")
+            lines.append(f"  Date: {format_msk(tx.created_at)}")
 
         return "\n".join(lines), user
 
@@ -1196,8 +1196,8 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     message.chat.id,
                     f"Subscription adjusted for user `{tg_id}`:\n"
                     f"  {sign}{hours}h\n"
-                    f"  Old expiry: {old_expiry.strftime('%d.%m.%Y %H:%M')}\n"
-                    f"  New expiry: {sub.expires_at.strftime('%d.%m.%Y %H:%M')}",
+                    f"  Old expiry: {format_msk(old_expiry)}\n"
+                    f"  New expiry: {format_msk(sub.expires_at)}",
                     parse_mode='Markdown'
                 )
 

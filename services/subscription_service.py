@@ -5,7 +5,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from database.models import User, Subscription
-from config.settings import TEST_SUBSCRIPTION_HOURS, DEVICE_LIMIT
+from config.settings import TEST_SUBSCRIPTION_HOURS, DEVICE_LIMIT, format_msk
 from message_templates import Messages
 
 
@@ -231,23 +231,28 @@ class SubscriptionService:
         Returns:
             Reminder message or empty string
         """
-        days_left = (subscription.expires_at - datetime.utcnow()).days
+        from services.notification_service import NotificationService
 
-        if days_left <= 0:
-            return Messages.SUBSCRIPTION_EXPIRED.format(
-                expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M')
-            )
-        elif days_left == 1:
+        delta = subscription.expires_at - datetime.utcnow()
+        total_seconds = delta.total_seconds()
+        days_left = delta.days
+        expiry_str = format_msk(subscription.expires_at)
+        actual_days = max(1, days_left)
+        days_word = NotificationService._pluralize_days(actual_days)
+
+        if total_seconds <= 0:
+            return Messages.SUBSCRIPTION_EXPIRED.format(expiry_date=expiry_str)
+        elif days_left <= 1:
             return Messages.RENEWAL_REMINDER_1.format(
-                expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M')
+                expiry_date=expiry_str, days_left=actual_days, days_word=days_word
             )
         elif days_left <= 3:
             return Messages.RENEWAL_REMINDER_3.format(
-                expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M')
+                expiry_date=expiry_str, days_left=actual_days, days_word=days_word
             )
         elif days_left <= 7:
             return Messages.RENEWAL_REMINDER_7.format(
-                expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M')
+                expiry_date=expiry_str, days_left=actual_days, days_word=days_word
             )
 
         return ""

@@ -61,15 +61,25 @@ def format_subscription_response(
 
         # Modify remark if subscription is expired/inactive
         if is_expired:
-            # Extract server name from URI for better UX
             server_name = _extract_server_name(uri)
             expired_remark = f"⏰ Clavis {server_name} - Expired, please renew subscription"
             uri = modify_vless_remark(uri, expired_remark)
+        elif key.server_id is None:
+            uri = modify_vless_remark(uri, "Clavis v1 (старый ключ)")
+        else:
+            # Add country flag to remark based on server name
+            remark = _extract_remark(uri)
+            flag = _country_flag(remark)
+            if flag:
+                uri = modify_vless_remark(uri, f"{remark} {flag}")
 
         vless_uris.append(uri)
 
     if not vless_uris:
         raise ValueError("No valid VLESS URIs found in keys")
+
+    # Sort by remark (server name) alphabetically
+    vless_uris.sort(key=lambda u: _extract_remark(u).lower())
 
     # Join URIs with newlines
     uris_text = "\n".join(vless_uris)
@@ -78,6 +88,44 @@ def format_subscription_response(
     encoded = base64.b64encode(uris_text.encode("utf-8")).decode("utf-8")
 
     return encoded
+
+
+_COUNTRY_FLAGS = {
+    "germany": "🇩🇪",
+    "netherlands": "🇳🇱",
+    "finland": "🇫🇮",
+    "sweden": "🇸🇪",
+    "france": "🇫🇷",
+    "usa": "🇺🇸",
+    "uk": "🇬🇧",
+    "canada": "🇨🇦",
+    "japan": "🇯🇵",
+    "singapore": "🇸🇬",
+    "australia": "🇦🇺",
+    "turkey": "🇹🇷",
+    "poland": "🇵🇱",
+    "latvia": "🇱🇻",
+    "russia": "🇷🇺",
+    "italy": "🇮🇹",
+    "spain": "🇪🇸",
+    "switzerland": "🇨🇭",
+}
+
+
+def _country_flag(text: str) -> str:
+    """Return flag emoji if text contains a known country name."""
+    lower = text.lower()
+    for country, flag in _COUNTRY_FLAGS.items():
+        if country in lower:
+            return flag
+    return ""
+
+
+def _extract_remark(vless_uri: str) -> str:
+    """Extract the remark (fragment) from a VLESS URI."""
+    if "#" in vless_uri:
+        return unquote(vless_uri.split("#")[1])
+    return "VPN"
 
 
 def _extract_server_name(vless_uri: str) -> str:

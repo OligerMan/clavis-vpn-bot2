@@ -16,6 +16,7 @@ from bot.keyboards.markups import payment_plans_keyboard, key_actions_keyboard, 
 from config.settings import (
     PLANS, ADMIN_IDS, SUBSCRIPTION_BASE_URL, DEVICE_LIMIT,
     TELEGRAM_PAYMENT_TOKEN, YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY,
+    format_msk,
 )
 
 logger = logging.getLogger(__name__)
@@ -456,7 +457,7 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
                     user.telegram_id,
                     Messages.PAYMENT_SUCCESS.format(
                         plan_description=plan['description'],
-                        expiry_date=subscription.expires_at.strftime('%d.%m.%Y %H:%M'),
+                        expiry_date=format_msk(subscription.expires_at),
                     ),
                     reply_markup=key_platform_keyboard(),
                     parse_mode='Markdown'
