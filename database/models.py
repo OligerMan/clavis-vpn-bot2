@@ -305,6 +305,21 @@ class TrafficLog(Base):
         return deleted
 
 
+class ActivityLog(Base):
+    """User activity log for admin monitoring."""
+
+    __tablename__ = "activity_logs"
+
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(Integer, nullable=False, index=True)
+    action = Column(String(50), nullable=False)
+    details = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    def __repr__(self):
+        return f"<ActivityLog(id={self.id}, telegram_id={self.telegram_id}, action={self.action})>"
+
+
 class Transaction(Base):
     """Payment transaction."""
 

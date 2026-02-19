@@ -11,6 +11,7 @@ from telebot.types import Message, CallbackQuery, LabeledPrice, PreCheckoutQuery
 
 from database import get_db_session
 from database.models import User, Transaction
+from database.activity_log import log_activity
 from services import SubscriptionService, KeyService
 from message_templates import Messages
 from bot.keyboards.markups import payment_plans_keyboard, key_actions_keyboard, key_platform_keyboard, payment_help_keyboard
@@ -484,6 +485,14 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
                         logger.info(f"Updated expiry for {updated_count} keys in subscription {subscription.id}")
                     except ValueError as e:
                         logger.warning(f"Could not update key expiry for transaction {transaction_id}: {e}")
+
+                # Log activity
+                plan_desc = plan['description']
+                amount_rub = transaction.amount // 100
+                if is_new_subscription or is_upgrade_from_test:
+                    log_activity(db, user.telegram_id, "payment", f"{plan_desc}, {amount_rub}₽")
+                else:
+                    log_activity(db, user.telegram_id, "sub_extended", f"+{days}д, {amount_rub}₽")
 
                 # Mark transaction as completed
                 transaction.complete()

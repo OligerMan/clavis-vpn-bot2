@@ -6,6 +6,7 @@ from telebot.types import Message
 
 from database import get_db_session
 from database.models import User
+from database.activity_log import log_activity
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ def register_user_middleware(bot: TeleBot) -> None:
                         username=username
                     )
                     db.add(user)
+                    log_activity(db, telegram_id, "new_user", f"@{username}" if username else None)
                     db.commit()
 
                     logger.info(f"Auto-registered new user: {telegram_id} (@{username})")

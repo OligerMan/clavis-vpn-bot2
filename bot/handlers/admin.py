@@ -19,7 +19,7 @@ from telebot.types import Message, CallbackQuery, ForceReply, InlineKeyboardMark
 from sqlalchemy import func
 
 from database import get_db_session
-from database.models import Server, User, Subscription, Key, Transaction
+from database.models import Server, User, Subscription, Key, Transaction, ActivityLog
 from config.settings import ADMIN_IDS, XUI_USERNAME, XUI_PASSWORD, format_msk
 from services import KeyService
 
@@ -231,6 +231,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "`/remove_old_keys` — soft-delete all legacy keys\n"
             "\n*Other:*\n"
             "`/report` — service dashboard (users, subs, payments, servers)\n"
+            "`/logs` — last N user actions (default 50)\n"
             "`/broadcast` — interactive broadcast to a list of users\n"
             "`/check_reminders` — manually run subscription expiry check\n"
             "`/admin_help` — this message",
@@ -348,6 +349,60 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         except Exception as e:
             logger.error(f"Error in /report: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── /logs ────────────────────────────────────────────────
+    ACTION_DISPLAY = {
+        "test_key": "Тест-ключ",
+        "payment": "Оплата",
+        "new_user": "Новый пользователь",
+        "sub_extended": "Продление",
+        "sub_reactivated": "Реактивация",
+    }
+
+    @bot.message_handler(commands=['logs'])
+    def handle_logs(message: Message):
+        """Show last N user actions. Usage: /logs [N]"""
+        if not is_admin(message.from_user.id):
+            return
+
+        parts = message.text.split()
+        limit = 50
+        if len(parts) >= 2:
+            try:
+                limit = max(1, min(200, int(parts[1])))
+            except ValueError:
+                pass
+
+        try:
+            with get_db_session() as db:
+                logs = (
+                    db.query(ActivityLog)
+                    .order_by(ActivityLog.created_at.desc())
+                    .limit(limit)
+                    .all()
+                )
+
+                if not logs:
+                    bot.send_message(message.chat.id, "Нет записей.")
+                    return
+
+                lines = [f"*Последние действия ({len(logs)})*\n"]
+                for entry in logs:
+                    ts = format_msk(entry.created_at, fmt="%d.%m %H:%M").replace(" МСК", "")
+                    action_name = ACTION_DISPLAY.get(entry.action, entry.action)
+                    detail = f": {entry.details}" if entry.details else ""
+                    lines.append(f"`{ts}` | `{entry.telegram_id}` | {action_name}{detail}")
+
+                text = "\n".join(lines)
+                # Telegram message limit is 4096 chars
+                if len(text) > 4000:
+                    text = text[:4000] + "\n..."
+
+                bot.send_message(message.chat.id, text, parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"Error in /logs: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── /servers ──────────────────────────────────────────────

@@ -7,6 +7,7 @@ from telebot.types import Message, CallbackQuery
 
 from database import get_db_session
 from database.models import User
+from database.activity_log import log_activity
 from services import SubscriptionService, KeyService
 from message_templates import Messages
 from bot.keyboards.markups import (
@@ -355,6 +356,8 @@ def register_user_handlers(bot: TeleBot) -> None:
                         parse_mode='Markdown'
                     )
                     return
+
+                log_activity(db, call.from_user.id, "test_key", f"до {format_msk(subscription.expires_at)}")
 
                 # Send success message with platform selection
                 bot.answer_callback_query(call.id, "Тестовый ключ создан!")
