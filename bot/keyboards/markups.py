@@ -241,7 +241,7 @@ def faq_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
 
     support_message = f"Здравствуйте! Мой ID(для поддержки): {telegram_id}. У меня есть вопрос: "
     encoded_message = urllib.parse.quote(support_message)
-    support_url = f"https://t.me/clavis_support?text={encoded_message}"
+    support_url = f"https://t.me/Clavis_support2?text={encoded_message}"
 
     keyboard.row(
         InlineKeyboardButton("💬 Написать в поддержку", url=support_url)
@@ -300,7 +300,7 @@ def payment_help_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
 
     support_message = f"Здравствуйте! Мой ID: {telegram_id}. Оплата прошла, но подписка не активирована."
     encoded_message = urllib.parse.quote(support_message)
-    support_url = f"https://t.me/clavis_support?text={encoded_message}"
+    support_url = f"https://t.me/Clavis_support2?text={encoded_message}"
 
     keyboard.row(
         InlineKeyboardButton("💬 Связаться с поддержкой", url=support_url)
@@ -516,7 +516,7 @@ def support_actions_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     Buttons:
     - Инструкции по подключению (opens platform selection)
     - FAQ (Частые вопросы)
-    - Связаться с поддержкой (URL to @clavis_support with pre-filled message)
+    - Связаться с поддержкой (URL to @Clavis_support2 with pre-filled message)
     - Назад в меню
 
     Args:
@@ -535,7 +535,7 @@ def support_actions_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
     import urllib.parse
     support_message = f"Здравствуйте! Мой ID(для поддержки): {telegram_id}. У меня есть вопрос: "
     encoded_message = urllib.parse.quote(support_message)
-    support_url = f"https://t.me/clavis_support?text={encoded_message}"
+    support_url = f"https://t.me/Clavis_support2?text={encoded_message}"
 
     keyboard.row(
         InlineKeyboardButton("💬 Связаться с поддержкой", url=support_url)

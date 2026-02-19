@@ -316,6 +316,7 @@ class Transaction(Base):
     amount = Column(Integer, nullable=False)  # Amount in kopeks
     plan = Column(String(50), nullable=False)  # '90_days', '365_days'
     status = Column(String(20), default="pending")  # 'pending', 'completed', 'failed'
+    yookassa_payment_id = Column(String(255), unique=True, nullable=True)  # Prevents double activation
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 

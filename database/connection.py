@@ -68,6 +68,27 @@ def get_session_factory():
     return _SessionLocal
 
 
+def _run_migrations(engine):
+    """Run schema migrations for existing databases."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+
+    # Migration: add yookassa_payment_id to transactions (prevents double payment activation)
+    if 'transactions' in inspector.get_table_names():
+        columns = [c['name'] for c in inspector.get_columns('transactions')]
+        if 'yookassa_payment_id' not in columns:
+            with engine.connect() as conn:
+                conn.execute(text(
+                    "ALTER TABLE transactions ADD COLUMN yookassa_payment_id VARCHAR(255)"
+                ))
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_transactions_yookassa_payment_id "
+                    "ON transactions (yookassa_payment_id)"
+                ))
+                conn.commit()
+
+
 def init_db(db_path: str | Path | None = None, echo: bool = False):
     """Initialize database: create engine and all tables.
 
@@ -86,6 +107,9 @@ def init_db(db_path: str | Path | None = None, echo: bool = False):
 
     # Create all tables
     Base.metadata.create_all(bind=_engine)
+
+    # Run migrations for existing tables
+    _run_migrations(_engine)
 
     return _engine
 

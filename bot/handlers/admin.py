@@ -16,6 +16,8 @@ from py3xui.inbound import Settings, Sniffing, StreamSettings
 from telebot import TeleBot
 from telebot.types import Message, CallbackQuery, ForceReply, InlineKeyboardMarkup, InlineKeyboardButton
 
+from sqlalchemy import func
+
 from database import get_db_session
 from database.models import Server, User, Subscription, Key, Transaction
 from config.settings import ADMIN_IDS, XUI_USERNAME, XUI_PASSWORD, format_msk
@@ -228,11 +230,125 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "`/add_old_keys` — import legacy keys from CSV\n"
             "`/remove_old_keys` — soft-delete all legacy keys\n"
             "\n*Other:*\n"
+            "`/report` — service dashboard (users, subs, payments, servers)\n"
             "`/broadcast` — interactive broadcast to a list of users\n"
             "`/check_reminders` — manually run subscription expiry check\n"
             "`/admin_help` — this message",
             parse_mode='Markdown'
         )
+
+    # ── /report ───────────────────────────────────────────────
+    @bot.message_handler(commands=['report'])
+    def handle_report(message: Message):
+        """Show service dashboard: users, subscriptions, payments, servers."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            with get_db_session() as db:
+                now = datetime.utcnow()
+                week_ago = now - timedelta(days=7)
+                month_ago = now - timedelta(days=30)
+
+                # Users
+                total_users = db.query(func.count(User.id)).scalar()
+                new_7d = db.query(func.count(User.id)).filter(User.created_at >= week_ago).scalar()
+                new_30d = db.query(func.count(User.id)).filter(User.created_at >= month_ago).scalar()
+
+                # Subscriptions
+                active_paid = db.query(func.count(Subscription.id)).filter(
+                    Subscription.is_active == True,
+                    Subscription.expires_at > now,
+                    Subscription.is_test == False,
+                ).scalar()
+                active_test = db.query(func.count(Subscription.id)).filter(
+                    Subscription.is_active == True,
+                    Subscription.expires_at > now,
+                    Subscription.is_test == True,
+                ).scalar()
+                expired = db.query(func.count(Subscription.id)).filter(
+                    Subscription.is_active == True,
+                    Subscription.expires_at <= now,
+                ).scalar()
+
+                # Payments — completed totals
+                completed = db.query(
+                    func.count(Transaction.id),
+                    func.coalesce(func.sum(Transaction.amount), 0),
+                ).filter(Transaction.status == 'completed').one()
+                completed_count, completed_sum_kopeks = completed
+
+                pending_count = db.query(func.count(Transaction.id)).filter(
+                    Transaction.status == 'pending'
+                ).scalar()
+                failed_count = db.query(func.count(Transaction.id)).filter(
+                    Transaction.status == 'failed'
+                ).scalar()
+
+                # Recent revenue
+                rev_7d = db.query(
+                    func.count(Transaction.id),
+                    func.coalesce(func.sum(Transaction.amount), 0),
+                ).filter(
+                    Transaction.status == 'completed',
+                    Transaction.completed_at >= week_ago,
+                ).one()
+                rev_7d_count, rev_7d_sum = rev_7d
+
+                rev_30d = db.query(
+                    func.count(Transaction.id),
+                    func.coalesce(func.sum(Transaction.amount), 0),
+                ).filter(
+                    Transaction.status == 'completed',
+                    Transaction.completed_at >= month_ago,
+                ).one()
+                rev_30d_count, rev_30d_sum = rev_30d
+
+                # Servers
+                total_servers = db.query(func.count(Server.id)).scalar()
+                active_servers = db.query(func.count(Server.id)).filter(
+                    Server.is_active == True
+                ).scalar()
+                total_keys = db.query(func.count(Key.id)).filter(
+                    Key.is_active == True,
+                    Key.server_id.isnot(None),
+                ).scalar()
+                total_capacity = db.query(
+                    func.coalesce(func.sum(Server.capacity), 0)
+                ).filter(Server.is_active == True).scalar()
+
+            def fmt_rub(kopeks: int) -> str:
+                """Format kopeks as rubles with thousands separator."""
+                rub = kopeks // 100
+                return f"{rub:,}".replace(",", " ")
+
+            text = (
+                "*Отчёт по сервису*\n\n"
+                "*Пользователи*\n"
+                f"  Всего: {total_users}\n"
+                f"  Новых за 7 дней: {new_7d}\n"
+                f"  Новых за 30 дней: {new_30d}\n\n"
+                "*Подписки*\n"
+                f"  Активных платных: {active_paid}\n"
+                f"  Активных тестовых: {active_test}\n"
+                f"  Истекших (всего): {expired}\n\n"
+                "*Платежи*\n"
+                f"  Успешных: {completed_count} на {fmt_rub(completed_sum_kopeks)}₽\n"
+                f"  Ожидающих: {pending_count}\n"
+                f"  Неудачных: {failed_count}\n"
+                f"  За 7 дней: {rev_7d_count} на {fmt_rub(rev_7d_sum)}₽\n"
+                f"  За 30 дней: {rev_30d_count} на {fmt_rub(rev_30d_sum)}₽\n\n"
+                "*Серверы*\n"
+                f"  Активных: {active_servers} из {total_servers}\n"
+                f"  Ключей: {total_keys} / {total_capacity}\n\n"
+                f"_{format_msk(now)} МСК_"
+            )
+
+            bot.send_message(message.chat.id, text, parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"Error in /report: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── /servers ──────────────────────────────────────────────
     @bot.message_handler(commands=['servers'])

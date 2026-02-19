@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 import requests
+from sqlalchemy.exc import IntegrityError
 from telebot import TeleBot
 from telebot.types import Message, CallbackQuery, LabeledPrice, PreCheckoutQuery
 
@@ -92,10 +93,53 @@ def verify_payment_via_yookassa(
                     status = payment.get("status")
 
                     if status == "succeeded" and payment.get("paid") is True:
+                        yookassa_id = payment['id']
                         logger.info(
-                            f"YooKassa payment confirmed: {payment['id']}, "
+                            f"YooKassa payment found: {yookassa_id}, "
                             f"transaction {transaction_id}, attempt {attempt}"
                         )
+
+                        # Atomically claim this payment to prevent double activation.
+                        # Unique constraint on yookassa_payment_id is the safety net.
+                        try:
+                            with get_db_session() as db:
+                                # Check if already claimed
+                                existing = db.query(Transaction).filter(
+                                    Transaction.yookassa_payment_id == yookassa_id
+                                ).first()
+                                if existing:
+                                    logger.warning(
+                                        f"YooKassa payment {yookassa_id} already claimed by "
+                                        f"transaction {existing.id}, skipping transaction {transaction_id}"
+                                    )
+                                    txn = db.query(Transaction).filter(
+                                        Transaction.id == transaction_id
+                                    ).first()
+                                    if txn and txn.status == 'pending':
+                                        txn.fail()
+                                    return
+
+                                # Claim it
+                                txn = db.query(Transaction).filter(
+                                    Transaction.id == transaction_id
+                                ).first()
+                                if not txn or txn.status != 'pending':
+                                    return
+                                txn.yookassa_payment_id = yookassa_id
+                        except IntegrityError:
+                            # Race condition: another thread claimed it between check and commit
+                            logger.warning(
+                                f"YooKassa payment {yookassa_id} claimed concurrently, "
+                                f"skipping transaction {transaction_id}"
+                            )
+                            with get_db_session() as db:
+                                txn = db.query(Transaction).filter(
+                                    Transaction.id == transaction_id
+                                ).first()
+                                if txn and txn.status == 'pending':
+                                    txn.fail()
+                            return
+
                         handle_payment_webhook(bot, transaction_id, 'success')
                         return
 
