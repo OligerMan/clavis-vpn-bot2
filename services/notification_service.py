@@ -1,6 +1,7 @@
 """Notification service for subscription renewal reminders."""
 
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import List
 
@@ -12,6 +13,9 @@ from message_templates import Messages
 from config.settings import SUBSCRIPTION_BASE_URL, format_msk
 
 logger = logging.getLogger(__name__)
+
+
+NOTIFICATION_DELAY = 0.5  # seconds between messages to avoid Telegram rate limits
 
 
 class NotificationService:
@@ -50,12 +54,14 @@ class NotificationService:
             # Calculate days until expiry
             days_left = (sub.expires_at - now).total_seconds() / 86400
 
+            sent = False
             try:
                 # Check if expired
                 if days_left <= 0 and not sub.expiry_notified:
                     NotificationService._send_expiry_notification(bot, user, sub)
                     sub.expiry_notified = True
                     sent_counts['expired'] += 1
+                    sent = True
 
                 # Skip renewal reminders for test subscriptions (only notify when expired)
                 elif sub.is_test:
@@ -66,22 +72,28 @@ class NotificationService:
                     NotificationService._send_reminder(bot, user, sub, 1, days_left)
                     sub.reminder_1d_sent = True
                     sent_counts['1d'] += 1
+                    sent = True
 
                 # Check 3 day reminder (paid only)
                 elif 1 < days_left <= 3 and not sub.reminder_3d_sent:
                     NotificationService._send_reminder(bot, user, sub, 3, days_left)
                     sub.reminder_3d_sent = True
                     sent_counts['3d'] += 1
+                    sent = True
 
                 # Check 7 day reminder (paid only)
                 elif 3 < days_left <= 7 and not sub.reminder_7d_sent:
                     NotificationService._send_reminder(bot, user, sub, 7, days_left)
                     sub.reminder_7d_sent = True
                     sent_counts['7d'] += 1
+                    sent = True
 
             except Exception as e:
                 logger.error(f"Failed to send notification for subscription {sub.id}: {e}", exc_info=True)
                 continue
+
+            if sent:
+                time.sleep(NOTIFICATION_DELAY)
 
         # Commit all flag updates
         db.commit()

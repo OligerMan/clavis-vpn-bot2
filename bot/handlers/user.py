@@ -162,6 +162,10 @@ def register_user_handlers(bot: TeleBot) -> None:
                     )
                     return
 
+                # Ensure keys exist for legacy/migrated users (no server-linked keys yet)
+                if not KeyService.has_server_keys(db, subscription):
+                    KeyService.ensure_keys_exist(db, subscription, user.telegram_id)
+
                 # Calculate days left
                 days_left = max(0, (subscription.expires_at - datetime.utcnow()).days)
 

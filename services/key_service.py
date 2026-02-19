@@ -315,6 +315,15 @@ class KeyService:
         db.commit()
 
     @staticmethod
+    def has_server_keys(db: Session, subscription: Subscription) -> bool:
+        """Check if subscription has any active keys linked to a server."""
+        return db.query(Key).filter(
+            Key.subscription_id == subscription.id,
+            Key.server_id.isnot(None),
+            Key.is_active == True,
+        ).first() is not None
+
+    @staticmethod
     def has_legacy_keys(db: Session, user) -> bool:
         """Check if user has any active legacy keys (server_id IS NULL)."""
         return db.query(Key).join(Subscription).filter(
