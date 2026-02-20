@@ -5,7 +5,10 @@ import sys
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
+from datetime import datetime, timedelta
+
 from database import init_db, get_db_session
+from database.models import Transaction
 from bot import register_handlers, start_polling, get_bot
 from services import NotificationService
 
@@ -35,6 +38,22 @@ def check_subscriptions_job():
         logger.error(f"Error in subscription check job: {e}", exc_info=True)
 
 
+def expire_stale_transactions_job():
+    """Mark pending transactions older than 10 minutes as failed."""
+    logger = logging.getLogger(__name__)
+    try:
+        cutoff = datetime.utcnow() - timedelta(minutes=10)
+        with get_db_session() as db:
+            count = db.query(Transaction).filter(
+                Transaction.status == 'pending',
+                Transaction.created_at < cutoff,
+            ).update({Transaction.status: 'failed'})
+            if count > 0:
+                logger.info(f"Expired {count} stale pending transaction(s)")
+    except Exception as e:
+        logger.error(f"Error in expire_stale_transactions job: {e}", exc_info=True)
+
+
 def main():
     """Main function to start the bot."""
     # Setup logging
@@ -58,6 +77,7 @@ def main():
         scheduler = BackgroundScheduler()
         # Run every hour
         scheduler.add_job(check_subscriptions_job, 'interval', hours=1, id='subscription_check')
+        scheduler.add_job(expire_stale_transactions_job, 'interval', minutes=5, id='expire_stale_transactions')
         scheduler.start()
         logger.info("Scheduler started (checking subscriptions every hour)")
 
