@@ -570,8 +570,17 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 test_decided = len(all_test_tg - undecided_tg)
 
                 conv_test = (converted_from_test / test_decided * 100) if test_decided > 0 else 0
-                conv_total = (paid_users / new_users * 100) if new_users > 0 else 0
                 paid_without_test = len(paid_tg - all_test_tg)
+
+                # Registration → payment: only new v2 users who paid
+                new_tg = set(
+                    r[0] for r in db.query(ActivityLog.telegram_id).filter(
+                        ActivityLog.action == 'new_user',
+                        ~ActivityLog.telegram_id.in_(admin_tg_ids),
+                    ).all()
+                )
+                new_paid = len(new_tg & paid_tg)
+                conv_total = (new_paid / new_users * 100) if new_users > 0 else 0
 
                 # ── Renewals (from activity log) ──
                 renewal_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
@@ -636,7 +645,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     f"  Конверсия тест → оплата: {conv_test:.1f}%"
                     f"  ({converted_from_test} из {test_decided} решивших)\n"
                     f"  Конверсия рег → оплата: {conv_total:.1f}%"
-                    f"  ({paid_users} из {new_users} новых)\n\n"
+                    f"  ({new_paid} из {new_users} новых)\n\n"
                     "*Продления*\n"
                     f"  Продлили подписку: {renewal_users}\n"
                     f"  Доля продлений: {renewal_pct:.1f}%\n\n"
