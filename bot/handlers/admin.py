@@ -234,6 +234,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "\n*Other:*\n"
             "`/report` — service dashboard (users, subs, payments, servers)\n"
             "`/analytics` — conversion, ARPU, revenue by plan\n"
+            "`/traffic` — traffic stats per server (live from x-ui)\n"
             "`/logs` — last N user actions (default 50)\n"
             "`/last_logs` — only new actions since last call\n"
             "`/broadcast` — interactive broadcast to a list of users\n"
@@ -666,6 +667,103 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         except Exception as e:
             logger.error(f"Error in /analytics: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── /traffic ──────────────────────────────────────────────
+    def _fmt_bytes(b: int) -> str:
+        if b >= 1024**3:
+            return f"{b / 1024**3:.1f} GB"
+        return f"{b / (1024**2):.1f} MB"
+
+    @bot.message_handler(commands=['traffic'])
+    def handle_traffic(message: Message):
+        """Show live traffic stats per server from x-ui panels."""
+        if not is_admin(message.from_user.id):
+            return
+
+        bot.send_message(message.chat.id, "Собираю данные с серверов...")
+
+        try:
+            from vpn.xui_client import XUIClient
+
+            with get_db_session() as db:
+                now = datetime.utcnow()
+                week_ago = now - timedelta(days=7)
+                servers = db.query(Server).filter(Server.is_active == True).all()
+
+                if not servers:
+                    bot.send_message(message.chat.id, "Нет активных серверов.")
+                    return
+
+                total_panel_keys = 0
+                total_upload = 0
+                total_download = 0
+                server_blocks = []
+
+                for server in servers:
+                    try:
+                        client = XUIClient(server)
+                        clients = client.list_clients()
+                    except Exception as e:
+                        server_blocks.append(
+                            f"`{server.name}` — ошибка: {e}"
+                        )
+                        continue
+
+                    panel_emails = {c.email for c in clients}
+                    panel_count = len(clients)
+
+                    # DB keys for this server
+                    db_keys = db.query(Key).filter(
+                        Key.server_id == server.id,
+                        Key.is_active == True,
+                    ).all()
+                    db_emails = {k.remote_key_id for k in db_keys}
+
+                    known = len(panel_emails & db_emails)
+                    unknown = panel_count - known
+
+                    new_7d = db.query(func.count(Key.id)).filter(
+                        Key.server_id == server.id,
+                        Key.is_active == True,
+                        Key.created_at >= week_ago,
+                    ).scalar()
+
+                    srv_up = sum(c.upload_bytes for c in clients)
+                    srv_down = sum(c.download_bytes for c in clients)
+                    srv_total = srv_up + srv_down
+
+                    total_panel_keys += panel_count
+                    total_upload += srv_up
+                    total_download += srv_down
+
+                    block = (
+                        f"`{server.name}` ({server.host})\n"
+                        f"  Ключей на панели: {panel_count}\n"
+                        f"  Из них в БД: {known}\n"
+                        f"  Неизвестных: {unknown}\n"
+                        f"  Новых за 7 дней: {new_7d}\n"
+                        f"  Трафик: ↑ {_fmt_bytes(srv_up)}  ↓ {_fmt_bytes(srv_down)}\n"
+                        f"  Суммарно: {_fmt_bytes(srv_total)}"
+                    )
+                    server_blocks.append(block)
+
+                total_all = total_upload + total_download
+                text = "*Трафик по серверам*\n\n"
+                text += "\n\n".join(server_blocks)
+                text += (
+                    f"\n\n*Итого*\n"
+                    f"  Серверов: {len(servers)}\n"
+                    f"  Ключей: {total_panel_keys}\n"
+                    f"  Трафик: ↑ {_fmt_bytes(total_upload)}  ↓ {_fmt_bytes(total_download)}\n"
+                    f"  Суммарно: {_fmt_bytes(total_all)}\n\n"
+                    f"_{format_msk(now)}_"
+                )
+
+                bot.send_message(message.chat.id, text, parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"Error in /traffic: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── /servers ──────────────────────────────────────────────
