@@ -21,7 +21,7 @@ from sqlalchemy import func
 from database import get_db_session
 from database.models import Server, User, Subscription, Key, Transaction, ActivityLog
 from database.activity_log import log_activity
-from config.settings import ADMIN_IDS, XUI_USERNAME, XUI_PASSWORD, format_msk
+from config.settings import ADMIN_IDS, XUI_USERNAME, XUI_PASSWORD, PLANS, format_msk
 from services import KeyService
 
 logger = logging.getLogger(__name__)
@@ -232,6 +232,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "`/remove_old_keys` — soft-delete all legacy keys\n"
             "\n*Other:*\n"
             "`/report` — service dashboard (users, subs, payments, servers)\n"
+            "`/analytics` — conversion, ARPU, revenue by plan\n"
             "`/logs` — last N user actions (default 50)\n"
             "`/last_logs` — only new actions since last call\n"
             "`/broadcast` — interactive broadcast to a list of users\n"
@@ -274,36 +275,46 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     Subscription.expires_at <= now,
                 ).scalar()
 
-                # Payments — completed totals
+                # Payments — exclude admin transactions
+                admin_user_ids = db.query(User.id).filter(
+                    User.telegram_id.in_(ADMIN_IDS)
+                ).subquery()
+                # Exclude admin transactions and test payments (before 20.02.2026)
+                real_payments_cutoff = datetime(2026, 2, 20)
+                non_admin_tx = db.query(Transaction).filter(
+                    ~Transaction.user_id.in_(admin_user_ids),
+                    Transaction.created_at >= real_payments_cutoff,
+                ).subquery()
+
                 completed = db.query(
-                    func.count(Transaction.id),
-                    func.coalesce(func.sum(Transaction.amount), 0),
-                ).filter(Transaction.status == 'completed').one()
+                    func.count(non_admin_tx.c.id),
+                    func.coalesce(func.sum(non_admin_tx.c.amount), 0),
+                ).filter(non_admin_tx.c.status == 'completed').one()
                 completed_count, completed_sum_kopeks = completed
 
-                pending_count = db.query(func.count(Transaction.id)).filter(
-                    Transaction.status == 'pending'
+                pending_count = db.query(func.count(non_admin_tx.c.id)).filter(
+                    non_admin_tx.c.status == 'pending'
                 ).scalar()
-                failed_count = db.query(func.count(Transaction.id)).filter(
-                    Transaction.status == 'failed'
+                failed_count = db.query(func.count(non_admin_tx.c.id)).filter(
+                    non_admin_tx.c.status == 'failed'
                 ).scalar()
 
-                # Recent revenue
+                # Recent revenue (non-admin)
                 rev_7d = db.query(
-                    func.count(Transaction.id),
-                    func.coalesce(func.sum(Transaction.amount), 0),
+                    func.count(non_admin_tx.c.id),
+                    func.coalesce(func.sum(non_admin_tx.c.amount), 0),
                 ).filter(
-                    Transaction.status == 'completed',
-                    Transaction.completed_at >= week_ago,
+                    non_admin_tx.c.status == 'completed',
+                    non_admin_tx.c.completed_at >= week_ago,
                 ).one()
                 rev_7d_count, rev_7d_sum = rev_7d
 
                 rev_30d = db.query(
-                    func.count(Transaction.id),
-                    func.coalesce(func.sum(Transaction.amount), 0),
+                    func.count(non_admin_tx.c.id),
+                    func.coalesce(func.sum(non_admin_tx.c.amount), 0),
                 ).filter(
-                    Transaction.status == 'completed',
-                    Transaction.completed_at >= month_ago,
+                    non_admin_tx.c.status == 'completed',
+                    non_admin_tx.c.completed_at >= month_ago,
                 ).one()
                 rev_30d_count, rev_30d_sum = rev_30d
 
@@ -353,6 +364,18 @@ def register_admin_handlers(bot: TeleBot) -> None:
             logger.error(f"Error in /report: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
 
+    def _truncate_lines(lines: list[str], max_len: int) -> str:
+        """Join lines, truncating at line boundaries to stay under max_len."""
+        result = []
+        total = 0
+        for line in lines:
+            if total + len(line) + 1 > max_len:  # +1 for \n
+                result.append("...")
+                break
+            result.append(line)
+            total += len(line) + 1
+        return "\n".join(result)
+
     # ── /logs ────────────────────────────────────────────────
     ACTION_DISPLAY = {
         "test_key": "Тест-ключ",
@@ -397,11 +420,8 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     detail = f": `{entry.details}`" if entry.details else ""
                     lines.append(f"`{ts}` | `{entry.telegram_id}` | {action_name}{detail}")
 
-                text = "\n".join(lines)
-                # Telegram message limit is 4096 chars
-                if len(text) > 4000:
-                    text = text[:4000] + "\n..."
-
+                # Truncate by lines to avoid cutting mid-entity
+                text = _truncate_lines(lines, 4000)
                 bot.send_message(message.chat.id, text, parse_mode='Markdown')
 
         except Exception as e:
@@ -440,14 +460,140 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     detail = f": `{entry.details}`" if entry.details else ""
                     lines.append(f"`{ts}` | `{entry.telegram_id}` | {action_name}{detail}")
 
-                text = "\n".join(lines)
-                if len(text) > 4000:
-                    text = text[:4000] + "\n..."
-
+                # Truncate by lines to avoid cutting mid-entity
+                text = _truncate_lines(lines, 4000)
                 bot.send_message(message.chat.id, text, parse_mode='Markdown')
 
         except Exception as e:
             logger.error(f"Error in /last_logs: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── /analytics ────────────────────────────────────────────
+    @bot.message_handler(commands=['analytics'])
+    def handle_analytics(message: Message):
+        """Show conversion and business health metrics."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            with get_db_session() as db:
+                now = datetime.utcnow()
+                real_payments_cutoff = datetime(2026, 2, 20)
+
+                # Exclude admins
+                admin_user_ids = db.query(User.id).filter(
+                    User.telegram_id.in_(ADMIN_IDS)
+                ).subquery()
+
+                # ── Funnel ──
+                total_users = db.query(func.count(User.id)).filter(
+                    ~User.id.in_(admin_user_ids)
+                ).scalar()
+
+                # Users who got a test key (from activity log — reliable even after is_test flip)
+                test_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
+                    ActivityLog.action == 'test_key',
+                    ~ActivityLog.telegram_id.in_(
+                        db.query(User.telegram_id).filter(User.telegram_id.in_(ADMIN_IDS))
+                    ),
+                ).scalar()
+
+                # Unique paying users (non-admin, real payments only)
+                paid_users = db.query(func.count(func.distinct(Transaction.user_id))).filter(
+                    Transaction.status == 'completed',
+                    ~Transaction.user_id.in_(admin_user_ids),
+                    Transaction.created_at >= real_payments_cutoff,
+                ).scalar()
+
+                conv_test = (paid_users / test_users * 100) if test_users > 0 else 0
+                conv_total = (paid_users / total_users * 100) if total_users > 0 else 0
+
+                # ── Renewals (users with 2+ completed payments) ──
+                from sqlalchemy import literal_column
+                renewal_sub = db.query(
+                    Transaction.user_id,
+                    func.count(Transaction.id).label('cnt'),
+                ).filter(
+                    Transaction.status == 'completed',
+                    ~Transaction.user_id.in_(admin_user_ids),
+                    Transaction.created_at >= real_payments_cutoff,
+                ).group_by(Transaction.user_id).subquery()
+
+                renewal_users = db.query(func.count()).filter(
+                    renewal_sub.c.cnt >= 2
+                ).scalar()
+                renewal_pct = (renewal_users / paid_users * 100) if paid_users > 0 else 0
+
+                # ── Revenue by plan ──
+                plan_stats = db.query(
+                    Transaction.plan,
+                    func.count(Transaction.id),
+                    func.coalesce(func.sum(Transaction.amount), 0),
+                ).filter(
+                    Transaction.status == 'completed',
+                    ~Transaction.user_id.in_(admin_user_ids),
+                    Transaction.created_at >= real_payments_cutoff,
+                ).group_by(Transaction.plan).all()
+
+                total_revenue = 0
+                plan_lines = []
+                for plan_key, count, amount in plan_stats:
+                    plan_info = PLANS.get(plan_key, {})
+                    desc = plan_info.get('description', plan_key)
+                    price = plan_info.get('price_display', '?')
+                    rub = amount // 100
+                    total_revenue += amount
+                    plan_lines.append(f"  {desc} ({price}): {count} шт — {rub:,}₽".replace(",", " "))
+
+                total_rub = total_revenue // 100
+                arpu = (total_rub // paid_users) if paid_users > 0 else 0
+
+                # ── Expiring soon ──
+                expiring_7d = db.query(func.count(Subscription.id)).filter(
+                    Subscription.is_active == True,
+                    Subscription.is_test == False,
+                    Subscription.expires_at > now,
+                    Subscription.expires_at <= now + timedelta(days=7),
+                    ~Subscription.user_id.in_(admin_user_ids),
+                ).scalar()
+
+                expiring_30d = db.query(func.count(Subscription.id)).filter(
+                    Subscription.is_active == True,
+                    Subscription.is_test == False,
+                    Subscription.expires_at > now,
+                    Subscription.expires_at <= now + timedelta(days=30),
+                    ~Subscription.user_id.in_(admin_user_ids),
+                ).scalar()
+
+                # ── Build message ──
+                text = (
+                    "*Аналитика*\n\n"
+                    "*Воронка*\n"
+                    f"  Всего пользователей: {total_users}\n"
+                    f"  Получили тест-ключ: {test_users}\n"
+                    f"  Оплатили: {paid_users}\n"
+                    f"  Конверсия тест → оплата: {conv_test:.1f}%\n"
+                    f"  Конверсия регистрация → оплата: {conv_total:.1f}%\n\n"
+                    "*Продления*\n"
+                    f"  Продлили подписку: {renewal_users}\n"
+                    f"  Доля продлений: {renewal_pct:.1f}%\n\n"
+                    "*Выручка по тарифам*\n"
+                )
+                if plan_lines:
+                    text += "\n".join(plan_lines) + "\n"
+                text += (
+                    f"  Итого: {total_rub:,}₽\n\n".replace(",", " ") +
+                    f"*ARPU:* {arpu:,}₽\n\n".replace(",", " ") +
+                    "*Истекают*\n"
+                    f"  В ближайшие 7 дней: {expiring_7d}\n"
+                    f"  В ближайшие 30 дней: {expiring_30d}\n\n"
+                    f"_{format_msk(now)}_"
+                )
+
+                bot.send_message(message.chat.id, text, parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"Error in /analytics: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── /servers ──────────────────────────────────────────────
@@ -1178,7 +1324,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
         lines = [
             f"*User Management*\n",
             f"*Telegram ID:* `{user.telegram_id}`",
-            f"*Username:* @{user.username}" if user.username else "*Username:* —",
+            f"*Username:* `@{user.username}`" if user.username else "*Username:* —",
             f"*Registered:* {format_msk(user.created_at)}",
         ]
 
