@@ -699,10 +699,10 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
                 from collections import defaultdict as _defaultdict
 
-                total_panel_keys = 0
-                total_upload = 0
-                total_download = 0
-                # group -> list of (name, keys, in_db, unk, new, up, down)
+                total_keys = 0
+                total_traffic = 0
+                total_monthly = 0
+                # group -> list of (name, db_count, new_7d, traffic, monthly_est)
                 groups: dict = _defaultdict(list)
                 errors = []
 
@@ -714,36 +714,46 @@ def register_admin_handlers(bot: TeleBot) -> None:
                         errors.append(f"{server.name}: {e}")
                         continue
 
-                    panel_emails = {c.email for c in clients}
-                    panel_count = len(clients)
+                    # Traffic by email from panel
+                    traffic_by_email = {
+                        c.email: c.upload_bytes + c.download_bytes
+                        for c in clients
+                    }
 
-                    db_emails = set(
-                        r[0] for r in db.query(Key.remote_key_id).filter(
-                            Key.server_id == server.id,
-                            Key.is_active == True,
-                        ).all()
-                    )
-
-                    known = len(panel_emails & db_emails)
-                    unknown = panel_count - known
-
-                    new_7d = db.query(func.count(Key.id)).filter(
+                    # DB keys for this server
+                    db_keys = db.query(Key).filter(
                         Key.server_id == server.id,
                         Key.is_active == True,
-                        Key.created_at >= week_ago,
-                    ).scalar()
+                    ).all()
 
-                    srv_up = sum(c.upload_bytes for c in clients)
-                    srv_down = sum(c.download_bytes for c in clients)
+                    db_count = len(db_keys)
+                    new_7d = sum(
+                        1 for k in db_keys
+                        if k.created_at and k.created_at >= week_ago
+                    )
 
-                    total_panel_keys += panel_count
-                    total_upload += srv_up
-                    total_download += srv_down
+                    srv_traffic = sum(traffic_by_email.values())
+
+                    # Monthly estimate: per-key traffic / max(age_days, 1) * 30
+                    srv_monthly = 0
+                    for k in db_keys:
+                        t = traffic_by_email.get(k.remote_key_id, 0)
+                        if t <= 0:
+                            continue
+                        age_days = max(
+                            (now - k.created_at).total_seconds() / 86400,
+                            1.0,
+                        ) if k.created_at else 1.0
+                        srv_monthly += t / age_days * 30
+
+                    total_keys += db_count
+                    total_traffic += srv_traffic
+                    total_monthly += srv_monthly
 
                     group = server.server_set or "default"
                     groups[group].append((
-                        server.name, panel_count, known, unknown,
-                        new_7d, srv_up, srv_down,
+                        server.name, db_count, new_7d,
+                        srv_traffic, int(srv_monthly),
                     ))
 
                 # Sort servers alphabetically within each group
@@ -751,7 +761,10 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     groups[g].sort(key=lambda r: r[0])
 
                 # Build table
-                hdr = f"{'Сервер':<16} {'Кл':>3} {'БД':>3} {'?':>2} {'+7д':>3} {'↑':>8} {'↓':>8} {'Всего':>8}"
+                hdr = (
+                    f"{'Сервер':<16} {'Кл':>3} {'+7д':>3}"
+                    f" {'Трафик':>8} {'~мес':>8}"
+                )
                 sep = "─" * len(hdr)
                 lines = [hdr, sep]
 
@@ -761,32 +774,30 @@ def register_admin_handlers(bot: TeleBot) -> None:
                         lines.append(f"[ {group_name} ]")
 
                     g_keys = 0
-                    g_up = 0
-                    g_down = 0
-                    for name, keys, in_db, unk, new, up, dn in rows:
-                        g_keys += keys
-                        g_up += up
-                        g_down += dn
-                        short = name[:16]
+                    g_traffic = 0
+                    g_monthly = 0
+                    for name, cnt, new, traffic, monthly in rows:
+                        g_keys += cnt
+                        g_traffic += traffic
+                        g_monthly += monthly
                         lines.append(
-                            f"{short:<16} {keys:>3} {in_db:>3} {unk:>2} {new:>3}"
-                            f" {_fmt_bytes(up):>8} {_fmt_bytes(dn):>8}"
-                            f" {_fmt_bytes(up + dn):>8}"
+                            f"{name[:16]:<16} {cnt:>3} {new:>3}"
+                            f" {_fmt_bytes(traffic):>8}"
+                            f" {_fmt_bytes(monthly):>8}"
                         )
 
                     if len(rows) > 1 and len(groups) > 1:
                         lines.append(
-                            f"{'':>16} {g_keys:>3} {'':>3} {'':>2} {'':>3}"
-                            f" {_fmt_bytes(g_up):>8} {_fmt_bytes(g_down):>8}"
-                            f" {_fmt_bytes(g_up + g_down):>8}"
+                            f"{'':>16} {g_keys:>3} {'':>3}"
+                            f" {_fmt_bytes(g_traffic):>8}"
+                            f" {_fmt_bytes(g_monthly):>8}"
                         )
 
-                total_all = total_upload + total_download
                 lines.append(sep)
                 lines.append(
-                    f"{'Итого':<16} {total_panel_keys:>3} {'':>3} {'':>2} {'':>3}"
-                    f" {_fmt_bytes(total_upload):>8} {_fmt_bytes(total_download):>8}"
-                    f" {_fmt_bytes(total_all):>8}"
+                    f"{'Итого':<16} {total_keys:>3} {'':>3}"
+                    f" {_fmt_bytes(total_traffic):>8}"
+                    f" {_fmt_bytes(int(total_monthly)):>8}"
                 )
 
                 for err in errors:
