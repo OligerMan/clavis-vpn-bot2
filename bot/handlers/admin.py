@@ -20,6 +20,7 @@ from sqlalchemy import func
 
 from database import get_db_session
 from database.models import Server, User, Subscription, Key, Transaction, ActivityLog
+from database.activity_log import log_activity
 from config.settings import ADMIN_IDS, XUI_USERNAME, XUI_PASSWORD, format_msk
 from services import KeyService
 
@@ -358,6 +359,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
         "new_user": "Новый пользователь",
         "sub_extended": "Продление",
         "sub_reactivated": "Реактивация",
+        "admin_grant_sub": "Выдана подписка",
     }
 
     @bot.message_handler(commands=['logs'])
@@ -391,7 +393,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 for entry in logs:
                     ts = format_msk(entry.created_at, fmt="%d.%m %H:%M").replace(" МСК", "")
                     action_name = ACTION_DISPLAY.get(entry.action, entry.action)
-                    detail = f": {entry.details}" if entry.details else ""
+                    detail = f": `{entry.details}`" if entry.details else ""
                     lines.append(f"`{ts}` | `{entry.telegram_id}` | {action_name}{detail}")
 
                 text = "\n".join(lines)
@@ -1203,6 +1205,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
         kb = InlineKeyboardMarkup()
         kb.row(InlineKeyboardButton("Refresh keys", callback_data=f"mu_refresh_{telegram_id}"))
         kb.row(InlineKeyboardButton("Adjust time", callback_data=f"mu_time_{telegram_id}"))
+        kb.row(InlineKeyboardButton("Grant subscription", callback_data=f"mu_grantsub_{telegram_id}"))
         kb.row(InlineKeyboardButton("Reset test period", callback_data=f"mu_resettest_{telegram_id}"))
         return kb
 
@@ -1374,6 +1377,85 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         except Exception as e:
             logger.error(f"Error adjusting time: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── Grant subscription callback (starts dialog) ───────────
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_grantsub_'))
+    def handle_mu_grantsub(call: CallbackQuery):
+        """Start dialog to grant a paid subscription."""
+        if not is_admin(call.from_user.id):
+            return
+
+        tg_id = int(call.data.replace('mu_grantsub_', ''))
+        bot.answer_callback_query(call.id)
+
+        msg = bot.send_message(
+            call.message.chat.id,
+            f"Enter expiry date for user `{tg_id}` in format `DD.MM.YYYY`\n"
+            f"Example: `01.01.2027`",
+            parse_mode='Markdown',
+        )
+        bot.register_next_step_handler(msg, _process_grant_subscription, tg_id)
+
+    def _process_grant_subscription(message: Message, tg_id: int):
+        """Process the date input and create subscription."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            expires_at = datetime.strptime(message.text.strip(), "%d.%m.%Y").replace(
+                hour=23, minute=59, second=59
+            )
+        except (ValueError, AttributeError):
+            bot.send_message(message.chat.id, "Invalid date format. Use `DD.MM.YYYY`. Cancelled.", parse_mode='Markdown')
+            return
+
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == tg_id).first()
+                if not user:
+                    bot.send_message(message.chat.id, "User not found")
+                    return
+
+                # Check for existing active non-expired subscription
+                existing = db.query(Subscription).filter(
+                    Subscription.user_id == user.id,
+                    Subscription.is_active == True,
+                    Subscription.expires_at > datetime.utcnow(),
+                ).first()
+
+                if existing:
+                    bot.send_message(
+                        message.chat.id,
+                        f"User already has active subscription (id={existing.id}, "
+                        f"expires {format_msk(existing.expires_at)}). "
+                        f"Use *Adjust time* instead.",
+                        parse_mode='Markdown',
+                    )
+                    return
+
+                sub = Subscription(
+                    user_id=user.id,
+                    name="Main",
+                    token=str(uuid.uuid4()),
+                    expires_at=expires_at,
+                    is_test=False,
+                    is_active=True,
+                )
+                db.add(sub)
+                log_activity(db, tg_id, "admin_grant_sub", f"до {format_msk(expires_at)}")
+                db.flush()
+
+                text, _ = _format_user_info(db, tg_id)
+                bot.send_message(
+                    message.chat.id,
+                    text + f"\n\n_Subscription granted until {format_msk(expires_at)}_",
+                    reply_markup=_manage_user_keyboard(tg_id),
+                    parse_mode='Markdown',
+                )
+
+        except Exception as e:
+            logger.error(f"Error granting subscription: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── Reset test period callback ────────────────────────────
