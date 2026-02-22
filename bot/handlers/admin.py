@@ -673,7 +673,9 @@ def register_admin_handlers(bot: TeleBot) -> None:
     def _fmt_bytes(b: int) -> str:
         if b >= 1024**3:
             return f"{b / 1024**3:.1f} GB"
-        return f"{b / (1024**2):.1f} MB"
+        if b >= 1024**2:
+            return f"{b / (1024**2):.0f} MB"
+        return f"{b / 1024:.0f} KB"
 
     @bot.message_handler(commands=['traffic'])
     def handle_traffic(message: Message):
@@ -698,27 +700,26 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 total_panel_keys = 0
                 total_upload = 0
                 total_download = 0
-                server_blocks = []
+                rows = []  # (name, keys, in_db, unknown, new_7d, up, down)
+                errors = []
 
                 for server in servers:
                     try:
                         client = XUIClient(server)
                         clients = client.list_clients()
                     except Exception as e:
-                        server_blocks.append(
-                            f"`{server.name}` — ошибка: {e}"
-                        )
+                        errors.append(f"{server.name}: {e}")
                         continue
 
                     panel_emails = {c.email for c in clients}
                     panel_count = len(clients)
 
-                    # DB keys for this server
-                    db_keys = db.query(Key).filter(
-                        Key.server_id == server.id,
-                        Key.is_active == True,
-                    ).all()
-                    db_emails = {k.remote_key_id for k in db_keys}
+                    db_emails = set(
+                        r[0] for r in db.query(Key.remote_key_id).filter(
+                            Key.server_id == server.id,
+                            Key.is_active == True,
+                        ).all()
+                    )
 
                     known = len(panel_emails & db_emails)
                     unknown = panel_count - known
@@ -731,36 +732,48 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
                     srv_up = sum(c.upload_bytes for c in clients)
                     srv_down = sum(c.download_bytes for c in clients)
-                    srv_total = srv_up + srv_down
 
                     total_panel_keys += panel_count
                     total_upload += srv_up
                     total_download += srv_down
 
-                    block = (
-                        f"`{server.name}` ({server.host})\n"
-                        f"  Ключей на панели: {panel_count}\n"
-                        f"  Из них в БД: {known}\n"
-                        f"  Неизвестных: {unknown}\n"
-                        f"  Новых за 7 дней: {new_7d}\n"
-                        f"  Трафик: ↑ {_fmt_bytes(srv_up)}  ↓ {_fmt_bytes(srv_down)}\n"
-                        f"  Суммарно: {_fmt_bytes(srv_total)}"
-                    )
-                    server_blocks.append(block)
+                    rows.append((
+                        server.name, panel_count, known, unknown,
+                        new_7d, srv_up, srv_down,
+                    ))
 
+                # Build table
                 total_all = total_upload + total_download
-                text = "*Трафик по серверам*\n\n"
-                text += "\n\n".join(server_blocks)
-                text += (
-                    f"\n\n*Итого*\n"
-                    f"  Серверов: {len(servers)}\n"
-                    f"  Ключей: {total_panel_keys}\n"
-                    f"  Трафик: ↑ {_fmt_bytes(total_upload)}  ↓ {_fmt_bytes(total_download)}\n"
-                    f"  Суммарно: {_fmt_bytes(total_all)}\n\n"
-                    f"_{format_msk(now)}_"
-                )
+                lines = ["Трафик по серверам\n"]
 
-                bot.send_message(message.chat.id, text, parse_mode='Markdown')
+                for name, keys, in_db, unk, new, up, dn in rows:
+                    lines.append(
+                        f"▸ {name}\n"
+                        f"  Ключи: {keys} (в БД {in_db}"
+                        + (f", чужих {unk}" if unk else "")
+                        + (f", новых {new}" if new else "")
+                        + ")\n"
+                        f"  ↑ {_fmt_bytes(up)}  ↓ {_fmt_bytes(dn)}"
+                        f"  = {_fmt_bytes(up + dn)}"
+                    )
+
+                if len(rows) > 1:
+                    lines.append(
+                        f"\nИтого: {total_panel_keys} ключей, "
+                        f"↑ {_fmt_bytes(total_upload)} ↓ {_fmt_bytes(total_download)} "
+                        f"= {_fmt_bytes(total_all)}"
+                    )
+
+                for err in errors:
+                    lines.append(f"\n⚠ {err}")
+
+                lines.append(f"\n{format_msk(now)}")
+
+                bot.send_message(
+                    message.chat.id,
+                    "```\n" + "\n".join(lines) + "\n```",
+                    parse_mode='Markdown',
+                )
 
         except Exception as e:
             logger.error(f"Error in /traffic: {e}", exc_info=True)

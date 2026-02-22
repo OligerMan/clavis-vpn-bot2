@@ -426,10 +426,24 @@ class XUIClient:
             if inbound is None:
                 raise XUIInboundError(f"Inbound {inbound_id} not found")
 
+            # Build traffic lookup from client_stats (has actual up/down)
+            stats_by_email = {}
+            if inbound.client_stats:
+                for cs in inbound.client_stats:
+                    stats_by_email[cs.email] = cs
+
             clients = []
             for client in inbound.settings.clients:
                 expiry_time = None
-                if hasattr(client, "expiry_time") and client.expiry_time:
+                # Traffic stats from client_stats (not settings)
+                cs = stats_by_email.get(client.email)
+                up = (cs.up if cs else 0) or 0
+                down = (cs.down if cs else 0) or 0
+
+                if cs and hasattr(cs, "expiry_time") and cs.expiry_time:
+                    if cs.expiry_time > 0:
+                        expiry_time = datetime.fromtimestamp(cs.expiry_time / 1000)
+                elif hasattr(client, "expiry_time") and client.expiry_time:
                     if client.expiry_time > 0:
                         expiry_time = datetime.fromtimestamp(client.expiry_time / 1000)
 
@@ -439,9 +453,9 @@ class XUIClient:
                         email=client.email,
                         enabled=getattr(client, "enable", True),
                         inbound_id=inbound_id,
-                        upload_bytes=getattr(client, "up", 0) or 0,
-                        download_bytes=getattr(client, "down", 0) or 0,
-                        total_bytes=(getattr(client, "up", 0) or 0) + (getattr(client, "down", 0) or 0),
+                        upload_bytes=up,
+                        download_bytes=down,
+                        total_bytes=up + down,
                         expiry_time=expiry_time,
                         flow=getattr(client, "flow", None),
                         limit_ip=getattr(client, "limit_ip", 0) or 0,
