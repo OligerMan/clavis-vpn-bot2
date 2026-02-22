@@ -9,6 +9,7 @@ import secrets
 import subprocess
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 from py3xui import Api, Inbound
@@ -429,7 +430,29 @@ def register_admin_handlers(bot: TeleBot) -> None:
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── /last_logs ────────────────────────────────────────────
-    _last_logs_seen = {}  # {chat_id: datetime} — last shown log timestamp
+    # Persist watermark to file so it survives bot restarts
+    _LAST_LOGS_FILE = Path(__file__).parent.parent.parent / "data" / "last_logs_seen.json"
+
+    def _load_watermarks() -> dict:
+        try:
+            if _LAST_LOGS_FILE.exists():
+                import json as _json
+                raw = _json.loads(_LAST_LOGS_FILE.read_text())
+                return {int(k): datetime.fromisoformat(v) for k, v in raw.items()}
+        except Exception:
+            pass
+        return {}
+
+    def _save_watermarks(wm: dict):
+        try:
+            import json as _json
+            _LAST_LOGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            raw = {str(k): v.isoformat() for k, v in wm.items()}
+            _LAST_LOGS_FILE.write_text(_json.dumps(raw))
+        except Exception:
+            pass
+
+    _last_logs_seen = _load_watermarks()
 
     @bot.message_handler(commands=['last_logs'])
     def handle_last_logs(message: Message):
@@ -450,8 +473,9 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     bot.send_message(message.chat.id, "Нет новых записей.")
                     return
 
-                # Update watermark to the newest entry
+                # Update and persist watermark
                 _last_logs_seen[message.chat.id] = logs[0].created_at
+                _save_watermarks(_last_logs_seen)
 
                 lines = [f"*Новые действия ({len(logs)})*\n"]
                 for entry in logs:
@@ -490,37 +514,63 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     ~User.id.in_(admin_user_ids)
                 ).scalar()
 
-                # Users who got a test key (from activity log — reliable even after is_test flip)
-                test_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
-                    ActivityLog.action == 'test_key',
+                admin_tg_ids = [aid for aid in ADMIN_IDS]
+
+                # All telegram_ids who ever had a test
+                # Source 1: activity log (post-deployment)
+                test_tg_from_log = set(
+                    r[0] for r in db.query(ActivityLog.telegram_id).filter(
+                        ActivityLog.action == 'test_key',
+                        ~ActivityLog.telegram_id.in_(admin_tg_ids),
+                    ).all()
+                )
+                # Source 2: current test subscriptions (covers pre-logging history)
+                test_tg_from_sub = set(
+                    r[0] for r in db.query(User.telegram_id).join(Subscription).filter(
+                        Subscription.is_test == True,
+                        ~User.id.in_(admin_user_ids),
+                    ).all()
+                )
+                all_test_tg = test_tg_from_log | test_tg_from_sub
+                test_users = len(all_test_tg)
+
+                # All telegram_ids who paid
+                paid_tg = set(
+                    r[0] for r in db.query(User.telegram_id).join(
+                        Transaction, User.id == Transaction.user_id
+                    ).filter(
+                        Transaction.status == 'completed',
+                        ~User.id.in_(admin_user_ids),
+                        Transaction.created_at >= real_payments_cutoff,
+                    ).all()
+                )
+                paid_users = len(paid_tg)
+
+                # Converted from test = had test AND paid
+                converted_from_test = len(all_test_tg & paid_tg)
+
+                # Decided = had test, but no longer in undecided active test
+                active_test_tg = set(
+                    r[0] for r in db.query(User.telegram_id).join(Subscription).filter(
+                        Subscription.is_test == True,
+                        Subscription.is_active == True,
+                        Subscription.expires_at > now,
+                        ~User.id.in_(admin_user_ids),
+                    ).all()
+                )
+                undecided_tg = active_test_tg - paid_tg  # still in test and haven't paid
+                test_decided = len(all_test_tg - undecided_tg)
+
+                conv_test = (converted_from_test / test_decided * 100) if test_decided > 0 else 0
+                conv_total = (paid_users / total_users * 100) if total_users > 0 else 0
+                paid_without_test = len(paid_tg - all_test_tg)
+
+                # ── Renewals (from activity log) ──
+                renewal_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
+                    ActivityLog.action == 'sub_extended',
                     ~ActivityLog.telegram_id.in_(
                         db.query(User.telegram_id).filter(User.telegram_id.in_(ADMIN_IDS))
                     ),
-                ).scalar()
-
-                # Unique paying users (non-admin, real payments only)
-                paid_users = db.query(func.count(func.distinct(Transaction.user_id))).filter(
-                    Transaction.status == 'completed',
-                    ~Transaction.user_id.in_(admin_user_ids),
-                    Transaction.created_at >= real_payments_cutoff,
-                ).scalar()
-
-                conv_test = (paid_users / test_users * 100) if test_users > 0 else 0
-                conv_total = (paid_users / total_users * 100) if total_users > 0 else 0
-
-                # ── Renewals (users with 2+ completed payments) ──
-                from sqlalchemy import literal_column
-                renewal_sub = db.query(
-                    Transaction.user_id,
-                    func.count(Transaction.id).label('cnt'),
-                ).filter(
-                    Transaction.status == 'completed',
-                    ~Transaction.user_id.in_(admin_user_ids),
-                    Transaction.created_at >= real_payments_cutoff,
-                ).group_by(Transaction.user_id).subquery()
-
-                renewal_users = db.query(func.count()).filter(
-                    renewal_sub.c.cnt >= 2
                 ).scalar()
                 renewal_pct = (renewal_users / paid_users * 100) if paid_users > 0 else 0
 
@@ -571,8 +621,11 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     "*Воронка*\n"
                     f"  Всего пользователей: {total_users}\n"
                     f"  Получили тест-ключ: {test_users}\n"
-                    f"  Оплатили: {paid_users}\n"
-                    f"  Конверсия тест → оплата: {conv_test:.1f}%\n"
+                    f"  Оплатили (всего): {paid_users}\n"
+                    f"  Оплатили после теста: {converted_from_test}\n"
+                    f"  Оплатили без теста: {paid_without_test}\n"
+                    f"  Конверсия тест → оплата: {conv_test:.1f}%"
+                    f"  ({converted_from_test} из {test_decided} решивших)\n"
                     f"  Конверсия регистрация → оплата: {conv_total:.1f}%\n\n"
                     "*Продления*\n"
                     f"  Продлили подписку: {renewal_users}\n"
