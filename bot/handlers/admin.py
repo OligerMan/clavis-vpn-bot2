@@ -514,6 +514,14 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     ~User.id.in_(admin_user_ids)
                 ).scalar()
 
+                # New users only (registered via new bot version)
+                new_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
+                    ActivityLog.action == 'new_user',
+                    ~ActivityLog.telegram_id.in_(
+                        db.query(User.telegram_id).filter(User.telegram_id.in_(ADMIN_IDS))
+                    ),
+                ).scalar()
+
                 admin_tg_ids = [aid for aid in ADMIN_IDS]
 
                 # All telegram_ids who ever had a test
@@ -562,7 +570,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 test_decided = len(all_test_tg - undecided_tg)
 
                 conv_test = (converted_from_test / test_decided * 100) if test_decided > 0 else 0
-                conv_total = (paid_users / total_users * 100) if total_users > 0 else 0
+                conv_total = (paid_users / new_users * 100) if new_users > 0 else 0
                 paid_without_test = len(paid_tg - all_test_tg)
 
                 # ── Renewals (from activity log) ──
@@ -620,13 +628,15 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     "*Аналитика*\n\n"
                     "*Воронка*\n"
                     f"  Всего пользователей: {total_users}\n"
+                    f"  Новых (v2): {new_users}\n"
                     f"  Получили тест-ключ: {test_users}\n"
                     f"  Оплатили (всего): {paid_users}\n"
                     f"  Оплатили после теста: {converted_from_test}\n"
                     f"  Оплатили без теста: {paid_without_test}\n"
                     f"  Конверсия тест → оплата: {conv_test:.1f}%"
                     f"  ({converted_from_test} из {test_decided} решивших)\n"
-                    f"  Конверсия регистрация → оплата: {conv_total:.1f}%\n\n"
+                    f"  Конверсия рег → оплата: {conv_total:.1f}%"
+                    f"  ({paid_users} из {new_users} новых)\n\n"
                     "*Продления*\n"
                     f"  Продлили подписку: {renewal_users}\n"
                     f"  Доля продлений: {renewal_pct:.1f}%\n\n"
