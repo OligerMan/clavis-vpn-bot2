@@ -697,10 +697,13 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     bot.send_message(message.chat.id, "Нет активных серверов.")
                     return
 
+                from collections import defaultdict as _defaultdict
+
                 total_panel_keys = 0
                 total_upload = 0
                 total_download = 0
-                rows = []  # (name, keys, in_db, unknown, new_7d, up, down)
+                # group -> list of (name, keys, in_db, unk, new, up, down)
+                groups: dict = _defaultdict(list)
                 errors = []
 
                 for server in servers:
@@ -737,35 +740,57 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     total_upload += srv_up
                     total_download += srv_down
 
-                    rows.append((
+                    group = server.server_set or "default"
+                    groups[group].append((
                         server.name, panel_count, known, unknown,
                         new_7d, srv_up, srv_down,
                     ))
 
+                # Sort servers alphabetically within each group
+                for g in groups:
+                    groups[g].sort(key=lambda r: r[0])
+
                 # Build table
+                hdr = f"{'Сервер':<16} {'Кл':>3} {'БД':>3} {'?':>2} {'+7д':>3} {'↑':>8} {'↓':>8} {'Всего':>8}"
+                sep = "─" * len(hdr)
+                lines = [hdr, sep]
+
+                for group_name in sorted(groups.keys()):
+                    rows = groups[group_name]
+                    if len(groups) > 1:
+                        lines.append(f"[ {group_name} ]")
+
+                    g_keys = 0
+                    g_up = 0
+                    g_down = 0
+                    for name, keys, in_db, unk, new, up, dn in rows:
+                        g_keys += keys
+                        g_up += up
+                        g_down += dn
+                        short = name[:16]
+                        lines.append(
+                            f"{short:<16} {keys:>3} {in_db:>3} {unk:>2} {new:>3}"
+                            f" {_fmt_bytes(up):>8} {_fmt_bytes(dn):>8}"
+                            f" {_fmt_bytes(up + dn):>8}"
+                        )
+
+                    if len(rows) > 1 and len(groups) > 1:
+                        lines.append(
+                            f"{'':>16} {g_keys:>3} {'':>3} {'':>2} {'':>3}"
+                            f" {_fmt_bytes(g_up):>8} {_fmt_bytes(g_down):>8}"
+                            f" {_fmt_bytes(g_up + g_down):>8}"
+                        )
+
                 total_all = total_upload + total_download
-                lines = ["Трафик по серверам\n"]
-
-                for name, keys, in_db, unk, new, up, dn in rows:
-                    lines.append(
-                        f"▸ {name}\n"
-                        f"  Ключи: {keys} (в БД {in_db}"
-                        + (f", чужих {unk}" if unk else "")
-                        + (f", новых {new}" if new else "")
-                        + ")\n"
-                        f"  ↑ {_fmt_bytes(up)}  ↓ {_fmt_bytes(dn)}"
-                        f"  = {_fmt_bytes(up + dn)}"
-                    )
-
-                if len(rows) > 1:
-                    lines.append(
-                        f"\nИтого: {total_panel_keys} ключей, "
-                        f"↑ {_fmt_bytes(total_upload)} ↓ {_fmt_bytes(total_download)} "
-                        f"= {_fmt_bytes(total_all)}"
-                    )
+                lines.append(sep)
+                lines.append(
+                    f"{'Итого':<16} {total_panel_keys:>3} {'':>3} {'':>2} {'':>3}"
+                    f" {_fmt_bytes(total_upload):>8} {_fmt_bytes(total_download):>8}"
+                    f" {_fmt_bytes(total_all):>8}"
+                )
 
                 for err in errors:
-                    lines.append(f"\n⚠ {err}")
+                    lines.append(f"⚠ {err}")
 
                 lines.append(f"\n{format_msk(now)}")
 
