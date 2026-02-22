@@ -233,6 +233,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "\n*Other:*\n"
             "`/report` — service dashboard (users, subs, payments, servers)\n"
             "`/logs` — last N user actions (default 50)\n"
+            "`/last_logs` — only new actions since last call\n"
             "`/broadcast` — interactive broadcast to a list of users\n"
             "`/check_reminders` — manually run subscription expiry check\n"
             "`/admin_help` — this message",
@@ -405,6 +406,48 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         except Exception as e:
             logger.error(f"Error in /logs: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── /last_logs ────────────────────────────────────────────
+    _last_logs_seen = {}  # {chat_id: datetime} — last shown log timestamp
+
+    @bot.message_handler(commands=['last_logs'])
+    def handle_last_logs(message: Message):
+        """Show new logs since last /last_logs call. First call = all logs."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            with get_db_session() as db:
+                since = _last_logs_seen.get(message.chat.id)
+
+                query = db.query(ActivityLog)
+                if since:
+                    query = query.filter(ActivityLog.created_at > since)
+                logs = query.order_by(ActivityLog.created_at.desc()).limit(200).all()
+
+                if not logs:
+                    bot.send_message(message.chat.id, "Нет новых записей.")
+                    return
+
+                # Update watermark to the newest entry
+                _last_logs_seen[message.chat.id] = logs[0].created_at
+
+                lines = [f"*Новые действия ({len(logs)})*\n"]
+                for entry in logs:
+                    ts = format_msk(entry.created_at, fmt="%d.%m %H:%M").replace(" МСК", "")
+                    action_name = ACTION_DISPLAY.get(entry.action, entry.action)
+                    detail = f": `{entry.details}`" if entry.details else ""
+                    lines.append(f"`{ts}` | `{entry.telegram_id}` | {action_name}{detail}")
+
+                text = "\n".join(lines)
+                if len(text) > 4000:
+                    text = text[:4000] + "\n..."
+
+                bot.send_message(message.chat.id, text, parse_mode='Markdown')
+
+        except Exception as e:
+            logger.error(f"Error in /last_logs: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── /servers ──────────────────────────────────────────────
