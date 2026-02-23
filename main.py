@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from database import init_db, get_db_session
 from database.models import Transaction
 from bot import register_handlers, start_polling, get_bot
-from services import NotificationService
+from services import NotificationService, KeyService
 
 
 def setup_logging():
@@ -54,6 +54,17 @@ def expire_stale_transactions_job():
         logger.error(f"Error in expire_stale_transactions job: {e}", exc_info=True)
 
 
+def recalculate_server_scores_job():
+    """Recalculate server throughput scores and update preferred servers."""
+    logger = logging.getLogger(__name__)
+    try:
+        with get_db_session() as db:
+            chosen = KeyService.recalculate_server_scores(db)
+            logger.info(f"Server scores recalculated, chosen: {chosen}")
+    except Exception as e:
+        logger.error(f"Error in server_scores job: {e}", exc_info=True)
+
+
 def main():
     """Main function to start the bot."""
     # Setup logging
@@ -78,6 +89,10 @@ def main():
         # Run every hour
         scheduler.add_job(check_subscriptions_job, 'interval', hours=1, id='subscription_check')
         scheduler.add_job(expire_stale_transactions_job, 'interval', minutes=5, id='expire_stale_transactions')
+        scheduler.add_job(
+            recalculate_server_scores_job, 'interval', hours=12,
+            id='server_scores', next_run_time=datetime.utcnow(),
+        )
         scheduler.start()
         logger.info("Scheduler started (checking subscriptions every hour)")
 

@@ -752,17 +752,19 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
                     group = server.server_set or "default"
                     groups[group].append((
-                        server.name, db_count, new_7d,
+                        server.id, server.name, db_count, new_7d,
                         srv_traffic, int(srv_monthly),
                     ))
 
                 # Sort servers alphabetically within each group
                 for g in groups:
-                    groups[g].sort(key=lambda r: r[0])
+                    groups[g].sort(key=lambda r: r[1])  # sort by name
+
+                preferred = KeyService.get_preferred_server_ids()
 
                 # Build table
                 hdr = (
-                    f"{'Сервер':<16} {'Кл':>3} {'+7д':>3}"
+                    f"{'Сервер':<17} {'Кл':>3} {'+7д':>3}"
                     f" {'Трафик':>8} {'~мес':>8}"
                 )
                 sep = "─" * len(hdr)
@@ -776,29 +778,33 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     g_keys = 0
                     g_traffic = 0
                     g_monthly = 0
-                    for name, cnt, new, traffic, monthly in rows:
+                    for sid, name, cnt, new, traffic, monthly in rows:
                         g_keys += cnt
                         g_traffic += traffic
                         g_monthly += monthly
+                        mark = "*" if sid in preferred else " "
                         lines.append(
-                            f"{name[:16]:<16} {cnt:>3} {new:>3}"
+                            f"{name[:16]:<16}{mark} {cnt:>3} {new:>3}"
                             f" {_fmt_bytes(traffic):>8}"
                             f" {_fmt_bytes(monthly):>8}"
                         )
 
                     if len(rows) > 1 and len(groups) > 1:
                         lines.append(
-                            f"{'':>16} {g_keys:>3} {'':>3}"
+                            f"{'':>17} {g_keys:>3} {'':>3}"
                             f" {_fmt_bytes(g_traffic):>8}"
                             f" {_fmt_bytes(g_monthly):>8}"
                         )
 
                 lines.append(sep)
                 lines.append(
-                    f"{'Итого':<16} {total_keys:>3} {'':>3}"
+                    f"{'Итого':<17} {total_keys:>3} {'':>3}"
                     f" {_fmt_bytes(total_traffic):>8}"
                     f" {_fmt_bytes(int(total_monthly)):>8}"
                 )
+
+                if preferred:
+                    lines.append("* в ротации для новых")
 
                 for err in errors:
                     lines.append(f"⚠ {err}")

@@ -1,10 +1,13 @@
 """Key management and traffic aggregation service."""
 
+import json
 import logging
+import math
 import random
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Set
 
 from sqlalchemy.orm import Session
 
@@ -13,6 +16,8 @@ from database.models import Key, Server, Subscription
 from vpn.xui_client import XUIClient
 
 logger = logging.getLogger(__name__)
+
+_SCORES_FILE = Path(__file__).parent.parent / "data" / "server_scores.json"
 
 
 class KeyService:
@@ -55,6 +60,124 @@ class KeyService:
             Server.is_active == True,
         ).distinct().all()
         return [r[0] or "default" for r in rows]
+
+    @staticmethod
+    def get_preferred_server_ids() -> Set[int]:
+        """Load preferred server IDs from scores file.
+
+        Returns empty set if file is missing or older than 48 hours.
+        """
+        try:
+            if _SCORES_FILE.exists():
+                data = json.loads(_SCORES_FILE.read_text())
+                updated = datetime.fromisoformat(data["updated_at"])
+                if (datetime.utcnow() - updated).total_seconds() < 48 * 3600:
+                    return set(data.get("chosen_ids", []))
+        except Exception:
+            pass
+        return set()
+
+    @staticmethod
+    def recalculate_server_scores(db: Session) -> Set[int]:
+        """Compute throughput index for every active server and pick the
+        least-loaded 25 % per group (min 1).
+
+        Index = (smart_monthly + stupid_monthly) / 2
+        - smart_monthly  = sum(key_traffic / max(age_days, 1) * 30)
+        - stupid_monthly = avg_traffic_per_key_global * keys_on_server * 2
+
+        Saves chosen server IDs to data/server_scores.json.
+        """
+        now = datetime.utcnow()
+        servers = db.query(Server).filter(
+            Server.protocol == "xui",
+            Server.is_active == True,
+        ).all()
+
+        if not servers:
+            return set()
+
+        # ── Collect per-server data from x-ui panels ──
+        # server_id -> {db_keys, smart_monthly, traffic_total}
+        server_data: Dict[int, dict] = {}
+        global_traffic = 0
+        global_keys = 0
+
+        for server in servers:
+            try:
+                client = XUIClient(server)
+                clients = client.list_clients()
+            except Exception as e:
+                logger.warning(f"server_scores: can't reach {server.name}: {e}")
+                continue
+
+            traffic_by_email = {
+                c.email: c.upload_bytes + c.download_bytes
+                for c in clients
+            }
+
+            db_keys = db.query(Key).filter(
+                Key.server_id == server.id,
+                Key.is_active == True,
+            ).all()
+
+            srv_traffic = sum(traffic_by_email.values())
+            smart = 0
+            for k in db_keys:
+                t = traffic_by_email.get(k.remote_key_id, 0)
+                if t <= 0:
+                    continue
+                age_days = max(
+                    (now - k.created_at).total_seconds() / 86400, 1.0
+                ) if k.created_at else 1.0
+                smart += t / age_days * 30
+
+            server_data[server.id] = {
+                "key_count": len(db_keys),
+                "smart": smart,
+                "traffic": srv_traffic,
+            }
+            global_traffic += srv_traffic
+            global_keys += len(db_keys)
+
+        if not server_data:
+            return set()
+
+        avg_traffic_per_key = global_traffic / global_keys if global_keys > 0 else 0
+
+        # ── Compute index ──
+        indices: Dict[int, float] = {}
+        for sid, d in server_data.items():
+            stupid = avg_traffic_per_key * d["key_count"] * 2
+            indices[sid] = (d["smart"] + stupid) / 2
+
+        # ── Pick top 25 % per group (min 1) ──
+        groups: Dict[str, list] = defaultdict(list)  # group -> [(server_id, index)]
+        server_by_id = {s.id: s for s in servers}
+        for sid, idx in indices.items():
+            srv = server_by_id.get(sid)
+            if srv and srv.has_capacity:
+                groups[srv.server_set or "default"].append((sid, idx))
+
+        chosen: Set[int] = set()
+        for group_name, items in groups.items():
+            items.sort(key=lambda x: x[1])  # ascending by index
+            count = max(1, math.ceil(len(items) * 0.25))
+            for sid, _ in items[:count]:
+                chosen.add(sid)
+
+        # ── Persist ──
+        try:
+            _SCORES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _SCORES_FILE.write_text(json.dumps({
+                "updated_at": now.isoformat(),
+                "chosen_ids": list(chosen),
+            }))
+        except Exception as e:
+            logger.error(f"server_scores: can't save file: {e}")
+
+        logger.info(f"server_scores: chosen {chosen} from {len(indices)} servers")
+        return chosen
 
     @staticmethod
     def select_servers_for_user(
@@ -111,17 +234,21 @@ class KeyService:
             # 1 per group: only fill groups user is missing
             limit = len(sets)
 
-        # Shuffle within each set for randomness
-        for servers_in_set in sets.values():
-            random.shuffle(servers_in_set)
+        # Prefer servers chosen by throughput scoring
+        preferred = KeyService.get_preferred_server_ids()
 
-        # Pick 1 from each group (up to limit)
+        # Pick 1 from each group (up to limit), preferring low-index servers
         selected: List[Server] = []
         for group_name, servers_in_set in sets.items():
             if len(selected) >= limit:
                 break
-            if servers_in_set:
-                selected.append(servers_in_set[0])
+            if not servers_in_set:
+                continue
+            # Split into preferred and rest
+            pref = [s for s in servers_in_set if s.id in preferred]
+            rest = [s for s in servers_in_set if s.id not in preferred]
+            pool = pref if pref else rest
+            selected.append(random.choice(pool))
 
         return selected
 
