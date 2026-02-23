@@ -217,31 +217,31 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         bot.send_message(
             message.chat.id,
-            "*Admin Commands*\n\n"
-            "*Server management:*\n"
-            "`/servers` — list all servers grouped by server set\n"
-            "`/groups` — quick overview of server groups\n"
-            "`/add_server` — add server (dialog: name → group → domain → auto-setup)\n"
-            "`/activate_group` — bulk-create keys for a group for all active subs\n"
-            "`/check_server <id>` — health check (version, uptime, clients)\n"
-            "`/toggle_server <id>` — enable/disable server\n"
-            "`/delete_server <id>` — delete server (force delete if keys exist)\n"
-            "\n*User management:*\n"
-            "`/manage_user <tg_id>` — user info, keys, subscription, actions\n"
-            "\n*Legacy keys:*\n"
-            "`/add_old_keys` — import legacy keys from CSV\n"
-            "`/remove_old_keys` — soft-delete all legacy keys\n"
-            "\n*Service analytics:*\n"
-            "`/report` — service dashboard (users, subs, payments, servers)\n"
-            "`/analytics` — conversion, ARPU, revenue by plan\n"
-            "`/traffic` — traffic stats per server (live from x-ui)\n"
-            "`/logs` — last N user actions (default 50)\n"
-            "`/last_logs` — only new actions since last call\n"
-            "\n*Other:*\n"
-            "`/broadcast` — interactive broadcast to a list of users\n"
-            "`/check_reminders` — manually run subscription expiry check\n"
-            "`/admin_help` — this message",
-            parse_mode='Markdown'
+            "<b>Admin Commands</b>\n\n"
+            "<b>Server management:</b>\n"
+            "/servers — list all servers grouped by server set\n"
+            "/groups — quick overview of server groups\n"
+            "/add_server — add server (dialog)\n"
+            "/activate_group — bulk-create keys for a group\n"
+            "/check_server — health check (version, uptime, clients)\n"
+            "/toggle_server — enable/disable server\n"
+            "/delete_server — delete server\n"
+            "\n<b>User management:</b>\n"
+            "/manage_user — user info, keys, subscription, actions\n"
+            "\n<b>Legacy keys:</b>\n"
+            "/add_old_keys — import legacy keys from CSV\n"
+            "/remove_old_keys — soft-delete all legacy keys\n"
+            "\n<b>Service analytics:</b>\n"
+            "/report — service dashboard (users, subs, payments, servers)\n"
+            "/analytics — conversion, ARPU, revenue by plan\n"
+            "/traffic — traffic stats per server (live from x-ui)\n"
+            "/logs — last N user actions (default 50)\n"
+            "/last_logs — only new actions since last call\n"
+            "\n<b>Other:</b>\n"
+            "/broadcast — interactive broadcast to a list of users\n"
+            "/check_reminders — manually run subscription expiry check\n"
+            "/admin_help — this message",
+            parse_mode='HTML',
         )
 
     # ── /report ───────────────────────────────────────────────
