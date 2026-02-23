@@ -245,127 +245,138 @@ def register_admin_handlers(bot: TeleBot) -> None:
         )
 
     # ── /report ───────────────────────────────────────────────
+    def _build_report_text() -> str:
+        """Build report text (reused by command and refresh callback)."""
+        with get_db_session() as db:
+            now = datetime.utcnow()
+            week_ago = now - timedelta(days=7)
+            month_ago = now - timedelta(days=30)
+
+            total_users = db.query(func.count(User.id)).scalar()
+            new_7d = db.query(func.count(User.id)).filter(User.created_at >= week_ago).scalar()
+            new_30d = db.query(func.count(User.id)).filter(User.created_at >= month_ago).scalar()
+
+            active_paid = db.query(func.count(Subscription.id)).filter(
+                Subscription.is_active == True,
+                Subscription.expires_at > now,
+                Subscription.is_test == False,
+            ).scalar()
+            active_test = db.query(func.count(Subscription.id)).filter(
+                Subscription.is_active == True,
+                Subscription.expires_at > now,
+                Subscription.is_test == True,
+            ).scalar()
+            expired = db.query(func.count(Subscription.id)).filter(
+                Subscription.is_active == True,
+                Subscription.expires_at <= now,
+            ).scalar()
+
+            admin_user_ids = db.query(User.id).filter(
+                User.telegram_id.in_(ADMIN_IDS)
+            ).subquery()
+            real_payments_cutoff = datetime(2026, 2, 20)
+            non_admin_tx = db.query(Transaction).filter(
+                ~Transaction.user_id.in_(admin_user_ids),
+                Transaction.created_at >= real_payments_cutoff,
+            ).subquery()
+
+            completed = db.query(
+                func.count(non_admin_tx.c.id),
+                func.coalesce(func.sum(non_admin_tx.c.amount), 0),
+            ).filter(non_admin_tx.c.status == 'completed').one()
+            completed_count, completed_sum_kopeks = completed
+
+            pending_count = db.query(func.count(non_admin_tx.c.id)).filter(
+                non_admin_tx.c.status == 'pending'
+            ).scalar()
+            failed_count = db.query(func.count(non_admin_tx.c.id)).filter(
+                non_admin_tx.c.status == 'failed'
+            ).scalar()
+
+            rev_7d = db.query(
+                func.count(non_admin_tx.c.id),
+                func.coalesce(func.sum(non_admin_tx.c.amount), 0),
+            ).filter(
+                non_admin_tx.c.status == 'completed',
+                non_admin_tx.c.completed_at >= week_ago,
+            ).one()
+            rev_7d_count, rev_7d_sum = rev_7d
+
+            rev_30d = db.query(
+                func.count(non_admin_tx.c.id),
+                func.coalesce(func.sum(non_admin_tx.c.amount), 0),
+            ).filter(
+                non_admin_tx.c.status == 'completed',
+                non_admin_tx.c.completed_at >= month_ago,
+            ).one()
+            rev_30d_count, rev_30d_sum = rev_30d
+
+            total_servers = db.query(func.count(Server.id)).scalar()
+            active_servers = db.query(func.count(Server.id)).filter(
+                Server.is_active == True
+            ).scalar()
+            total_keys = db.query(func.count(Key.id)).filter(
+                Key.is_active == True,
+                Key.server_id.isnot(None),
+            ).scalar()
+            total_capacity = db.query(
+                func.coalesce(func.sum(Server.capacity), 0)
+            ).filter(Server.is_active == True).scalar()
+
+        def fmt_rub(kopeks: int) -> str:
+            rub = kopeks // 100
+            return f"{rub:,}".replace(",", " ")
+
+        return (
+            "*Отчёт по сервису*\n\n"
+            "*Пользователи*\n"
+            f"  Всего: {total_users}\n"
+            f"  Новых за 7 дней: {new_7d}\n"
+            f"  Новых за 30 дней: {new_30d}\n\n"
+            "*Подписки*\n"
+            f"  Активных платных: {active_paid}\n"
+            f"  Активных тестовых: {active_test}\n"
+            f"  Истекших (всего): {expired}\n\n"
+            "*Платежи*\n"
+            f"  Успешных: {completed_count} на {fmt_rub(completed_sum_kopeks)}₽\n"
+            f"  Ожидающих: {pending_count}\n"
+            f"  Неудачных: {failed_count}\n"
+            f"  За 7 дней: {rev_7d_count} на {fmt_rub(rev_7d_sum)}₽\n"
+            f"  За 30 дней: {rev_30d_count} на {fmt_rub(rev_30d_sum)}₽\n\n"
+            "*Серверы*\n"
+            f"  Активных: {active_servers} из {total_servers}\n"
+            f"  Ключей: {total_keys} / {total_capacity}\n\n"
+            f"_{format_msk(now)}_"
+        )
+
+    _refresh_kb = InlineKeyboardMarkup()
+    _refresh_kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="refresh_report"))
+
     @bot.message_handler(commands=['report'])
     def handle_report(message: Message):
-        """Show service dashboard: users, subscriptions, payments, servers."""
         if not is_admin(message.from_user.id):
             return
-
         try:
-            with get_db_session() as db:
-                now = datetime.utcnow()
-                week_ago = now - timedelta(days=7)
-                month_ago = now - timedelta(days=30)
-
-                # Users
-                total_users = db.query(func.count(User.id)).scalar()
-                new_7d = db.query(func.count(User.id)).filter(User.created_at >= week_ago).scalar()
-                new_30d = db.query(func.count(User.id)).filter(User.created_at >= month_ago).scalar()
-
-                # Subscriptions
-                active_paid = db.query(func.count(Subscription.id)).filter(
-                    Subscription.is_active == True,
-                    Subscription.expires_at > now,
-                    Subscription.is_test == False,
-                ).scalar()
-                active_test = db.query(func.count(Subscription.id)).filter(
-                    Subscription.is_active == True,
-                    Subscription.expires_at > now,
-                    Subscription.is_test == True,
-                ).scalar()
-                expired = db.query(func.count(Subscription.id)).filter(
-                    Subscription.is_active == True,
-                    Subscription.expires_at <= now,
-                ).scalar()
-
-                # Payments — exclude admin transactions
-                admin_user_ids = db.query(User.id).filter(
-                    User.telegram_id.in_(ADMIN_IDS)
-                ).subquery()
-                # Exclude admin transactions and test payments (before 20.02.2026)
-                real_payments_cutoff = datetime(2026, 2, 20)
-                non_admin_tx = db.query(Transaction).filter(
-                    ~Transaction.user_id.in_(admin_user_ids),
-                    Transaction.created_at >= real_payments_cutoff,
-                ).subquery()
-
-                completed = db.query(
-                    func.count(non_admin_tx.c.id),
-                    func.coalesce(func.sum(non_admin_tx.c.amount), 0),
-                ).filter(non_admin_tx.c.status == 'completed').one()
-                completed_count, completed_sum_kopeks = completed
-
-                pending_count = db.query(func.count(non_admin_tx.c.id)).filter(
-                    non_admin_tx.c.status == 'pending'
-                ).scalar()
-                failed_count = db.query(func.count(non_admin_tx.c.id)).filter(
-                    non_admin_tx.c.status == 'failed'
-                ).scalar()
-
-                # Recent revenue (non-admin)
-                rev_7d = db.query(
-                    func.count(non_admin_tx.c.id),
-                    func.coalesce(func.sum(non_admin_tx.c.amount), 0),
-                ).filter(
-                    non_admin_tx.c.status == 'completed',
-                    non_admin_tx.c.completed_at >= week_ago,
-                ).one()
-                rev_7d_count, rev_7d_sum = rev_7d
-
-                rev_30d = db.query(
-                    func.count(non_admin_tx.c.id),
-                    func.coalesce(func.sum(non_admin_tx.c.amount), 0),
-                ).filter(
-                    non_admin_tx.c.status == 'completed',
-                    non_admin_tx.c.completed_at >= month_ago,
-                ).one()
-                rev_30d_count, rev_30d_sum = rev_30d
-
-                # Servers
-                total_servers = db.query(func.count(Server.id)).scalar()
-                active_servers = db.query(func.count(Server.id)).filter(
-                    Server.is_active == True
-                ).scalar()
-                total_keys = db.query(func.count(Key.id)).filter(
-                    Key.is_active == True,
-                    Key.server_id.isnot(None),
-                ).scalar()
-                total_capacity = db.query(
-                    func.coalesce(func.sum(Server.capacity), 0)
-                ).filter(Server.is_active == True).scalar()
-
-            def fmt_rub(kopeks: int) -> str:
-                """Format kopeks as rubles with thousands separator."""
-                rub = kopeks // 100
-                return f"{rub:,}".replace(",", " ")
-
-            text = (
-                "*Отчёт по сервису*\n\n"
-                "*Пользователи*\n"
-                f"  Всего: {total_users}\n"
-                f"  Новых за 7 дней: {new_7d}\n"
-                f"  Новых за 30 дней: {new_30d}\n\n"
-                "*Подписки*\n"
-                f"  Активных платных: {active_paid}\n"
-                f"  Активных тестовых: {active_test}\n"
-                f"  Истекших (всего): {expired}\n\n"
-                "*Платежи*\n"
-                f"  Успешных: {completed_count} на {fmt_rub(completed_sum_kopeks)}₽\n"
-                f"  Ожидающих: {pending_count}\n"
-                f"  Неудачных: {failed_count}\n"
-                f"  За 7 дней: {rev_7d_count} на {fmt_rub(rev_7d_sum)}₽\n"
-                f"  За 30 дней: {rev_30d_count} на {fmt_rub(rev_30d_sum)}₽\n\n"
-                "*Серверы*\n"
-                f"  Активных: {active_servers} из {total_servers}\n"
-                f"  Ключей: {total_keys} / {total_capacity}\n\n"
-                f"_{format_msk(now)} МСК_"
-            )
-
-            bot.send_message(message.chat.id, text, parse_mode='Markdown')
-
+            text = _build_report_text()
+            bot.send_message(message.chat.id, text, parse_mode='Markdown', reply_markup=_refresh_kb)
         except Exception as e:
             logger.error(f"Error in /report: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda c: c.data == 'refresh_report')
+    def handle_refresh_report(call: CallbackQuery):
+        if not is_admin(call.from_user.id):
+            return
+        try:
+            text = _build_report_text()
+            bot.edit_message_text(
+                text, call.message.chat.id, call.message.message_id,
+                parse_mode='Markdown', reply_markup=_refresh_kb,
+            )
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error refreshing /report: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, text=f"Error: {e}")
 
     def _truncate_lines(lines: list[str], max_len: int) -> str:
         """Join lines, truncating at line boundaries to stay under max_len."""
@@ -495,195 +506,205 @@ def register_admin_handlers(bot: TeleBot) -> None:
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── /analytics ────────────────────────────────────────────
-    @bot.message_handler(commands=['analytics'])
-    def handle_analytics(message: Message):
-        """Show conversion and business health metrics."""
-        if not is_admin(message.from_user.id):
-            return
+    def _build_analytics_text() -> str:
+        """Build analytics text (reused by command and refresh callback)."""
+        with get_db_session() as db:
+            now = datetime.utcnow()
+            real_payments_cutoff = datetime(2026, 2, 20)
 
-        try:
-            with get_db_session() as db:
-                now = datetime.utcnow()
-                real_payments_cutoff = datetime(2026, 2, 20)
+            admin_user_ids = db.query(User.id).filter(
+                User.telegram_id.in_(ADMIN_IDS)
+            ).subquery()
 
-                # Exclude admins
-                admin_user_ids = db.query(User.id).filter(
-                    User.telegram_id.in_(ADMIN_IDS)
-                ).subquery()
+            # ── Funnel ──
+            total_users = db.query(func.count(User.id)).filter(
+                ~User.id.in_(admin_user_ids)
+            ).scalar()
 
-                # ── Funnel ──
-                total_users = db.query(func.count(User.id)).filter(
-                    ~User.id.in_(admin_user_ids)
-                ).scalar()
+            active_paid = db.query(func.count(Subscription.id)).filter(
+                Subscription.is_active == True,
+                Subscription.expires_at > now,
+                Subscription.is_test == False,
+                ~Subscription.user_id.in_(admin_user_ids),
+            ).scalar()
+            active_test = db.query(func.count(Subscription.id)).filter(
+                Subscription.is_active == True,
+                Subscription.expires_at > now,
+                Subscription.is_test == True,
+                ~Subscription.user_id.in_(admin_user_ids),
+            ).scalar()
 
-                active_paid = db.query(func.count(Subscription.id)).filter(
-                    Subscription.is_active == True,
-                    Subscription.expires_at > now,
-                    Subscription.is_test == False,
-                    ~Subscription.user_id.in_(admin_user_ids),
-                ).scalar()
-                active_test = db.query(func.count(Subscription.id)).filter(
-                    Subscription.is_active == True,
-                    Subscription.expires_at > now,
+            new_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
+                ActivityLog.action == 'new_user',
+                ~ActivityLog.telegram_id.in_(
+                    db.query(User.telegram_id).filter(User.telegram_id.in_(ADMIN_IDS))
+                ),
+            ).scalar()
+
+            admin_tg_ids = [aid for aid in ADMIN_IDS]
+
+            test_tg_from_log = set(
+                r[0] for r in db.query(ActivityLog.telegram_id).filter(
+                    ActivityLog.action == 'test_key',
+                    ~ActivityLog.telegram_id.in_(admin_tg_ids),
+                ).all()
+            )
+            test_tg_from_sub = set(
+                r[0] for r in db.query(User.telegram_id).join(Subscription).filter(
                     Subscription.is_test == True,
-                    ~Subscription.user_id.in_(admin_user_ids),
-                ).scalar()
+                    ~User.id.in_(admin_user_ids),
+                ).all()
+            )
+            all_test_tg = test_tg_from_log | test_tg_from_sub
+            test_users = len(all_test_tg)
 
-                # New users only (registered via new bot version)
-                new_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
-                    ActivityLog.action == 'new_user',
-                    ~ActivityLog.telegram_id.in_(
-                        db.query(User.telegram_id).filter(User.telegram_id.in_(ADMIN_IDS))
-                    ),
-                ).scalar()
-
-                admin_tg_ids = [aid for aid in ADMIN_IDS]
-
-                # All telegram_ids who ever had a test
-                # Source 1: activity log (post-deployment)
-                test_tg_from_log = set(
-                    r[0] for r in db.query(ActivityLog.telegram_id).filter(
-                        ActivityLog.action == 'test_key',
-                        ~ActivityLog.telegram_id.in_(admin_tg_ids),
-                    ).all()
-                )
-                # Source 2: current test subscriptions (covers pre-logging history)
-                test_tg_from_sub = set(
-                    r[0] for r in db.query(User.telegram_id).join(Subscription).filter(
-                        Subscription.is_test == True,
-                        ~User.id.in_(admin_user_ids),
-                    ).all()
-                )
-                all_test_tg = test_tg_from_log | test_tg_from_sub
-                test_users = len(all_test_tg)
-
-                # All telegram_ids who paid
-                paid_tg = set(
-                    r[0] for r in db.query(User.telegram_id).join(
-                        Transaction, User.id == Transaction.user_id
-                    ).filter(
-                        Transaction.status == 'completed',
-                        ~User.id.in_(admin_user_ids),
-                        Transaction.created_at >= real_payments_cutoff,
-                    ).all()
-                )
-                paid_users = len(paid_tg)
-
-                # Converted from test = had test AND paid
-                converted_from_test = len(all_test_tg & paid_tg)
-
-                # Decided = had test, but no longer in undecided active test
-                active_test_tg = set(
-                    r[0] for r in db.query(User.telegram_id).join(Subscription).filter(
-                        Subscription.is_test == True,
-                        Subscription.is_active == True,
-                        Subscription.expires_at > now,
-                        ~User.id.in_(admin_user_ids),
-                    ).all()
-                )
-                undecided_tg = active_test_tg - paid_tg  # still in test and haven't paid
-                test_decided = len(all_test_tg - undecided_tg)
-
-                conv_test = (converted_from_test / test_decided * 100) if test_decided > 0 else 0
-                paid_without_test = len(paid_tg - all_test_tg)
-
-                # Registration → payment: only new v2 users who paid
-                new_tg = set(
-                    r[0] for r in db.query(ActivityLog.telegram_id).filter(
-                        ActivityLog.action == 'new_user',
-                        ~ActivityLog.telegram_id.in_(admin_tg_ids),
-                    ).all()
-                )
-                new_paid = len(new_tg & paid_tg)
-                conv_total = (new_paid / new_users * 100) if new_users > 0 else 0
-
-                # ── Renewals (from activity log) ──
-                renewal_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
-                    ActivityLog.action == 'sub_extended',
-                    ~ActivityLog.telegram_id.in_(
-                        db.query(User.telegram_id).filter(User.telegram_id.in_(ADMIN_IDS))
-                    ),
-                ).scalar()
-                renewal_pct = (renewal_users / paid_users * 100) if paid_users > 0 else 0
-
-                # ── Revenue by plan ──
-                plan_stats = db.query(
-                    Transaction.plan,
-                    func.count(Transaction.id),
-                    func.coalesce(func.sum(Transaction.amount), 0),
+            paid_tg = set(
+                r[0] for r in db.query(User.telegram_id).join(
+                    Transaction, User.id == Transaction.user_id
                 ).filter(
                     Transaction.status == 'completed',
-                    ~Transaction.user_id.in_(admin_user_ids),
+                    ~User.id.in_(admin_user_ids),
                     Transaction.created_at >= real_payments_cutoff,
-                ).group_by(Transaction.plan).all()
+                ).all()
+            )
+            paid_users = len(paid_tg)
 
-                total_revenue = 0
-                plan_lines = []
-                for plan_key, count, amount in plan_stats:
-                    plan_info = PLANS.get(plan_key, {})
-                    desc = plan_info.get('description', plan_key)
-                    price = plan_info.get('price_display', '?')
-                    rub = amount // 100
-                    total_revenue += amount
-                    plan_lines.append(f"  {desc} ({price}): {count} шт — {rub:,}₽".replace(",", " "))
+            converted_from_test = len(all_test_tg & paid_tg)
 
-                total_rub = total_revenue // 100
-                arpu = (total_rub // paid_users) if paid_users > 0 else 0
-
-                # ── Expiring soon ──
-                expiring_7d = db.query(func.count(Subscription.id)).filter(
+            active_test_tg = set(
+                r[0] for r in db.query(User.telegram_id).join(Subscription).filter(
+                    Subscription.is_test == True,
                     Subscription.is_active == True,
-                    Subscription.is_test == False,
                     Subscription.expires_at > now,
-                    Subscription.expires_at <= now + timedelta(days=7),
-                    ~Subscription.user_id.in_(admin_user_ids),
-                ).scalar()
+                    ~User.id.in_(admin_user_ids),
+                ).all()
+            )
+            undecided_tg = active_test_tg - paid_tg
+            test_decided = len(all_test_tg - undecided_tg)
 
-                expiring_30d = db.query(func.count(Subscription.id)).filter(
-                    Subscription.is_active == True,
-                    Subscription.is_test == False,
-                    Subscription.expires_at > now,
-                    Subscription.expires_at <= now + timedelta(days=30),
-                    ~Subscription.user_id.in_(admin_user_ids),
-                ).scalar()
+            conv_test = (converted_from_test / test_decided * 100) if test_decided > 0 else 0
+            paid_without_test = len(paid_tg - all_test_tg)
 
-                # ── Build message ──
-                text = (
-                    "*Аналитика*\n\n"
-                    "*Воронка*\n"
-                    f"  Всего пользователей: {total_users}\n"
-                    f"  Активных платных: {active_paid}\n"
-                    f"  Активных тестовых: {active_test}\n"
-                    f"  Новых (v2): {new_users}\n"
-                    f"  Получили тест-ключ: {test_users}\n"
-                    f"  Оплатили (всего): {paid_users}\n"
-                    f"  Оплатили после теста: {converted_from_test}\n"
-                    f"  Оплатили без теста: {paid_without_test}\n"
-                    f"  Конверсия тест → оплата: {conv_test:.1f}%"
-                    f"  ({converted_from_test} из {test_decided} решивших)\n"
-                    f"  Конверсия рег → оплата: {conv_total:.1f}%"
-                    f"  ({new_paid} из {new_users} новых)\n\n"
-                    "*Продления*\n"
-                    f"  Продлили подписку: {renewal_users}\n"
-                    f"  Доля продлений: {renewal_pct:.1f}%\n\n"
-                    "*Выручка по тарифам*\n"
-                )
-                if plan_lines:
-                    text += "\n".join(plan_lines) + "\n"
-                text += (
-                    f"  Итого: {total_rub:,}₽\n\n".replace(",", " ") +
-                    f"*ARPU:* {arpu:,}₽\n\n".replace(",", " ") +
-                    "*Истекают*\n"
-                    f"  В ближайшие 7 дней: {expiring_7d}\n"
-                    f"  В ближайшие 30 дней: {expiring_30d}\n\n"
-                    f"_{format_msk(now)}_"
-                )
+            new_tg = set(
+                r[0] for r in db.query(ActivityLog.telegram_id).filter(
+                    ActivityLog.action == 'new_user',
+                    ~ActivityLog.telegram_id.in_(admin_tg_ids),
+                ).all()
+            )
+            new_paid = len(new_tg & paid_tg)
+            conv_total = (new_paid / new_users * 100) if new_users > 0 else 0
 
-                bot.send_message(message.chat.id, text, parse_mode='Markdown')
+            # ── Renewals ──
+            renewal_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
+                ActivityLog.action == 'sub_extended',
+                ~ActivityLog.telegram_id.in_(
+                    db.query(User.telegram_id).filter(User.telegram_id.in_(ADMIN_IDS))
+                ),
+            ).scalar()
+            renewal_pct = (renewal_users / paid_users * 100) if paid_users > 0 else 0
 
+            # ── Revenue by plan ──
+            plan_stats = db.query(
+                Transaction.plan,
+                func.count(Transaction.id),
+                func.coalesce(func.sum(Transaction.amount), 0),
+            ).filter(
+                Transaction.status == 'completed',
+                ~Transaction.user_id.in_(admin_user_ids),
+                Transaction.created_at >= real_payments_cutoff,
+            ).group_by(Transaction.plan).all()
+
+            total_revenue = 0
+            plan_lines = []
+            for plan_key, count, amount in plan_stats:
+                plan_info = PLANS.get(plan_key, {})
+                desc = plan_info.get('description', plan_key)
+                price = plan_info.get('price_display', '?')
+                rub = amount // 100
+                total_revenue += amount
+                plan_lines.append(f"  {desc} ({price}): {count} шт — {rub:,}₽".replace(",", " "))
+
+            total_rub = total_revenue // 100
+            arpu = (total_rub // paid_users) if paid_users > 0 else 0
+
+            # ── Expiring soon ──
+            expiring_7d = db.query(func.count(Subscription.id)).filter(
+                Subscription.is_active == True,
+                Subscription.is_test == False,
+                Subscription.expires_at > now,
+                Subscription.expires_at <= now + timedelta(days=7),
+                ~Subscription.user_id.in_(admin_user_ids),
+            ).scalar()
+
+            expiring_30d = db.query(func.count(Subscription.id)).filter(
+                Subscription.is_active == True,
+                Subscription.is_test == False,
+                Subscription.expires_at > now,
+                Subscription.expires_at <= now + timedelta(days=30),
+                ~Subscription.user_id.in_(admin_user_ids),
+            ).scalar()
+
+        # ── Build message ──
+        text = (
+            "*Аналитика*\n\n"
+            "*Воронка*\n"
+            f"  Всего пользователей: {total_users}\n"
+            f"  Активных платных: {active_paid}\n"
+            f"  Активных тестовых: {active_test}\n"
+            f"  Новых (v2): {new_users}\n"
+            f"  Получили тест-ключ: {test_users}\n"
+            f"  Оплатили (всего): {paid_users}\n"
+            f"  Оплатили после теста: {converted_from_test}\n"
+            f"  Оплатили без теста: {paid_without_test}\n"
+            f"  Конверсия тест → оплата: {conv_test:.1f}%"
+            f"  ({converted_from_test} из {test_decided} решивших)\n"
+            f"  Конверсия рег → оплата: {conv_total:.1f}%"
+            f"  ({new_paid} из {new_users} новых)\n\n"
+            "*Продления*\n"
+            f"  Продлили подписку: {renewal_users}\n"
+            f"  Доля продлений: {renewal_pct:.1f}%\n\n"
+            "*Выручка по тарифам*\n"
+        )
+        if plan_lines:
+            text += "\n".join(plan_lines) + "\n"
+        text += (
+            f"  Итого: {total_rub:,}₽\n\n".replace(",", " ") +
+            f"*ARPU:* {arpu:,}₽\n\n".replace(",", " ") +
+            "*Истекают*\n"
+            f"  В ближайшие 7 дней: {expiring_7d}\n"
+            f"  В ближайшие 30 дней: {expiring_30d}\n\n"
+            f"_{format_msk(now)}_"
+        )
+        return text
+
+    _refresh_analytics_kb = InlineKeyboardMarkup()
+    _refresh_analytics_kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="refresh_analytics"))
+
+    @bot.message_handler(commands=['analytics'])
+    def handle_analytics(message: Message):
+        if not is_admin(message.from_user.id):
+            return
+        try:
+            text = _build_analytics_text()
+            bot.send_message(message.chat.id, text, parse_mode='Markdown', reply_markup=_refresh_analytics_kb)
         except Exception as e:
             logger.error(f"Error in /analytics: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda c: c.data == 'refresh_analytics')
+    def handle_refresh_analytics(call: CallbackQuery):
+        if not is_admin(call.from_user.id):
+            return
+        try:
+            text = _build_analytics_text()
+            bot.edit_message_text(
+                text, call.message.chat.id, call.message.message_id,
+                parse_mode='Markdown', reply_markup=_refresh_analytics_kb,
+            )
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error refreshing /analytics: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, text=f"Error: {e}")
 
     # ── /traffic ──────────────────────────────────────────────
     def _fmt_bytes(b: int) -> str:
