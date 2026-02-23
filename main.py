@@ -91,8 +91,10 @@ def main():
         scheduler.add_job(expire_stale_transactions_job, 'interval', minutes=5, id='expire_stale_transactions')
         scheduler.add_job(
             recalculate_server_scores_job, 'interval', hours=12,
-            id='server_scores', next_run_time=datetime.utcnow(),
+            id='server_scores', misfire_grace_time=300,
         )
+        # Run once on startup
+        recalculate_server_scores_job()
         scheduler.start()
         logger.info("Scheduler started (checking subscriptions every hour)")
 
