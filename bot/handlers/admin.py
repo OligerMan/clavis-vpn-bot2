@@ -516,6 +516,19 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     ~User.id.in_(admin_user_ids)
                 ).scalar()
 
+                active_paid = db.query(func.count(Subscription.id)).filter(
+                    Subscription.is_active == True,
+                    Subscription.expires_at > now,
+                    Subscription.is_test == False,
+                    ~Subscription.user_id.in_(admin_user_ids),
+                ).scalar()
+                active_test = db.query(func.count(Subscription.id)).filter(
+                    Subscription.is_active == True,
+                    Subscription.expires_at > now,
+                    Subscription.is_test == True,
+                    ~Subscription.user_id.in_(admin_user_ids),
+                ).scalar()
+
                 # New users only (registered via new bot version)
                 new_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
                     ActivityLog.action == 'new_user',
@@ -639,6 +652,8 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     "*Аналитика*\n\n"
                     "*Воронка*\n"
                     f"  Всего пользователей: {total_users}\n"
+                    f"  Активных платных: {active_paid}\n"
+                    f"  Активных тестовых: {active_test}\n"
                     f"  Новых (v2): {new_users}\n"
                     f"  Получили тест-ключ: {test_users}\n"
                     f"  Оплатили (всего): {paid_users}\n"
