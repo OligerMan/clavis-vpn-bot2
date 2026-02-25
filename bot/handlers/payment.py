@@ -312,13 +312,37 @@ def register_payment_handlers(bot: TeleBot) -> None:
             from datetime import datetime, timezone
             created_after = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-            logger.info(f"Pre-checkout confirmed for transaction {transaction_id}, starting YooKassa verification (after {created_after})")
+            plan = PLANS[plan_key]
+
+            # If the original transaction is no longer pending (e.g. marked failed by a
+            # previous canceled payment attempt), create a fresh transaction for this retry.
+            active_transaction_id = transaction_id
+            with get_db_session() as db:
+                txn = db.query(Transaction).filter(Transaction.id == transaction_id).first()
+                if not txn or txn.status != 'pending':
+                    user = db.query(User).filter(User.telegram_id == query.from_user.id).first()
+                    if user:
+                        new_txn = Transaction(
+                            user_id=user.id,
+                            amount=plan['amount'],
+                            status='pending',
+                            plan=plan_key,
+                        )
+                        db.add(new_txn)
+                        db.commit()
+                        db.refresh(new_txn)
+                        active_transaction_id = new_txn.id
+                        logger.info(
+                            f"Retry payment: created transaction {active_transaction_id} "
+                            f"(original #{transaction_id} status={txn.status if txn else 'missing'})"
+                        )
+
+            logger.info(f"Pre-checkout confirmed for transaction {active_transaction_id}, starting YooKassa verification (after {created_after})")
 
             # Start background verification via YooKassa API
-            plan = PLANS[plan_key]
             thread = threading.Thread(
                 target=verify_payment_via_yookassa,
-                args=(bot, transaction_id, query.from_user.id, plan['amount'], created_after),
+                args=(bot, active_transaction_id, query.from_user.id, plan['amount'], created_after),
                 daemon=True,
             )
             thread.start()
