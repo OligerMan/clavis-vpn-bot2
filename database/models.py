@@ -155,7 +155,7 @@ class Server(Base):
     protocol = Column(String(20), nullable=False)  # 'xui' or 'outline'
     api_url = Column(String(500), nullable=True)
     api_credentials = Column(Text, nullable=True)  # Encrypted JSON
-    capacity = Column(Integer, default=100)
+    capacity = Column(Integer, default=200)
     is_active = Column(Boolean, default=True)
     server_set = Column(String(50), default="default")
 

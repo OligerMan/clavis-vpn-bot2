@@ -1365,6 +1365,13 @@ def register_admin_handlers(bot: TeleBot) -> None:
             with get_db_session() as db:
                 stats = KeyService.activate_group_for_all(db, group_name)
 
+            # Recalculate server scores so new group is included in rotation
+            try:
+                with get_db_session() as db:
+                    KeyService.recalculate_server_scores(db)
+            except Exception as e:
+                logger.warning(f"Failed to recalculate scores after group activation: {e}")
+
             bot.send_message(
                 call.message.chat.id,
                 f"*Group `{group_name}` activated!*\n\n"
