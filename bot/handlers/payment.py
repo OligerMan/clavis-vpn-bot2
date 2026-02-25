@@ -120,11 +120,12 @@ def verify_payment_via_yookassa(
                                         txn.fail()
                                     return
 
-                                # Claim it
+                                # Claim it (allow failed→completed transition for
+                                # retried payments where a prior attempt was canceled)
                                 txn = db.query(Transaction).filter(
                                     Transaction.id == transaction_id
                                 ).first()
-                                if not txn or txn.status != 'pending':
+                                if not txn or txn.status == 'completed':
                                     return
                                 txn.yookassa_payment_id = yookassa_id
                         except IntegrityError:
