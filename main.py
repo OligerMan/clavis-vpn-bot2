@@ -2,13 +2,14 @@
 
 import logging
 import sys
+import threading
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from datetime import datetime, timedelta
 
 from database import init_db, get_db_session
-from database.models import Transaction
+from database.models import Transaction, User
 from bot import register_handlers, start_polling, get_bot
 from services import NotificationService, KeyService
 
@@ -65,6 +66,41 @@ def recalculate_server_scores_job():
         logger.error(f"Error in server_scores job: {e}", exc_info=True)
 
 
+def resume_pending_verifications():
+    """Resume YooKassa verification for pending transactions after bot restart."""
+    logger = logging.getLogger(__name__)
+    try:
+        from bot.handlers.payment import verify_payment_via_yookassa
+
+        cutoff = datetime.utcnow() - timedelta(minutes=10)
+        bot = get_bot()
+
+        with get_db_session() as db:
+            pending = db.query(Transaction).join(User).filter(
+                Transaction.status == 'pending',
+                Transaction.created_at >= cutoff,
+                Transaction.yookassa_payment_id.is_(None),
+            ).all()
+
+            for txn in pending:
+                created_after = txn.created_at.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                logger.info(
+                    f"Resuming verification for transaction {txn.id} "
+                    f"(user {txn.user.telegram_id}, {txn.amount / 100:.0f} RUB, after={created_after})"
+                )
+                thread = threading.Thread(
+                    target=verify_payment_via_yookassa,
+                    args=(bot, txn.id, txn.user.telegram_id, txn.amount, created_after),
+                    daemon=True,
+                )
+                thread.start()
+
+            if pending:
+                logger.info(f"Resumed {len(pending)} pending verification(s)")
+    except Exception as e:
+        logger.error(f"Error resuming pending verifications: {e}", exc_info=True)
+
+
 def main():
     """Main function to start the bot."""
     # Setup logging
@@ -82,6 +118,9 @@ def main():
 
         # Register all handlers
         register_handlers()
+
+        # Resume any pending payment verifications killed by prior restart
+        resume_pending_verifications()
 
         # Start scheduler for renewal reminders
         logger.info("Starting renewal reminder scheduler...")
