@@ -240,6 +240,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "\n<b>Other:</b>\n"
             "/broadcast — interactive broadcast to a list of users\n"
             "/check_reminders — manually run subscription expiry check\n"
+            "/backup — send database backup file\n"
             "/admin_help — this message",
             parse_mode='HTML',
         )
@@ -2332,5 +2333,19 @@ You can now start testing from scratch with /start"""
         """Cancel old keys removal."""
         bot.answer_callback_query(call.id, "Cancelled")
         bot.edit_message_text("Removal cancelled.", call.message.chat.id, call.message.id)
+
+    # ── /backup ───────────────────────────────────────────────
+    @bot.message_handler(commands=['backup'])
+    def handle_backup(message: Message):
+        """Send database backup file."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            from main import send_db_backup
+            send_db_backup(bot, message.chat.id)
+        except Exception as e:
+            logger.error(f"Error sending backup: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Backup error: {e}")
 
     logger.info("Admin handlers registered")

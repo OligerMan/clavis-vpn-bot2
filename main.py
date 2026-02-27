@@ -1,17 +1,23 @@
 """Main entry point for Clavis VPN Bot v2."""
 
+import io
 import logging
+import os
 import sys
 import threading
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from database import init_db, get_db_session
-from database.models import Transaction, User
+from database.models import Transaction, User, Subscription
+from database.connection import DEFAULT_DB_PATH
 from bot import register_handlers, start_polling, get_bot
 from services import NotificationService, KeyService
+
+BACKUP_ADMIN_ID = 331186567
 
 
 def setup_logging():
@@ -64,6 +70,47 @@ def recalculate_server_scores_job():
             logger.info(f"Server scores recalculated, chosen: {chosen}")
     except Exception as e:
         logger.error(f"Error in server_scores job: {e}", exc_info=True)
+
+
+def send_db_backup(bot, chat_id: int):
+    """Copy the database file and send it as a Telegram document."""
+    db_path = os.environ.get("CLAVIS_DB_PATH", DEFAULT_DB_PATH)
+    db_path = Path(db_path)
+
+    if not db_path.exists():
+        bot.send_message(chat_id, "Database file not found.")
+        return
+
+    # Read DB into memory
+    data = db_path.read_bytes()
+    size_kb = len(data) / 1024
+
+    # Build caption with basic stats
+    with get_db_session() as db:
+        total_users = db.query(User).count()
+        active_subs = db.query(Subscription).filter(
+            Subscription.is_active == True,
+            Subscription.expires_at > datetime.utcnow(),
+        ).count()
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    buf = io.BytesIO(data)
+    buf.name = f"clavis_backup_{ts}.db"
+
+    caption = f"DB backup | {size_kb:.0f} KB | {total_users} users | {active_subs} active subs"
+
+    bot.send_document(chat_id, buf, caption=caption)
+
+
+def backup_database_job():
+    """Scheduled job: send database backup to admin."""
+    logger = logging.getLogger(__name__)
+    try:
+        bot = get_bot()
+        send_db_backup(bot, BACKUP_ADMIN_ID)
+        logger.info("Database backup sent to admin")
+    except Exception as e:
+        logger.error(f"Error in database backup job: {e}", exc_info=True)
 
 
 def resume_pending_verifications():
@@ -131,6 +178,11 @@ def main():
         scheduler.add_job(
             recalculate_server_scores_job, 'interval', hours=12,
             id='server_scores', misfire_grace_time=300,
+        )
+        scheduler.add_job(
+            backup_database_job, 'cron',
+            hour=0, minute=0,  # 00:00 UTC = 03:00 MSK
+            id='database_backup', misfire_grace_time=3600,
         )
         # Run once on startup
         recalculate_server_scores_job()
