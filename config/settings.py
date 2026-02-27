@@ -31,18 +31,25 @@ ADMIN_IDS: List[int] = [
     if id_str.strip()
 ]
 
-# Payment Plans (amount in kopeks)
+# Stars payment toggle (set to True to enable Stars payments)
+STARS_ENABLED = False
+
+# Payment Plans (amount in kopeks for card, whole stars for Stars)
 PLANS: Dict[str, Dict[str, any]] = {
     '90_days': {
         'days': 90,
         'amount': 27500,  # 275 rubles in kopeks
+        'stars_amount': 150,
         'price_display': '275₽',
+        'stars_display': '150⭐',
         'description': '3 месяца'
     },
     '365_days': {
         'days': 365,
         'amount': 92500,  # 925 rubles in kopeks
+        'stars_amount': 500,
         'price_display': '925₽',
+        'stars_display': '500⭐',
         'description': '1 год'
     }
 }

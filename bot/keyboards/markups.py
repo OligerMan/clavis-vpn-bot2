@@ -102,20 +102,55 @@ def payment_plans_keyboard() -> InlineKeyboardMarkup:
     """
     Generate payment plans keyboard.
 
-    Buttons:
-    - 90 дней — 275₽
-    - 365 дней — 925₽
+    When STARS_ENABLED: shows plan choice → then payment method selection.
+    When disabled: goes straight to card invoice (choose_plan → card_).
     """
+    from config.settings import STARS_ENABLED, PLANS
+
     keyboard = InlineKeyboardMarkup(row_width=1)
 
-    keyboard.row(
-        InlineKeyboardButton("📅 90 дней — 275₽", callback_data="plan_90")
-    )
-    keyboard.row(
-        InlineKeyboardButton("📅 365 дней — 925₽ (Выгоднее!)", callback_data="plan_365")
-    )
+    if STARS_ENABLED:
+        keyboard.row(
+            InlineKeyboardButton("📅 90 дней — 3 месяца", callback_data="choose_plan_90")
+        )
+        keyboard.row(
+            InlineKeyboardButton("📅 365 дней — 1 год (Выгоднее!)", callback_data="choose_plan_365")
+        )
+    else:
+        p90 = PLANS['90_days']
+        p365 = PLANS['365_days']
+        keyboard.row(
+            InlineKeyboardButton(f"📅 90 дней — {p90['price_display']}", callback_data="card_90")
+        )
+        keyboard.row(
+            InlineKeyboardButton(f"📅 365 дней — {p365['price_display']} (Выгоднее!)", callback_data="card_365")
+        )
+
     keyboard.row(
         InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")
+    )
+
+    return keyboard
+
+
+def payment_method_keyboard(plan_key: str) -> InlineKeyboardMarkup:
+    """
+    Generate payment method keyboard for a specific plan.
+
+    Args:
+        plan_key: '90_days' or '365_days'
+    """
+    from config.settings import PLANS
+    plan = PLANS[plan_key]
+    suffix = '90' if plan_key == '90_days' else '365'
+
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        InlineKeyboardButton(f"⭐ {plan['stars_display']}", callback_data=f"stars_{suffix}"),
+        InlineKeyboardButton(f"💳 {plan['price_display']}", callback_data=f"card_{suffix}"),
+    )
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад", callback_data="payment")
     )
 
     return keyboard

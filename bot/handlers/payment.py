@@ -14,11 +14,11 @@ from database.models import User, Transaction
 from database.activity_log import log_activity
 from services import SubscriptionService, KeyService
 from message_templates import Messages
-from bot.keyboards.markups import payment_plans_keyboard, key_actions_keyboard, key_platform_keyboard, payment_help_keyboard
+from bot.keyboards.markups import payment_plans_keyboard, payment_method_keyboard, key_actions_keyboard, key_platform_keyboard, payment_help_keyboard
 from config.settings import (
     PLANS, ADMIN_IDS, SUBSCRIPTION_BASE_URL, DEVICE_LIMIT,
     TELEGRAM_PAYMENT_TOKEN, YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY,
-    format_msk,
+    STARS_ENABLED, format_msk,
 )
 
 logger = logging.getLogger(__name__)
@@ -196,9 +196,10 @@ def register_payment_handlers(bot: TeleBot) -> None:
     def handle_payment(message: Message):
         """Handle /payment command - show payment plans."""
         try:
+            text = Messages.PAYMENT_OPTIONS_STARS if STARS_ENABLED else Messages.PAYMENT_OPTIONS
             bot.send_message(
                 message.chat.id,
-                Messages.PAYMENT_OPTIONS,
+                text,
                 reply_markup=payment_plans_keyboard(),
                 parse_mode='Markdown'
             )
@@ -212,11 +213,33 @@ def register_payment_handlers(bot: TeleBot) -> None:
         handle_payment(call.message)
         bot.answer_callback_query(call.id)
 
-    @bot.callback_query_handler(func=lambda call: call.data in ['plan_90', 'plan_365'])
-    def handle_plan_selection(call: CallbackQuery):
-        """Handle plan selection — send Telegram native invoice."""
+    @bot.callback_query_handler(func=lambda call: call.data in ['choose_plan_90', 'choose_plan_365'])
+    def handle_plan_choice(call: CallbackQuery):
+        """Handle plan choice — show payment method selection."""
         try:
-            plan_key = '90_days' if call.data == 'plan_90' else '365_days'
+            plan_key = '90_days' if call.data == 'choose_plan_90' else '365_days'
+            plan = PLANS[plan_key]
+            text = (
+                f"*{plan['description']}* — {plan['days']} дней\n\n"
+                f"Выберите способ оплаты:"
+            )
+            bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=payment_method_keyboard(plan_key),
+                parse_mode='Markdown',
+            )
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in plan choice callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
+
+    @bot.callback_query_handler(func=lambda call: call.data in ['card_90', 'card_365'])
+    def handle_card_plan(call: CallbackQuery):
+        """Handle card payment — send RUB invoice via YooKassa."""
+        try:
+            plan_key = '90_days' if call.data == 'card_90' else '365_days'
             plan = PLANS[plan_key]
 
             with get_db_session() as db:
@@ -228,19 +251,19 @@ def register_payment_handlers(bot: TeleBot) -> None:
                     bot.answer_callback_query(call.id, "Ошибка: пользователь не найден")
                     return
 
-                # Create pending transaction
                 transaction = Transaction(
                     user_id=user.id,
                     amount=plan['amount'],
                     status='pending',
-                    plan=plan_key
+                    plan=plan_key,
+                    payment_method='card',
                 )
                 db.add(transaction)
                 db.commit()
                 db.refresh(transaction)
                 transaction_id = transaction.id
 
-                logger.info(f"Created transaction {transaction_id} for user {user.telegram_id}, plan {plan_key}")
+                logger.info(f"Created card transaction {transaction_id} for user {user.telegram_id}, plan {plan_key}")
 
             bot.answer_callback_query(call.id)
 
@@ -260,7 +283,6 @@ def register_payment_handlers(bot: TeleBot) -> None:
                 }
             })
 
-            # Send Telegram native invoice
             bot.send_invoice(
                 call.message.chat.id,
                 "Оплата VPN",
@@ -271,21 +293,68 @@ def register_payment_handlers(bot: TeleBot) -> None:
                 [LabeledPrice(f"{price_rub} рублей", plan['amount'])],
                 need_email=True,
                 send_email_to_provider=True,
-                provider_data=provider_data
+                provider_data=provider_data,
             )
 
+        except Exception as e:
+            logger.error(f"Error in card plan callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
+            bot.send_message(call.message.chat.id, Messages.ERROR_GENERIC)
+
+    @bot.callback_query_handler(func=lambda call: call.data in ['stars_90', 'stars_365'])
+    def handle_stars_plan(call: CallbackQuery):
+        """Handle Stars payment — send XTR invoice."""
+        try:
+            plan_key = '90_days' if call.data == 'stars_90' else '365_days'
+            plan = PLANS[plan_key]
+
+            with get_db_session() as db:
+                user = db.query(User).filter(
+                    User.telegram_id == call.from_user.id
+                ).first()
+
+                if not user:
+                    bot.answer_callback_query(call.id, "Ошибка: пользователь не найден")
+                    return
+
+                transaction = Transaction(
+                    user_id=user.id,
+                    amount=plan['stars_amount'],
+                    status='pending',
+                    plan=plan_key,
+                    payment_method='stars',
+                )
+                db.add(transaction)
+                db.commit()
+                db.refresh(transaction)
+                transaction_id = transaction.id
+
+                logger.info(f"Created stars transaction {transaction_id} for user {user.telegram_id}, plan {plan_key}")
+
+            bot.answer_callback_query(call.id)
+
+            bot.send_invoice(
+                call.message.chat.id,
+                "Оплата VPN",
+                f"VPN на {plan['days']} дней",
+                f"{plan_key}#{transaction_id}",
+                "",  # empty provider_token for Stars
+                "XTR",
+                [LabeledPrice(f"VPN {plan['description']}", plan['stars_amount'])],
+            )
 
         except Exception as e:
-            logger.error(f"Error in plan selection callback: {e}", exc_info=True)
+            logger.error(f"Error in stars plan callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Произошла ошибка")
             bot.send_message(call.message.chat.id, Messages.ERROR_GENERIC)
 
     @bot.pre_checkout_query_handler(func=lambda query: True)
     def handle_pre_checkout(query: PreCheckoutQuery):
         """
-        Handle pre-checkout: validate and confirm, then verify payment via YooKassa API.
+        Handle pre-checkout: validate and confirm.
 
-        Does NOT activate subscription here — waits for YooKassa confirmation.
+        For Stars (XTR): just confirm, successful_payment will handle activation.
+        For Card (RUB): confirm and start YooKassa background verification.
         """
         try:
             payload = query.invoice_payload
@@ -309,7 +378,12 @@ def register_payment_handlers(bot: TeleBot) -> None:
             # Confirm pre-checkout (allow payment to proceed)
             bot.answer_pre_checkout_query(query.id, ok=True)
 
-            # Record current time — only look for YooKassa payments created after this moment
+            # Stars: no background verification needed — successful_payment is definitive
+            if query.currency == "XTR":
+                logger.info(f"Stars pre-checkout confirmed for transaction {transaction_id}")
+                return
+
+            # Card/RUB: start YooKassa background verification
             from datetime import datetime, timezone
             created_after = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -328,6 +402,7 @@ def register_payment_handlers(bot: TeleBot) -> None:
                             amount=plan['amount'],
                             status='pending',
                             plan=plan_key,
+                            payment_method='card',
                         )
                         db.add(new_txn)
                         db.commit()
@@ -354,10 +429,11 @@ def register_payment_handlers(bot: TeleBot) -> None:
 
     @bot.message_handler(content_types=['successful_payment'])
     def handle_successful_payment(message: Message):
-        """Handle successful_payment if it arrives (belt-and-suspenders)."""
+        """Handle successful_payment — definitive for Stars, belt-and-suspenders for cards."""
         logger.info(">>> successful_payment RECEIVED!")
         try:
-            payload = message.successful_payment.invoice_payload
+            sp = message.successful_payment
+            payload = sp.invoice_payload
             parts = payload.split('#')
             if len(parts) != 2:
                 return
@@ -374,9 +450,16 @@ def register_payment_handlers(bot: TeleBot) -> None:
                     logger.info(f"Transaction {transaction_id} already completed, skipping")
                     return
 
+                # Save telegram_charge_id for Stars refunds
+                if sp.currency == "XTR" and transaction:
+                    transaction.telegram_charge_id = sp.telegram_payment_charge_id
+
             # Process if not yet completed
             handle_payment_webhook(bot, transaction_id, 'success')
-            logger.info(f"Successful payment processed for transaction {transaction_id} via successful_payment handler")
+            logger.info(
+                f"Successful payment processed for transaction {transaction_id} "
+                f"via successful_payment handler (currency={sp.currency})"
+            )
 
         except Exception as e:
             logger.error(f"Error in successful_payment handler: {e}", exc_info=True)
@@ -513,11 +596,14 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
 
                 # Log activity
                 plan_desc = plan['description']
-                amount_rub = transaction.amount // 100
-                if is_new_subscription or is_upgrade_from_test:
-                    log_activity(db, user.telegram_id, "payment", f"{plan_desc}, {amount_rub}₽")
+                if transaction.payment_method == 'stars':
+                    price_str = f"{transaction.amount}⭐"
                 else:
-                    log_activity(db, user.telegram_id, "sub_extended", f"+{days}д, {amount_rub}₽")
+                    price_str = f"{transaction.amount // 100}₽"
+                if is_new_subscription or is_upgrade_from_test:
+                    log_activity(db, user.telegram_id, "payment", f"{plan_desc}, {price_str}")
+                else:
+                    log_activity(db, user.telegram_id, "sub_extended", f"+{days}д, {price_str}")
 
                 # Mark transaction as completed
                 transaction.complete()

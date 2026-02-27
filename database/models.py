@@ -328,10 +328,12 @@ class Transaction(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True)
-    amount = Column(Integer, nullable=False)  # Amount in kopeks
+    amount = Column(Integer, nullable=False)  # kopeks for card, whole stars for Stars
     plan = Column(String(50), nullable=False)  # '90_days', '365_days'
+    payment_method = Column(String(20), default='card')  # 'card' or 'stars'
     status = Column(String(20), default="pending")  # 'pending', 'completed', 'failed'
     yookassa_payment_id = Column(String(255), unique=True, nullable=True)  # Prevents double activation
+    telegram_charge_id = Column(String(255), nullable=True)  # For Stars refunds
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 
