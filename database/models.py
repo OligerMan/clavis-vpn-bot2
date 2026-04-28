@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     event,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -33,11 +34,16 @@ class User(Base):
     telegram_id = Column(Integer, unique=True, nullable=False, index=True)
     username = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    ref_source = Column(String(100), nullable=True, index=True)
+    # Link to Clavis app account — nullable (only set for users who went
+    # through the app-integration flow; old and gated users stay NULL).
+    account_id = Column(String(36), ForeignKey("clavis_accounts.id", ondelete="SET NULL"), nullable=True, index=True)
 
     # Relationships
     subscriptions = relationship("Subscription", back_populates="user", cascade="all, delete-orphan")
     config = relationship("UserConfig", back_populates="user", uselist=False, cascade="all, delete-orphan")
     transactions = relationship("Transaction", back_populates="user", cascade="all, delete-orphan")
+    referral_invites = relationship("ReferralInvite", back_populates="inviter", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<User(id={self.id}, telegram_id={self.telegram_id}, username={self.username})>"
@@ -49,11 +55,12 @@ class Subscription(Base):
     __tablename__ = "subscriptions"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     name = Column(String(100), default="Main")
     token = Column(String(36), unique=True, nullable=False, index=True)
     expires_at = Column(DateTime, nullable=False)
     device_limit = Column(Integer, default=5)
+    plan_type = Column(String(20), default="basic")  # "basic" or "premium"
     is_test = Column(Boolean, default=False)
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -63,6 +70,10 @@ class Subscription(Base):
     reminder_3d_sent = Column(Boolean, default=False)
     reminder_1d_sent = Column(Boolean, default=False)
     expiry_notified = Column(Boolean, default=False)
+    fcm_notified_days = Column(Integer, default=-1)
+
+    # Clavis app account link — nullable; old subs and non-app users stay NULL.
+    account_id = Column(String(36), ForeignKey("clavis_accounts.id", ondelete="SET NULL"), nullable=True, index=True)
 
     # Relationships
     user = relationship("User", back_populates="subscriptions")
@@ -93,6 +104,7 @@ class Subscription(Base):
         self.reminder_3d_sent = False
         self.reminder_1d_sent = False
         self.expiry_notified = False
+        self.fcm_notified_days = 1_000_000_000
 
 
 @event.listens_for(Subscription, "before_insert")
@@ -110,6 +122,7 @@ class Key(Base):
     id = Column(Integer, primary_key=True)
     subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False)
     server_id = Column(Integer, ForeignKey("servers.id", ondelete="SET NULL"), nullable=True)
+    server_inbound_id = Column(Integer, ForeignKey("server_inbounds.id", ondelete="SET NULL"), nullable=True)
     protocol = Column(String(20), nullable=False)  # 'xui' or 'outline'
     remote_key_id = Column(String(255), nullable=True)  # ID on VPN server for API calls
     key_data = Column(Text, nullable=False)  # Full URI (vless://..., ss://...)
@@ -124,6 +137,7 @@ class Key(Base):
     # Relationships
     subscription = relationship("Subscription", back_populates="keys")
     server = relationship("Server", back_populates="keys")
+    server_inbound = relationship("ServerInbound", back_populates="keys")
     traffic_logs = relationship("TrafficLog", back_populates="key", cascade="all, delete-orphan")
 
     def __repr__(self):
@@ -157,10 +171,12 @@ class Server(Base):
     api_credentials = Column(Text, nullable=True)  # Encrypted JSON
     capacity = Column(Integer, default=200)
     is_active = Column(Boolean, default=True)
+    monitor_enabled = Column(Boolean, default=True)
     server_set = Column(String(50), default="default")
 
     # Relationships
     keys = relationship("Key", back_populates="server")
+    inbounds = relationship("ServerInbound", back_populates="server", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Server(id={self.id}, name={self.name}, protocol={self.protocol})>"
@@ -172,8 +188,74 @@ class Server(Base):
 
     @property
     def has_capacity(self) -> bool:
-        """Check if server can accept new keys."""
-        return self.is_active and self.current_load < self.capacity
+        """Check if server can accept new keys (no hard limit, manual balancing)."""
+        return self.is_active
+
+
+class ServerGroup(Base):
+    """Named server group for organizing servers."""
+
+    __tablename__ = "server_groups"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(50), unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<ServerGroup(id={self.id}, name={self.name})>"
+
+
+class ConnectionProfile(Base):
+    """Reusable connection profile template (protocol + settings)."""
+
+    __tablename__ = "connection_profiles"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False)
+    protocol = Column(String(20), default="vless")
+    security = Column(String(20), default="reality")
+    network = Column(String(20), default="tcp")
+    flow = Column(String(50), default="xtls-rprx-vision")
+    fingerprint = Column(String(20), default="chrome")
+    sni = Column(String(255), nullable=False)
+    dest = Column(String(255), default="")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    server_inbounds = relationship("ServerInbound", back_populates="profile", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<ConnectionProfile(id={self.id}, name={self.name}, sni={self.sni})>"
+
+
+class ServerInbound(Base):
+    """An inbound instance on a specific server, created from a profile."""
+
+    __tablename__ = "server_inbounds"
+
+    id = Column(Integer, primary_key=True)
+    server_id = Column(Integer, ForeignKey("servers.id", ondelete="CASCADE"), nullable=False)
+    profile_id = Column(Integer, ForeignKey("connection_profiles.id", ondelete="CASCADE"), nullable=False)
+    inbound_id = Column(Integer, nullable=False)
+    port = Column(Integer, nullable=False)
+    public_key = Column(String(255), nullable=False)
+    short_id = Column(String(255), nullable=False)
+    private_key = Column(String(255), default="")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    server = relationship("Server", back_populates="inbounds")
+    profile = relationship("ConnectionProfile", back_populates="server_inbounds")
+    keys = relationship("Key", back_populates="server_inbound")
+
+    __table_args__ = (
+        UniqueConstraint("server_id", "profile_id", name="uq_server_profile"),
+    )
+
+    def __repr__(self):
+        return f"<ServerInbound(id={self.id}, server={self.server_id}, profile={self.profile_id}, inbound={self.inbound_id})>"
 
 
 class UserConfig(Base):
@@ -357,3 +439,230 @@ class Transaction(Base):
     def fail(self):
         """Mark transaction as failed."""
         self.status = "failed"
+
+
+class RefLink(Base):
+    """Referral link with access control."""
+
+    __tablename__ = "ref_links"
+
+    id = Column(Integer, primary_key=True)
+    tag = Column(String(100), unique=True, nullable=False, index=True)
+    note = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    access_list = relationship("RefLinkAccess", back_populates="ref_link", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<RefLink(id={self.id}, tag={self.tag})>"
+
+
+class RefLinkAccess(Base):
+    """Per-user access to a referral link's statistics."""
+
+    __tablename__ = "ref_link_access"
+
+    id = Column(Integer, primary_key=True)
+    ref_link_id = Column(Integer, ForeignKey("ref_links.id", ondelete="CASCADE"), nullable=False)
+    telegram_id = Column(Integer, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    ref_link = relationship("RefLink", back_populates="access_list")
+
+    __table_args__ = (
+        UniqueConstraint("ref_link_id", "telegram_id", name="uq_reflink_user"),
+    )
+
+
+class ReferralInvite(Base):
+    """Invite link generated by a paid user to give a friend a free 7-day subscription."""
+
+    __tablename__ = "referral_invites"
+
+    id = Column(Integer, primary_key=True)
+    # 12-char random alphanumeric code, URL-safe
+    code = Column(String(16), unique=True, nullable=False, index=True)
+    # The paid user who generated this invite
+    inviter_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # Token of the friend's subscription (filled on first /invite/{code} access)
+    subscription_token = Column(String(36), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    activated_at = Column(DateTime, nullable=True)
+
+    inviter = relationship("User", back_populates="referral_invites")
+
+    def __repr__(self):
+        return f"<ReferralInvite(id={self.id}, code={self.code}, activated={self.activated_at is not None})>"
+
+
+class WebTrialActivation(Base):
+    """Tracks IP addresses that received a free 48h trial via the /trial web endpoint."""
+
+    __tablename__ = "web_trial_activations"
+
+    id = Column(Integer, primary_key=True)
+    ip_address = Column(String(45), nullable=False, index=True)  # IPv4 or IPv6
+    subscription_token = Column(String(36), nullable=False)       # token of the created sub
+    created_at = Column(DateTime, default=datetime.utcnow)
+    visit_count = Column(Integer, default=1)  # total /trial hits from this IP
+
+    def __repr__(self):
+        return f"<WebTrialActivation(id={self.id}, ip={self.ip_address}, visits={self.visit_count})>"
+
+
+# ──────────────────────────────────────────────────────────────
+# Clavis app integration: account / device / login / sync models
+# See F:\Projects\clavis-app\docs\server-integration-spec.md §2.
+# All tokens in distinct namespaces — see plan "Изоляция токенов".
+# ──────────────────────────────────────────────────────────────
+
+class ClavisAccount(Base):
+    """A Clavis app account. Server-issued UUID. Links users ↔ devices ↔ subscriptions."""
+
+    __tablename__ = "clavis_accounts"
+
+    id = Column(String(36), primary_key=True)  # UUID v4
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_active = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Argon2id-encoded recovery phrase hash; NULL for Telegram-only accounts.
+    recovery_phrase_hash = Column(String(200), nullable=True)
+    # HMAC(SERVER_SECRET, normalized_phrase)[:16] — indexed shortcut for recovery
+    # to avoid O(n) Argon2 scans. NULL for TG-only accounts.
+    phrase_lookup_key = Column(String(32), nullable=True, index=True)
+
+    # Relationships
+    devices = relationship("Device", back_populates="account", cascade="all, delete-orphan")
+    login_tokens = relationship("LoginToken", back_populates="account", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<ClavisAccount(id={self.id})>"
+
+
+@event.listens_for(ClavisAccount, "before_insert")
+def _generate_account_id(mapper, connection, target):
+    if not target.id:
+        target.id = str(uuid.uuid4())
+
+
+class Device(Base):
+    """A registered device. Ephemeral (account_id NULL) until login/create/recover."""
+
+    __tablename__ = "devices"
+
+    id = Column(String(36), primary_key=True)  # UUID v4
+    account_id = Column(
+        String(36),
+        ForeignKey("clavis_accounts.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    device_token = Column(String(128), unique=True, nullable=False, index=True)
+    # One of: 'telegram','ios','android','macos','windows','linux'
+    device_type = Column(String(16), nullable=False)
+    device_name = Column(String(128), nullable=True)
+    # Client-generated per-install UUID (stable across logout/login on the
+    # same OS install). Used as a dedup key during promote-to-account — see
+    # spec §3.11. NULL for old clients and for Telegram devices.
+    install_id = Column(String(64), nullable=True)
+    fcm_token = Column(String(255), nullable=True)
+    fcm_token_updated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_seen = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    account = relationship("ClavisAccount", back_populates="devices")
+
+    def __repr__(self):
+        return f"<Device(id={self.id}, type={self.device_type}, account={self.account_id})>"
+
+
+@event.listens_for(Device, "before_insert")
+def _generate_device_id(mapper, connection, target):
+    if not target.id:
+        target.id = str(uuid.uuid4())
+
+
+class LoginToken(Base):
+    """One-time cross-device login token (Telegram → app). 10-min TTL, single-use."""
+
+    __tablename__ = "login_tokens"
+
+    # Random 64-char base64url; never collides with subscription.token (UUID 36 chars).
+    token = Column(String(96), primary_key=True)
+    account_id = Column(
+        String(36),
+        ForeignKey("clavis_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)  # +10 min
+    claimed_at = Column(DateTime, nullable=True)
+    claimed_by_device = Column(
+        String(36),
+        ForeignKey("devices.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    account = relationship("ClavisAccount", back_populates="login_tokens")
+
+    def __repr__(self):
+        return f"<LoginToken(token={self.token[:8]}..., account={self.account_id}, claimed={self.claimed_at is not None})>"
+
+
+class SyncPair(Base):
+    """Short-code pairing flow (show QR ↔ scan). 2-min TTL, single-success."""
+
+    __tablename__ = "sync_pairs"
+
+    # 8 uppercase alphanumeric; distinct namespace from UUIDs.
+    pair_code = Column(String(8), primary_key=True)
+    shower_device = Column(
+        String(36),
+        ForeignKey("devices.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    claimer_device = Column(
+        String(36),
+        ForeignKey("devices.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    status = Column(String(16), nullable=False, default="pending")  # pending|claimed|expired|error
+    error_reason = Column(String(32), nullable=True)  # both_empty|both_full|cross_account
+    claim_attempts = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)  # +2 min
+
+    def __repr__(self):
+        return f"<SyncPair(code={self.pair_code}, status={self.status})>"
+
+
+class AppPayment(Base):
+    """In-app payment via YooKassa direct API (not Telegram Payments)."""
+
+    __tablename__ = "app_payments"
+
+    id = Column(String(36), primary_key=True)
+    yookassa_id = Column(String(64), unique=True, nullable=False, index=True)
+    account_id = Column(
+        String(36),
+        ForeignKey("clavis_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    device_id = Column(String(36), nullable=True)
+    plan_id = Column(String(16), nullable=False)
+    amount_value = Column(String(16), nullable=False)
+    email = Column(String(255), nullable=False)
+    status = Column(String(32), nullable=False, default="pending")
+    paid = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+    def __repr__(self):
+        return f"<AppPayment(yookassa={self.yookassa_id}, status={self.status})>"
+
+
+@event.listens_for(AppPayment, "before_insert")
+def _generate_app_payment_id(mapper, connection, target):
+    if not target.id:
+        target.id = str(uuid.uuid4())

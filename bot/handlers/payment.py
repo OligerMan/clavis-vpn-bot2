@@ -200,7 +200,7 @@ def register_payment_handlers(bot: TeleBot) -> None:
             bot.send_message(
                 message.chat.id,
                 text,
-                reply_markup=payment_plans_keyboard(),
+                reply_markup=payment_plans_keyboard(telegram_id=message.from_user.id),
                 parse_mode='Markdown'
             )
         except Exception as e:
@@ -213,11 +213,20 @@ def register_payment_handlers(bot: TeleBot) -> None:
         handle_payment(call.message)
         bot.answer_callback_query(call.id)
 
-    @bot.callback_query_handler(func=lambda call: call.data in ['choose_plan_90', 'choose_plan_365'])
+    @bot.callback_query_handler(func=lambda call: call.data in [
+        'choose_plan_90', 'choose_plan_365',
+        'choose_plan_premium_90', 'choose_plan_premium_365',
+    ])
     def handle_plan_choice(call: CallbackQuery):
         """Handle plan choice — show payment method selection."""
         try:
-            plan_key = '90_days' if call.data == 'choose_plan_90' else '365_days'
+            plan_map = {
+                'choose_plan_90': '90_days',
+                'choose_plan_365': '365_days',
+                'choose_plan_premium_90': 'premium_90_days',
+                'choose_plan_premium_365': 'premium_365_days',
+            }
+            plan_key = plan_map[call.data]
             plan = PLANS[plan_key]
             text = (
                 f"*{plan['description']}* — {plan['days']} дней\n\n"
@@ -235,11 +244,19 @@ def register_payment_handlers(bot: TeleBot) -> None:
             logger.error(f"Error in plan choice callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Произошла ошибка")
 
-    @bot.callback_query_handler(func=lambda call: call.data in ['card_90', 'card_365'])
+    @bot.callback_query_handler(func=lambda call: call.data in [
+        'card_90', 'card_365', 'card_premium_90', 'card_premium_365',
+    ])
     def handle_card_plan(call: CallbackQuery):
         """Handle card payment — send RUB invoice via YooKassa."""
         try:
-            plan_key = '90_days' if call.data == 'card_90' else '365_days'
+            card_plan_map = {
+                'card_90': '90_days',
+                'card_365': '365_days',
+                'card_premium_90': 'premium_90_days',
+                'card_premium_365': 'premium_365_days',
+            }
+            plan_key = card_plan_map[call.data]
             plan = PLANS[plan_key]
 
             with get_db_session() as db:
@@ -301,11 +318,19 @@ def register_payment_handlers(bot: TeleBot) -> None:
             bot.answer_callback_query(call.id, "Произошла ошибка")
             bot.send_message(call.message.chat.id, Messages.ERROR_GENERIC)
 
-    @bot.callback_query_handler(func=lambda call: call.data in ['stars_90', 'stars_365'])
+    @bot.callback_query_handler(func=lambda call: call.data in [
+        'stars_90', 'stars_365', 'stars_premium_90', 'stars_premium_365',
+    ])
     def handle_stars_plan(call: CallbackQuery):
         """Handle Stars payment — send XTR invoice."""
         try:
-            plan_key = '90_days' if call.data == 'stars_90' else '365_days'
+            stars_plan_map = {
+                'stars_90': '90_days',
+                'stars_365': '365_days',
+                'stars_premium_90': 'premium_90_days',
+                'stars_premium_365': 'premium_365_days',
+            }
+            plan_key = stars_plan_map[call.data]
             plan = PLANS[plan_key]
 
             with get_db_session() as db:
@@ -566,6 +591,12 @@ def handle_payment_webhook(bot: TeleBot, transaction_id: int, status: str) -> bo
                 subscription = SubscriptionService.create_or_extend_paid_subscription(
                     db, user, days, transaction_id
                 )
+
+                # Set plan type (basic/premium) based on purchased plan
+                new_plan_type = plan.get('plan_type', 'basic')
+                if subscription.plan_type != new_plan_type:
+                    subscription.plan_type = new_plan_type
+                    db.commit()
 
                 # Ensure managed keys exist (creates if needed)
                 from database.models import Key

@@ -24,7 +24,7 @@ def start_menu_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
-def full_menu_keyboard(hide_test_key: bool = False, show_old_keys: bool = False) -> InlineKeyboardMarkup:
+def full_menu_keyboard(hide_test_key: bool = False, show_old_keys: bool = False, show_invite: bool = False) -> InlineKeyboardMarkup:
     """
     Generate full menu keyboard (for back to menu).
 
@@ -63,6 +63,12 @@ def full_menu_keyboard(hide_test_key: bool = False, show_old_keys: bool = False)
             InlineKeyboardButton("📦 Старые ключи", callback_data="old_keys")
         )
 
+    # Invite row (only for paid users)
+    if show_invite:
+        keyboard.row(
+            InlineKeyboardButton("👥 Пригласи друга", callback_data="gen_referral")
+        )
+
     # Support row
     keyboard.row(
         InlineKeyboardButton("❓ Поддержка", callback_data="support")
@@ -98,14 +104,15 @@ def test_key_confirmation_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
-def payment_plans_keyboard() -> InlineKeyboardMarkup:
+def payment_plans_keyboard(telegram_id: int = None) -> InlineKeyboardMarkup:
     """
     Generate payment plans keyboard.
 
     When STARS_ENABLED: shows plan choice → then payment method selection.
     When disabled: goes straight to card invoice (choose_plan → card_).
+    Premium plans shown only to PREMIUM_TESTERS.
     """
-    from config.settings import STARS_ENABLED, PLANS
+    from config.settings import STARS_ENABLED, PLANS, PREMIUM_TESTERS
 
     keyboard = InlineKeyboardMarkup(row_width=1)
 
@@ -126,6 +133,25 @@ def payment_plans_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"📅 365 дней — {p365['price_display']} (Выгоднее!)", callback_data="card_365")
         )
 
+    # Premium plans — only for testers
+    if telegram_id and telegram_id in PREMIUM_TESTERS:
+        pp90 = PLANS['premium_90_days']
+        pp365 = PLANS['premium_365_days']
+        if STARS_ENABLED:
+            keyboard.row(
+                InlineKeyboardButton(f"⭐ Premium 90 дней", callback_data="choose_plan_premium_90")
+            )
+            keyboard.row(
+                InlineKeyboardButton(f"⭐ Premium 365 дней", callback_data="choose_plan_premium_365")
+            )
+        else:
+            keyboard.row(
+                InlineKeyboardButton(f"⭐ Premium 90 дней — {pp90['price_display']}", callback_data="card_premium_90")
+            )
+            keyboard.row(
+                InlineKeyboardButton(f"⭐ Premium 365 дней — {pp365['price_display']}", callback_data="card_premium_365")
+            )
+
     keyboard.row(
         InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")
     )
@@ -138,11 +164,19 @@ def payment_method_keyboard(plan_key: str) -> InlineKeyboardMarkup:
     Generate payment method keyboard for a specific plan.
 
     Args:
-        plan_key: '90_days' or '365_days'
+        plan_key: plan key from PLANS dict (e.g. '90_days', 'premium_90_days')
     """
     from config.settings import PLANS
     plan = PLANS[plan_key]
-    suffix = '90' if plan_key == '90_days' else '365'
+
+    # Map plan_key to callback suffix
+    suffix_map = {
+        '90_days': '90',
+        '365_days': '365',
+        'premium_90_days': 'premium_90',
+        'premium_365_days': 'premium_365',
+    }
+    suffix = suffix_map.get(plan_key, plan_key)
 
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.row(
@@ -377,17 +411,17 @@ def android_instructions_keyboard(v2raytun_deeplink: str = None, source: str = "
     return keyboard
 
 
-def ios_instructions_keyboard(v2raytun_deeplink: str = None, source: str = "key") -> InlineKeyboardMarkup:
+def ios_instructions_keyboard(deeplink: str = None, source: str = "key") -> InlineKeyboardMarkup:
     """Generate simplified iOS instructions keyboard."""
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
-        InlineKeyboardButton("📥 Скачать v2rayTun", url="https://apps.apple.com/ru/app/v2raytun/id6476628951")
+        InlineKeyboardButton("📥 Скачать Happ", url="https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973")
     )
 
-    if v2raytun_deeplink:
+    if deeplink:
         keyboard.row(
-            InlineKeyboardButton("🚀 Подключить", url=v2raytun_deeplink)
+            InlineKeyboardButton("🚀 Подключить", url=deeplink)
         )
 
     keyboard.row(
@@ -427,17 +461,17 @@ def windows_instructions_keyboard(v2raytun_deeplink: str = None, source: str = "
     return keyboard
 
 
-def macos_instructions_keyboard(v2raytun_deeplink: str = None, source: str = "key") -> InlineKeyboardMarkup:
+def macos_instructions_keyboard(deeplink: str = None, source: str = "key") -> InlineKeyboardMarkup:
     """Generate simplified macOS instructions keyboard."""
     keyboard = InlineKeyboardMarkup()
 
     keyboard.row(
-        InlineKeyboardButton("📥 Скачать v2rayTun", url="https://apps.apple.com/ru/app/v2raytun/id6476628951")
+        InlineKeyboardButton("📥 Скачать Happ", url="https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973")
     )
 
-    if v2raytun_deeplink:
+    if deeplink:
         keyboard.row(
-            InlineKeyboardButton("🚀 Подключить", url=v2raytun_deeplink)
+            InlineKeyboardButton("🚀 Подключить", url=deeplink)
         )
 
     keyboard.row(

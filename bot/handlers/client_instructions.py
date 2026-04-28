@@ -64,21 +64,25 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
             with get_db_session() as db:
                 user = db.query(User).filter(User.telegram_id == call.from_user.id).first()
 
-                # Get v2rayTun deep link for all platforms
+                # Get deep links for all platforms
                 v2raytun_deeplink = None
+                happ_deeplink = None
                 if user:
                     subscription = SubscriptionService.get_active_subscription(db, user)
                     if subscription:
                         v2raytun_deeplink = SubscriptionService.get_v2raytun_deeplink(
                             subscription, SUBSCRIPTION_BASE_URL
                         )
+                        happ_deeplink = SubscriptionService.get_happ_deeplink(
+                            subscription, SUBSCRIPTION_BASE_URL
+                        )
 
                 # Map callback data to messages and keyboards
                 platform_map = {
                     'platform_android': (Messages.ANDROID_INSTRUCTIONS, android_instructions_keyboard(v2raytun_deeplink, source=source)),
-                    'platform_ios': (Messages.IOS_INSTRUCTIONS, ios_instructions_keyboard(v2raytun_deeplink, source=source)),
+                    'platform_ios': (Messages.IOS_INSTRUCTIONS, ios_instructions_keyboard(happ_deeplink, source=source)),
                     'platform_windows': (Messages.WINDOWS_INSTRUCTIONS, windows_instructions_keyboard(v2raytun_deeplink, source=source)),
-                    'platform_macos': (Messages.MACOS_INSTRUCTIONS, macos_instructions_keyboard(v2raytun_deeplink, source=source))
+                    'platform_macos': (Messages.MACOS_INSTRUCTIONS, macos_instructions_keyboard(happ_deeplink, source=source))
                 }
 
                 platform_data = platform_map.get(platform_key)

@@ -221,6 +221,11 @@ class SubscriptionService:
         return f"{base_url.rstrip('/')}/v2raytun/{subscription.token}"
 
     @staticmethod
+    def get_happ_deeplink(subscription: Subscription, base_url: str) -> str:
+        """Generate Happ one-tap import link via HTTPS redirect page."""
+        return f"{base_url.rstrip('/')}/happ/{subscription.token}"
+
+    @staticmethod
     def get_renewal_reminder(subscription: Subscription) -> str:
         """
         Get renewal reminder message based on days until expiry.

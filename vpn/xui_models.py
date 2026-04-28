@@ -102,6 +102,10 @@ class ServerHealth:
     version: Optional[str] = None
     uptime: Optional[int] = None  # Seconds
     error_message: Optional[str] = None
+    cpu_pct: Optional[float] = None
+    mem_used_pct: Optional[float] = None
+    disk_used_pct: Optional[float] = None
+    xray_state: Optional[str] = None  # "running" / "stop"
 
     @property
     def uptime_hours(self) -> Optional[float]:

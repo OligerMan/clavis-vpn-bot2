@@ -16,6 +16,8 @@ from telebot.types import (
 )
 
 from config.settings import ADMIN_IDS
+from database import get_db_session
+from database.models import User, Subscription, Transaction
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +33,13 @@ def _is_admin(telegram_id: int) -> bool:
 
 
 def _menu_markup() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("Все пользователи", callback_data="bc_all_users"))
+    kb.add(InlineKeyboardButton("Активные пользователи", callback_data="bc_active_users"))
+    kb.add(InlineKeyboardButton("Активные платные", callback_data="bc_active_paid"))
+    kb.add(InlineKeyboardButton("Без подписки", callback_data="bc_no_sub"))
+    kb.add(InlineKeyboardButton("Новые за N дней", callback_data="bc_new_days"))
+    kb.row(
         InlineKeyboardButton("Broadcast status", callback_data="bc_status"),
         InlineKeyboardButton("Cancel", callback_data="bc_cancel"),
     )
@@ -317,6 +324,142 @@ def register_broadcast_handlers(bot: TeleBot) -> None:
         bot.send_message(
             chat_id,
             f"Loaded *{len(ids)}* target IDs.\n\nNow send the message text (Markdown supported).",
+            parse_mode="Markdown",
+        )
+
+    # ── Quick audience selection ─────────────────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data in (
+        "bc_all_users", "bc_active_users", "bc_active_paid", "bc_no_sub", "bc_new_days",
+    ))
+    def handle_bc_audience(call: CallbackQuery):
+        if not _is_admin(call.from_user.id):
+            return
+        chat_id = call.message.chat.id
+        state = _broadcast_state.get(chat_id)
+        if not state or state.get("step") != "awaiting_file":
+            bot.answer_callback_query(call.id, "Not in file upload step.")
+            return
+
+        bot.answer_callback_query(call.id)
+
+        # "Новые за N дней" — ask for number first
+        if call.data == "bc_new_days":
+            state["step"] = "awaiting_days"
+            bot.edit_message_text(
+                "Введите количество дней (например `7`):",
+                chat_id,
+                call.message.message_id,
+                parse_mode="Markdown",
+            )
+            return
+
+        now = datetime.utcnow()
+        real_payments_cutoff = datetime(2026, 2, 20)
+
+        with get_db_session() as db:
+            if call.data == "bc_all_users":
+                ids = {r[0] for r in db.query(User.telegram_id).all()}
+                label = "всех пользователей"
+
+            elif call.data == "bc_active_users":
+                ids = {
+                    r[0] for r in db.query(User.telegram_id)
+                    .join(Subscription)
+                    .filter(
+                        Subscription.is_active == True,
+                        Subscription.expires_at > now,
+                    ).all()
+                }
+                label = "активных пользователей"
+
+            elif call.data == "bc_active_paid":
+                ids = {
+                    r[0] for r in db.query(User.telegram_id)
+                    .join(Subscription)
+                    .join(Transaction, Transaction.user_id == User.id)
+                    .filter(
+                        Subscription.is_active == True,
+                        Subscription.expires_at > now,
+                        Subscription.is_test == False,
+                        Transaction.status == 'completed',
+                        Transaction.created_at >= real_payments_cutoff,
+                    ).all()
+                }
+                label = "активных платных пользователей"
+
+            elif call.data == "bc_no_sub":
+                active_sub_user_ids = db.query(Subscription.user_id).filter(
+                    Subscription.is_active == True,
+                    Subscription.expires_at > now,
+                ).subquery()
+                ids = {
+                    r[0] for r in db.query(User.telegram_id)
+                    .filter(~User.id.in_(active_sub_user_ids))
+                    .all()
+                }
+                label = "пользователей без подписки"
+
+            else:
+                ids = set()
+                label = "?"
+
+        if not ids:
+            bot.edit_message_text("Нет пользователей.", chat_id, call.message.message_id)
+            return
+
+        state["targets"] = ids
+        state["step"] = "awaiting_message"
+
+        bot.edit_message_text(
+            f"Выбрано *{len(ids)}* {label}.\n\n"
+            f"Отправьте текст рассылки (Markdown supported).",
+            chat_id,
+            call.message.message_id,
+            parse_mode="Markdown",
+        )
+
+    # ── Days input handler (for "Новые за N дней") ──────────────
+    @bot.message_handler(
+        func=lambda m: (
+            _broadcast_state.get(m.chat.id, {}).get("step") == "awaiting_days"
+            and _is_admin(m.from_user.id)
+        ),
+        content_types=["text"],
+    )
+    def handle_bc_days_input(message: Message):
+        chat_id = message.chat.id
+        state = _broadcast_state[chat_id]
+
+        try:
+            days = int(message.text.strip())
+            if days <= 0:
+                raise ValueError
+        except ValueError:
+            bot.send_message(chat_id, "Введите положительное целое число.")
+            return
+
+        from datetime import timedelta
+        cutoff = datetime.utcnow() - timedelta(days=days)
+
+        with get_db_session() as db:
+            ids = {
+                r[0] for r in db.query(User.telegram_id)
+                .filter(User.created_at >= cutoff)
+                .all()
+            }
+
+        if not ids:
+            bot.send_message(chat_id, f"Нет пользователей за последние {days} дн.")
+            state["step"] = "awaiting_file"
+            return
+
+        state["targets"] = ids
+        state["step"] = "awaiting_message"
+
+        bot.send_message(
+            chat_id,
+            f"Выбрано *{len(ids)}* новых пользователей за {days} дн.\n\n"
+            f"Отправьте текст рассылки (Markdown supported).",
             parse_mode="Markdown",
         )
 

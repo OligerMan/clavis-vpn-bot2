@@ -3,13 +3,15 @@
 import base64
 import logging
 import re
+from datetime import timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse, JSONResponse, HTMLResponse
 from typing import List, Dict, Any
 
-from database import get_db_session, Subscription, Key
+from database import get_db_session, Subscription, Key, WebTrialActivation
+from database.activity_log import log_activity
 from vpn.xui_uri_builder import parse_vless_uri
 from subscription.cache import (
     get_cached_subscription,
@@ -32,7 +34,10 @@ def _make_profile_title(subscription: Subscription) -> str:
     Format: "base64:<b64 encoded title>"
     Title includes service name and subscription type indicator.
     """
-    if subscription.is_test:
+    plan_type = getattr(subscription, 'plan_type', 'basic') or 'basic'
+    if plan_type == 'free':
+        title = "Clavis v2 (приглашение от друга)"
+    elif subscription.is_test:
         title = "Clavis v2 (Тест)"
     else:
         title = "Clavis v2"
@@ -84,7 +89,7 @@ async def get_subscription(token: str, request: Request) -> PlainTextResponse:
                 if subscription:
                     profile_title = _make_profile_title(subscription)
                     # Use fresh expires_ts from database, not from cache
-                    expires_ts = int(subscription.expires_at.timestamp())
+                    expires_ts = int(subscription.expires_at.replace(tzinfo=timezone.utc).timestamp())
                 else:
                     # Fallback if subscription not found (shouldn't happen)
                     profile_title = "base64:Q2xhdmlzIHYy"  # "Clavis v2"
@@ -144,12 +149,18 @@ async def get_subscription(token: str, request: Request) -> PlainTextResponse:
                     f"is_expired={subscription.is_expired}"
                 )
 
+            # Build ad lines for free (referral) subscriptions
+            ad_lines = None
+            if getattr(subscription, 'plan_type', None) == 'free':
+                from config.settings import FREE_AD_LINES
+                ad_lines = FREE_AD_LINES
+
             # Format response (will modify remarks if expired)
-            response = format_subscription_response(keys, is_expired=is_expired)
+            response = format_subscription_response(keys, is_expired=is_expired, ad_lines=ad_lines)
 
             # Cache response (cache expired subscriptions too, they rarely change)
             token_short = subscription.token[:8] if subscription.token else "unknown"
-            expires_ts = int(subscription.expires_at.timestamp())
+            expires_ts = int(subscription.expires_at.replace(tzinfo=timezone.utc).timestamp())
             cache_subscription_response(token, (response, token_short, expires_ts))
 
             logger.info(
@@ -163,7 +174,7 @@ async def get_subscription(token: str, request: Request) -> PlainTextResponse:
             headers = {
                 "profile-title": _make_profile_title(subscription),
                 "profile-update-interval": "12",
-                "subscription-userinfo": f"upload=0; download=0; total=0; expire={int(subscription.expires_at.timestamp())}",
+                "subscription-userinfo": f"upload=0; download=0; total=0; expire={int(subscription.expires_at.replace(tzinfo=timezone.utc).timestamp())}",
                 "content-disposition": "inline",
             }
 
@@ -353,7 +364,7 @@ async def get_subscription_raw(token: str, request: Request) -> PlainTextRespons
             headers = {
                 "profile-title": _make_profile_title(subscription),
                 "profile-update-interval": "12",
-                "subscription-userinfo": f"upload=0; download=0; total=0; expire={int(subscription.expires_at.timestamp())}",
+                "subscription-userinfo": f"upload=0; download=0; total=0; expire={int(subscription.expires_at.replace(tzinfo=timezone.utc).timestamp())}",
                 "content-disposition": "inline",
             }
 
@@ -433,7 +444,7 @@ async def get_subscription_json(token: str, request: Request) -> JSONResponse:
             headers = {
                 "profile-title": _make_profile_title(subscription),
                 "profile-update-interval": "12",
-                "subscription-userinfo": f"upload=0; download=0; total=0; expire={int(subscription.expires_at.timestamp())}",
+                "subscription-userinfo": f"upload=0; download=0; total=0; expire={int(subscription.expires_at.replace(tzinfo=timezone.utc).timestamp())}",
                 "content-disposition": "inline",
             }
 
@@ -516,3 +527,566 @@ async def v2raytun_redirect(token: str, request: Request):
 </html>"""
 
     return HTMLResponse(content=html)
+
+
+@router.get("/happ/{token}")
+async def happ_redirect(token: str, request: Request):
+    """Serve HTML page that redirects to Happ deep link (iOS/macOS)."""
+    _validate_token(token)
+
+    from config.settings import SUBSCRIPTION_BASE_URL
+
+    client_ip = request.client.host if request.client else "unknown"
+    logger.info(f"happ redirect: token={token[:8]}..., ip={client_ip}")
+
+    sub_url = f"{SUBSCRIPTION_BASE_URL.rstrip('/')}/sub/{token}"
+    deep_link = f"happ://add/{sub_url}"
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Clavis VPN</title>
+    <meta http-equiv="refresh" content="0;url={deep_link}">
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh; margin: 0;
+            background: #0f172a; color: #e2e8f0;
+            text-align: center; padding: 20px;
+        }}
+        .container {{ max-width: 400px; }}
+        h2 {{ color: #38bdf8; margin-bottom: 8px; }}
+        p {{ color: #94a3b8; line-height: 1.5; }}
+        .sub-url {{
+            background: #1e293b; border: 1px solid #334155;
+            border-radius: 8px; padding: 12px; margin: 16px 0;
+            word-break: break-all; font-family: monospace; font-size: 13px;
+            color: #7dd3fc; user-select: all;
+        }}
+        a.btn {{
+            display: inline-block; margin-top: 12px; padding: 12px 24px;
+            background: #0ea5e9; color: #fff; text-decoration: none;
+            border-radius: 8px; font-weight: 600;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Clavis VPN</h2>
+        <p>Открываем Happ...</p>
+        <p>Если приложение не открылось автоматически:</p>
+        <a class="btn" href="{deep_link}">Открыть Happ</a>
+        <p style="margin-top: 24px; font-size: 13px;">Или скопируйте ссылку вручную:</p>
+        <div class="sub-url">{sub_url}</div>
+    </div>
+    <script>window.location.href = "{deep_link}";</script>
+</body>
+</html>"""
+
+    return HTMLResponse(content=html)
+
+
+@router.get("/login/{one_time_token}")
+async def clavis_login_redirect(one_time_token: str, request: Request):
+    """Meta-refresh → ``clavis://login-token/<token>``.
+
+    We do NOT validate the token here — an invalid/expired token must be
+    detected by the app's ``/api/v1/login/claim`` call, so this wrapper can't
+    leak information about token existence.
+    """
+    from config.settings import SUBSCRIPTION_BASE_URL
+
+    client_ip = request.client.host if request.client else "unknown"
+    logger.info(f"clavis login redirect: token={one_time_token[:8]}..., ip={client_ip}")
+
+    deep_link = f"clavis://login-token/{one_time_token}"
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Clavis — Login</title>
+    <meta http-equiv="refresh" content="0;url={deep_link}">
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh; margin: 0;
+            background: #0f172a; color: #e2e8f0;
+            text-align: center; padding: 20px;
+        }}
+        .container {{ max-width: 400px; }}
+        h2 {{ color: #38bdf8; margin-bottom: 8px; }}
+        p {{ color: #94a3b8; line-height: 1.5; }}
+        a.btn {{
+            display: inline-block; margin-top: 12px; padding: 12px 24px;
+            background: #0ea5e9; color: #fff; text-decoration: none;
+            border-radius: 8px; font-weight: 600;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Clavis</h2>
+        <p>Открываем приложение Clavis...</p>
+        <p>Если приложение не открылось автоматически, нажмите кнопку ниже:</p>
+        <a class="btn" href="{deep_link}">Открыть Clavis</a>
+    </div>
+    <script>window.location.href = "{deep_link}";</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
+@router.get("/sync/{pair_code}")
+async def clavis_sync_redirect(pair_code: str, request: Request):
+    """Meta-refresh → ``clavis://sync/<pair_code>``.
+
+    Like ``/login/{token}``: no validation here. Invalid codes surface on
+    the app's ``/api/v1/sync/claim`` call.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    logger.info(f"clavis sync redirect: code={pair_code}, ip={client_ip}")
+
+    deep_link = f"clavis://sync/{pair_code}"
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Clavis — Sync</title>
+    <meta http-equiv="refresh" content="0;url={deep_link}">
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh; margin: 0;
+            background: #0f172a; color: #e2e8f0;
+            text-align: center; padding: 20px;
+        }}
+        .container {{ max-width: 400px; }}
+        h2 {{ color: #38bdf8; margin-bottom: 8px; }}
+        p {{ color: #94a3b8; line-height: 1.5; }}
+        a.btn {{
+            display: inline-block; margin-top: 12px; padding: 12px 24px;
+            background: #0ea5e9; color: #fff; text-decoration: none;
+            border-radius: 8px; font-weight: 600;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Clavis</h2>
+        <p>Открываем приложение Clavis...</p>
+        <p>Если приложение не открылось автоматически, нажмите кнопку ниже:</p>
+        <a class="btn" href="{deep_link}">Открыть Clavis</a>
+    </div>
+    <script>window.location.href = "{deep_link}";</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
+@router.get("/invite/{code}")
+async def referral_invite(code: str, request: Request):
+    """Activate a referral invite and show a VPN setup landing page.
+
+    On first access: creates an anonymous guest user + 7-day free subscription,
+    issues a key on the Free server group, stores the subscription token.
+    On subsequent accesses: serves the existing subscription page.
+    The page includes a v2raytun:// deeplink so the friend can connect without Telegram.
+    """
+    import secrets
+    import re
+    from datetime import datetime, timedelta
+    from database import get_db_session, ReferralInvite, User, Subscription
+    from config.settings import SUBSCRIPTION_BASE_URL, REFERRAL_SUBSCRIPTION_DAYS
+
+    # Basic code format guard
+    if not re.match(r'^[a-zA-Z0-9]{6,20}$', code):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    client_ip = request.client.host if request.client else "unknown"
+    logger.info(f"Referral invite access: code={code}, ip={client_ip}")
+
+    try:
+        with get_db_session() as db:
+            invite = db.query(ReferralInvite).filter(ReferralInvite.code == code).first()
+            if not invite:
+                raise HTTPException(status_code=404, detail="Invite link not found or expired")
+
+            # If already activated — just serve the existing subscription page
+            if invite.subscription_token:
+                sub_token = invite.subscription_token
+            else:
+                # First use: create guest user + subscription + key
+                from services.key_service import KeyService
+
+                # Create anonymous guest user with a negative telegram_id
+                guest = User(telegram_id=0, username="[referral]")
+                db.add(guest)
+                db.flush()  # get guest.id
+                guest.telegram_id = -guest.id  # guaranteed unique negative ID
+
+                expires_at = datetime.utcnow() + timedelta(days=REFERRAL_SUBSCRIPTION_DAYS)
+                subscription = Subscription(
+                    user_id=guest.id,
+                    is_test=False,
+                    is_active=True,
+                    expires_at=expires_at,
+                    device_limit=1,
+                    plan_type='free',
+                )
+                db.add(subscription)
+                db.flush()  # get subscription.id and auto-generated token
+
+                # Issue key on Free server group
+                try:
+                    KeyService.ensure_keys_exist(db, subscription, guest.telegram_id)
+                except Exception as e:
+                    logger.error(f"Failed to create key for invite {code}: {e}", exc_info=True)
+                    raise HTTPException(status_code=503, detail="No free servers available right now. Try again later.")
+
+                invite.subscription_token = subscription.token
+                invite.activated_at = datetime.utcnow()
+                db.commit()
+
+                sub_token = subscription.token
+                log_activity(db, guest.telegram_id, "invite_used", f"code={code}, inviter_db_id={invite.inviter_id}")
+                db.commit()
+                logger.info(f"Referral invite {code} activated: guest_user={guest.id}, sub={subscription.id}")
+
+        base = SUBSCRIPTION_BASE_URL.rstrip('/')
+        sub_url = f"{base}/sub/{sub_token}"
+        deep_link = f"v2raytun://import/{sub_url}"
+        invite_url = f"{base}/invite/{code}"
+
+        # Generate QR code as inline base64 PNG
+        try:
+            import segno, io as _io, base64 as _b64
+            qr = segno.make(invite_url, error='h')
+            qr_buf = _io.BytesIO()
+            qr.save(qr_buf, kind='png', scale=8, border=2)
+            qr_b64 = _b64.b64encode(qr_buf.getvalue()).decode()
+            qr_block = (
+                '<p class="label">Или отсканируй QR-код с другого устройства:</p>'
+                f'<img src="data:image/png;base64,{qr_b64}" '
+                'style="width:200px;height:200px;margin:12px auto;display:block;border-radius:8px;">'
+            )
+        except Exception:
+            qr_block = ''
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Clavis VPN — Подключение</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh; margin: 0;
+            background: #0f172a; color: #e2e8f0;
+            text-align: center; padding: 20px; box-sizing: border-box;
+        }}
+        .container {{ max-width: 420px; width: 100%; }}
+        h2 {{ color: #38bdf8; margin-bottom: 4px; }}
+        .subtitle {{ color: #64748b; font-size: 14px; margin-bottom: 24px; }}
+        .steps {{ text-align: left; background: #1e293b; border-radius: 12px;
+                  padding: 16px 20px; margin-bottom: 20px; }}
+        .steps li {{ color: #94a3b8; margin-bottom: 8px; line-height: 1.5; }}
+        .steps li b {{ color: #e2e8f0; }}
+        a.btn {{
+            display: block; margin: 12px 0; padding: 14px 24px;
+            background: #0ea5e9; color: white; text-decoration: none;
+            border-radius: 10px; font-size: 16px; font-weight: 600;
+        }}
+        a.btn:hover {{ background: #0284c7; }}
+        a.btn.secondary {{ background: #1e293b; border: 1px solid #334155;
+                           font-size: 14px; padding: 11px 20px; color: #94a3b8; }}
+        .sub-url {{
+            background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+            padding: 12px; margin: 16px 0; word-break: break-all;
+            font-family: monospace; font-size: 12px; color: #7dd3fc;
+            user-select: all; text-align: left;
+        }}
+        .label {{ color: #64748b; font-size: 13px; margin-top: 20px; }}
+        .ad {{ color: #475569; font-size: 12px; margin-top: 24px; }}
+        {_DOWNLOAD_LINKS_CSS}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🔐 Clavis VPN</h2>
+        <p class="subtitle">Бесплатный VPN на 3 дня</p>
+
+        <ol class="steps">
+            <li><b>Установите приложение</b> (ссылки ниже)</li>
+            <li><b>Нажмите кнопку «Подключить»</b> — подписка добавится автоматически</li>
+            <li><b>Включите VPN</b> в приложении</li>
+        </ol>
+        {_DOWNLOAD_LINKS_HTML}
+
+        <a class="btn" href="{deep_link}">🚀 Подключить VPN</a>
+
+        {qr_block}
+
+        <p class="label">Или добавьте ссылку вручную в любой VLESS-клиент:</p>
+        <div class="sub-url">{sub_url}</div>
+
+        <p class="ad">Для постоянного быстрого VPN: @clavis_vpn_bot</p>
+    </div>
+</body>
+</html>"""
+
+        return HTMLResponse(content=html)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /invite/{code}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+_DOWNLOAD_LINKS_HTML = """
+<p class="label" style="margin-top:24px;">Скачать приложение:</p>
+<div class="dl-grid">
+    <a class="dl-btn" href="https://play.google.com/store/apps/details?id=com.v2raytun.android">Android</a>
+    <a class="dl-btn" href="https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973">iPhone / iPad</a>
+    <a class="dl-btn" href="https://github.com/mdf45/v2raytun/releases/download/v3.7.10/v2RayTun_Setup.exe">Windows</a>
+    <a class="dl-btn" href="https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973">macOS</a>
+</div>
+"""
+
+_DOWNLOAD_LINKS_CSS = """
+        .dl-grid {
+            display: grid; grid-template-columns: 1fr 1fr;
+            gap: 8px; margin: 8px 0 20px;
+        }
+        a.dl-btn {
+            display: block; padding: 10px 8px;
+            background: #1e293b; border: 1px solid #334155;
+            color: #94a3b8; text-decoration: none;
+            border-radius: 8px; font-size: 14px;
+        }
+        a.dl-btn:hover { background: #273548; color: #e2e8f0; }
+"""
+
+
+def _trial_page(sub_url: str, base: str, returning: bool = False) -> str:
+    """Build the /trial HTML success page."""
+    deep_link = f"v2raytun://import/{sub_url}"
+    trial_url = f"{base}/trial"
+
+    try:
+        import segno, io as _io, base64 as _b64
+        qr = segno.make(trial_url, error='h')
+        qr_buf = _io.BytesIO()
+        qr.save(qr_buf, kind='png', scale=8, border=2)
+        qr_b64 = _b64.b64encode(qr_buf.getvalue()).decode()
+        qr_block = (
+            '<p class="label">Или отсканируй QR с другого устройства:</p>'
+            f'<img src="data:image/png;base64,{qr_b64}" '
+            'style="width:200px;height:200px;margin:12px auto;display:block;border-radius:8px;">'
+        )
+    except Exception:
+        qr_block = ''
+
+    welcome = (
+        '<p class="returning">👋 Добро пожаловать снова! Ваш VPN ещё активен.</p>'
+        if returning else ''
+    )
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Clavis VPN — Бесплатный триал</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh; margin: 0;
+            background: #0f172a; color: #e2e8f0;
+            text-align: center; padding: 20px; box-sizing: border-box;
+        }}
+        .container {{ max-width: 420px; width: 100%; }}
+        h2 {{ color: #38bdf8; margin-bottom: 4px; }}
+        .subtitle {{ color: #64748b; font-size: 14px; margin-bottom: 24px; }}
+        .returning {{ background: #1e3a2f; border: 1px solid #166534; border-radius: 8px;
+                      padding: 10px 16px; color: #4ade80; font-size: 14px; margin-bottom: 16px; }}
+        .steps {{ text-align: left; background: #1e293b; border-radius: 12px;
+                  padding: 16px 20px; margin-bottom: 20px; }}
+        .steps li {{ color: #94a3b8; margin-bottom: 8px; line-height: 1.5; }}
+        .steps li b {{ color: #e2e8f0; }}
+        a.btn {{
+            display: block; margin: 12px 0; padding: 14px 24px;
+            background: #0ea5e9; color: white; text-decoration: none;
+            border-radius: 10px; font-size: 16px; font-weight: 600;
+        }}
+        a.btn:hover {{ background: #0284c7; }}
+        .sub-url {{
+            background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+            padding: 12px; margin: 16px 0; word-break: break-all;
+            font-family: monospace; font-size: 12px; color: #7dd3fc;
+            user-select: all; text-align: left;
+        }}
+        .label {{ color: #64748b; font-size: 13px; margin-top: 20px; }}
+        .ad {{ color: #475569; font-size: 12px; margin-top: 24px; }}
+        {_DOWNLOAD_LINKS_CSS}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🔐 Clavis VPN</h2>
+        <p class="subtitle">Бесплатный VPN на 48 часов</p>
+
+        {welcome}
+
+        <ol class="steps">
+            <li><b>Установите приложение</b> (ссылки ниже)</li>
+            <li><b>Нажмите кнопку «Подключить»</b> — подписка добавится автоматически</li>
+            <li><b>Включите VPN</b> в приложении</li>
+        </ol>
+        {_DOWNLOAD_LINKS_HTML}
+
+        <a class="btn" href="{deep_link}">🚀 Подключить VPN</a>
+
+        {qr_block}
+
+        <p class="label">Или добавьте ссылку вручную в любой VLESS-клиент:</p>
+        <div class="sub-url">{sub_url}</div>
+
+        <p class="ad">Для постоянного быстрого VPN: @clavis_vpn_bot</p>
+    </div>
+</body>
+</html>"""
+
+
+@router.get("/trial")
+async def web_trial_disabled(request: Request):
+    """Temporarily disabled."""
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse("<h2>Страница временно недоступна.</h2>", status_code=503)
+
+
+@router.get("/trial_disabled")
+async def web_trial(request: Request):
+    """Free 48h VPN trial, rate-limited per IP.
+
+    First visit: creates anonymous user + subscription + key on Free server group.
+    Repeat visits while active: returns the same subscription page.
+    After expiry: shows "trial expired" page with upgrade link.
+    """
+    from datetime import datetime, timedelta
+    from database import get_db_session, WebTrialActivation, User, Subscription
+    from config.settings import SUBSCRIPTION_BASE_URL
+
+    ip = (
+        request.headers.get('x-real-ip') or
+        (request.headers.get('x-forwarded-for') or '').split(',')[0].strip() or
+        (request.client.host if request.client else 'unknown')
+    )
+
+    logger.info(f"Web trial access: ip={ip}")
+
+    base = SUBSCRIPTION_BASE_URL.rstrip('/')
+
+    try:
+        with get_db_session() as db:
+            activation = db.query(WebTrialActivation).filter(
+                WebTrialActivation.ip_address == ip
+            ).first()
+
+            if activation:
+                # Always increment visit counter
+                activation.visit_count += 1
+                db.commit()
+
+                sub = db.query(Subscription).filter(
+                    Subscription.token == activation.subscription_token
+                ).first()
+
+                now = datetime.utcnow()
+                if sub and sub.expires_at > now:
+                    # Still active — return the same page
+                    sub_url = f"{base}/sub/{sub.token}"
+                    return HTMLResponse(content=_trial_page(sub_url, base, returning=True))
+                else:
+                    # Expired
+                    bot_url = "https://t.me/clavis_vpn_bot"
+                    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Clavis VPN — Триал истёк</title>
+    <style>
+        body {{ font-family: -apple-system, sans-serif; display: flex; justify-content: center;
+               align-items: center; min-height: 100vh; margin: 0;
+               background: #0f172a; color: #e2e8f0; text-align: center; padding: 20px; }}
+        .container {{ max-width: 400px; }}
+        h2 {{ color: #f87171; }}
+        p {{ color: #94a3b8; line-height: 1.6; }}
+        a.btn {{ display: inline-block; margin-top: 20px; padding: 14px 28px;
+                 background: #0ea5e9; color: white; text-decoration: none;
+                 border-radius: 10px; font-size: 16px; font-weight: 600; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>⏰ Пробный период истёк</h2>
+        <p>Ваши бесплатные 48 часов закончились.</p>
+        <p>Перейдите в бот, чтобы оформить постоянную подписку — от 275₽ за 3 месяца.</p>
+        <a class="btn" href="{bot_url}">Перейти в @clavis_vpn_bot</a>
+    </div>
+</body>
+</html>"""
+                    return HTMLResponse(content=html)
+
+            # New IP — create subscription
+            from services.key_service import KeyService
+
+            guest = User(telegram_id=0, username="[web-trial]")
+            db.add(guest)
+            db.flush()
+            guest.telegram_id = -guest.id
+
+            expires_at = datetime.utcnow() + timedelta(hours=48)
+            subscription = Subscription(
+                user_id=guest.id,
+                is_test=False,
+                is_active=True,
+                expires_at=expires_at,
+                device_limit=1,
+                plan_type='free',
+            )
+            db.add(subscription)
+            db.flush()
+
+            try:
+                KeyService.ensure_keys_exist(db, subscription, guest.telegram_id)
+            except Exception as e:
+                logger.error(f"Failed to create key for web trial ip={ip}: {e}", exc_info=True)
+                raise HTTPException(status_code=503, detail="No free servers available. Try again later.")
+
+            db.add(WebTrialActivation(
+                ip_address=ip,
+                subscription_token=subscription.token,
+            ))
+            db.commit()
+
+            logger.info(f"Web trial activated: ip={ip}, sub={subscription.id}")
+            sub_url = f"{base}/sub/{subscription.token}"
+            return HTMLResponse(content=_trial_page(sub_url, base, returning=False))
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /trial: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")

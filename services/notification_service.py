@@ -63,8 +63,8 @@ class NotificationService:
                     sent_counts['expired'] += 1
                     sent = True
 
-                # Skip renewal reminders for test subscriptions (only notify when expired)
-                elif sub.is_test:
+                # Skip renewal reminders for test and free (invite) subscriptions
+                elif sub.is_test or getattr(sub, 'plan_type', 'basic') == 'free':
                     continue
 
                 # Check 1 day reminder (paid only)
@@ -90,6 +90,17 @@ class NotificationService:
 
             except Exception as e:
                 logger.error(f"Failed to send notification for subscription {sub.id}: {e}", exc_info=True)
+                # Mark as sent for users who blocked the bot to avoid infinite retries
+                err_msg = str(e)
+                if 'blocked by the user' in err_msg or '403' in err_msg:
+                    if days_left <= 0:
+                        sub.expiry_notified = True
+                    elif days_left <= 1:
+                        sub.reminder_1d_sent = True
+                    elif days_left <= 3:
+                        sub.reminder_3d_sent = True
+                    elif days_left <= 7:
+                        sub.reminder_7d_sent = True
                 continue
 
             if sent:

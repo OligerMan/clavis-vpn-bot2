@@ -2,8 +2,8 @@
 
 import base64
 import re
-from typing import List, Any
-from urllib.parse import unquote, quote
+from typing import List, Any, Optional
+from urllib.parse import unquote, quote  # noqa: F401 (quote used in modify_vless_remark)
 
 
 def modify_vless_remark(vless_uri: str, new_remark: str) -> str:
@@ -30,7 +30,8 @@ def modify_vless_remark(vless_uri: str, new_remark: str) -> str:
 
 def format_subscription_response(
     keys: List[Any],
-    is_expired: bool = False
+    is_expired: bool = False,
+    ad_lines: Optional[List[str]] = None,
 ) -> str:
     """Format subscription response as base64-encoded VLESS URIs.
 
@@ -80,6 +81,13 @@ def format_subscription_response(
 
     # Sort by remark (server name) alphabetically
     vless_uris.sort(key=lambda u: _extract_remark(u).lower())
+
+    # Append ad entries: copies of the first real URI with ad text as remarks.
+    # This way tapping any ad entry still connects to the real server.
+    if ad_lines and vless_uris:
+        base_uri = vless_uris[0]
+        for line in ad_lines:
+            vless_uris.append(modify_vless_remark(base_uri, line))
 
     # Join URIs with newlines
     uris_text = "\n".join(vless_uris)

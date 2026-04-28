@@ -5,19 +5,29 @@ import logging
 import math
 import random
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Set
 
 from sqlalchemy.orm import Session
 
 from config.settings import USER_SERVER_LIMIT
-from database.models import Key, Server, Subscription
+from database.models import Key, Server, ServerInbound, Subscription
 from vpn.xui_client import XUIClient
 
 logger = logging.getLogger(__name__)
 
 _SCORES_FILE = Path(__file__).parent.parent / "data" / "server_scores.json"
+
+
+def _client_id_for_sub(sub: Subscription):
+    """Return client identifier for x-ui key creation.
+
+    Telegram users → telegram_id (int), app-only users → 'app_{account_id}'.
+    """
+    if sub.user_id is not None and sub.user is not None:
+        return sub.user.telegram_id
+    return f"app_{sub.account_id}"
 
 
 class KeyService:
@@ -105,8 +115,7 @@ class KeyService:
 
         for server in servers:
             try:
-                client = XUIClient(server)
-                clients = client.list_clients()
+                clients = KeyService.list_all_clients_for_server(db, server)
             except Exception as e:
                 logger.warning(f"server_scores: can't reach {server.name}: {e}")
                 continue
@@ -116,14 +125,18 @@ class KeyService:
                 for c in clients
             }
 
-            db_keys = db.query(Key).filter(
+            # Only keys with non-expired subscriptions for load index
+            db_keys_active = db.query(Key).join(
+                Subscription, Key.subscription_id == Subscription.id
+            ).filter(
                 Key.server_id == server.id,
                 Key.is_active == True,
+                Subscription.expires_at > now,
             ).all()
 
             srv_traffic = sum(traffic_by_email.values())
             smart = 0
-            for k in db_keys:
+            for k in db_keys_active:
                 t = traffic_by_email.get(k.remote_key_id, 0)
                 if t <= 0:
                     continue
@@ -133,12 +146,12 @@ class KeyService:
                 smart += t / age_days * 30
 
             server_data[server.id] = {
-                "key_count": len(db_keys),
+                "key_count": len(db_keys_active),
                 "smart": smart,
                 "traffic": srv_traffic,
             }
             global_traffic += srv_traffic
-            global_keys += len(db_keys)
+            global_keys += len(db_keys_active)
 
         if not server_data:
             return set()
@@ -151,7 +164,7 @@ class KeyService:
             stupid = avg_traffic_per_key * d["key_count"] * 2
             indices[sid] = (d["smart"] + stupid) / 2
 
-        # ── Pick top 25 % per group (min 1) ──
+        # ── Pick top 20 % per group (min 1) ──
         groups: Dict[str, list] = defaultdict(list)  # group -> [(server_id, index)]
         server_by_id = {s.id: s for s in servers}
         for sid, idx in indices.items():
@@ -162,7 +175,7 @@ class KeyService:
         chosen: Set[int] = set()
         for group_name, items in groups.items():
             items.sort(key=lambda x: x[1])  # ascending by index
-            count = max(1, math.ceil(len(items) * 0.25))
+            count = max(1, math.ceil(len(items) * 0.20))
             for sid, _ in items[:count]:
                 chosen.add(sid)
 
@@ -207,6 +220,25 @@ class KeyService:
 
         if not all_servers:
             return []
+
+        # Filter servers by plan type
+        from config.settings import PREMIUM_GROUPS, FREE_GROUP_NAME
+        plan_type = getattr(subscription, 'plan_type', 'basic') or 'basic'
+
+        if plan_type == 'free':
+            # Free (referral) plan: only servers in the Free group, 1 server max
+            all_servers = [
+                s for s in all_servers
+                if (s.server_set or "default") == FREE_GROUP_NAME
+            ]
+            if limit is None:
+                limit = 1
+        elif plan_type != 'premium':
+            all_servers = [
+                s for s in all_servers
+                if (s.server_set or "default") not in PREMIUM_GROUPS
+                and (s.server_set or "default") != FREE_GROUP_NAME
+            ]
 
         # Servers user already has active managed keys on
         existing_server_ids = set(
@@ -256,18 +288,19 @@ class KeyService:
     def create_subscription_keys(
         db: Session,
         subscription: Subscription,
-        user_telegram_id: int,
+        client_id,
         servers: List[Server] = None,
     ) -> List[Key]:
         """
         Create VPN keys on selected servers for a subscription.
 
-        If servers is None, uses select_servers_for_user() to pick them.
+        For each server, creates one key per active ServerInbound.
+        Falls back to legacy single-inbound mode if no ServerInbound records exist.
 
         Args:
             db: Database session
             subscription: Subscription object
-            user_telegram_id: User's Telegram ID
+            client_id: Identifier for key email (telegram_id or app_{account_id})
             servers: Optional explicit list of servers to create keys on
 
         Returns:
@@ -285,16 +318,50 @@ class KeyService:
         created_keys = []
         errors = []
 
+        # Use a fixed display name for free (referral) subscriptions
+        plan_type = getattr(subscription, 'plan_type', 'basic') or 'basic'
+        free_remarks = "Clavis Free" if plan_type == 'free' else None
+
         for server in servers:
-            try:
-                client = XUIClient(server)
-                key = client.create_key(subscription, user_telegram_id)
-                db.add(key)
-                created_keys.append(key)
-                logger.info(f"Created key on server {server.name} for subscription {subscription.id}")
-            except Exception as e:
-                logger.warning(f"Failed to create key on server {server.name}: {e}")
-                errors.append(f"{server.name}: {e}")
+            inbounds = db.query(ServerInbound).filter(
+                ServerInbound.server_id == server.id,
+                ServerInbound.is_active == True,
+            ).all()
+
+            if not inbounds:
+                # Legacy mode: single inbound from api_credentials
+                try:
+                    client = XUIClient(server)
+                    key = client.create_key(subscription, client_id, remarks=free_remarks)
+                    db.add(key)
+                    created_keys.append(key)
+                    logger.info(f"Created key on server {server.name} for subscription {subscription.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to create key on server {server.name}: {e}")
+                    errors.append(f"{server.name}: {e}")
+            else:
+                # Multi-inbound mode: one key per active ServerInbound
+                for idx, si in enumerate(inbounds):
+                    key_number = idx + 1 if len(inbounds) > 1 else None
+                    try:
+                        client = XUIClient(server, server_inbound=si)
+                        key = client.create_key(
+                            subscription, client_id,
+                            remarks=free_remarks,
+                            key_number=key_number,
+                        )
+                        db.add(key)
+                        created_keys.append(key)
+                        logger.info(
+                            f"Created key on server {server.name} inbound {si.inbound_id} "
+                            f"for subscription {subscription.id}"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to create key on server {server.name} "
+                            f"inbound {si.inbound_id}: {e}"
+                        )
+                        errors.append(f"{server.name}/inbound-{si.inbound_id}: {e}")
 
         if not created_keys:
             raise ValueError(f"Failed to create keys on all servers: {'; '.join(errors)}")
@@ -309,7 +376,7 @@ class KeyService:
     def ensure_keys_exist(
         db: Session,
         subscription: Subscription,
-        user_telegram_id: int,
+        client_id,
     ) -> List[Key]:
         """
         Ensure the subscription has keys in all activated groups.
@@ -323,7 +390,7 @@ class KeyService:
         Args:
             db: Database session
             subscription: Subscription object
-            user_telegram_id: User's Telegram ID
+            client_id: Identifier for key email (telegram_id or app_{account_id})
 
         Returns:
             List of all active keys for this subscription
@@ -333,7 +400,7 @@ class KeyService:
         if servers:
             try:
                 KeyService.create_subscription_keys(
-                    db, subscription, user_telegram_id, servers=servers,
+                    db, subscription, client_id, servers=servers,
                 )
             except ValueError as e:
                 logger.warning(f"Could not create all keys for sub {subscription.id}: {e}")
@@ -343,6 +410,36 @@ class KeyService:
             Key.subscription_id == subscription.id,
             Key.is_active == True,
         ).all()
+
+    @staticmethod
+    def _make_xui_client(db: Session, server: Server, key: Key) -> XUIClient:
+        """Create XUIClient for a key, resolving ServerInbound if available."""
+        si = None
+        if key.server_inbound_id:
+            si = db.query(ServerInbound).filter(
+                ServerInbound.id == key.server_inbound_id
+            ).first()
+        return XUIClient(server, server_inbound=si)
+
+    @staticmethod
+    def list_all_clients_for_server(db: Session, server: Server) -> list:
+        """List clients across all active inbounds for a server.
+
+        For profile-based servers (with ServerInbound records), makes a single
+        login and single get_list() call, then aggregates clients from all
+        active inbound IDs. Falls back to legacy single-inbound mode.
+        """
+        inbounds = db.query(ServerInbound).filter(
+            ServerInbound.server_id == server.id,
+            ServerInbound.is_active == True,
+        ).all()
+
+        if inbounds:
+            # One connection, one get_list() for all inbound IDs
+            client = XUIClient(server, server_inbound=inbounds[0])
+            return client.list_clients_multi([si.inbound_id for si in inbounds])
+        else:
+            return XUIClient(server).list_clients()
 
     @staticmethod
     def get_subscription_traffic(db: Session, subscription: Subscription) -> Dict[str, float]:
@@ -366,7 +463,7 @@ class KeyService:
             Key.is_active == True
         ).all()
 
-        # Group keys by server to reuse XUIClient connections
+        # Group keys by server to reuse connections where possible
         keys_by_server: Dict[int, list] = {}
         for key in keys:
             keys_by_server.setdefault(key.server_id, []).append(key)
@@ -377,9 +474,9 @@ class KeyService:
                 continue
 
             try:
-                client = XUIClient(server)
                 for key in server_keys:
                     try:
+                        client = KeyService._make_xui_client(db, server, key)
                         traffic = client.get_traffic(key)
                         total_upload += traffic.upload_bytes
                         total_download += traffic.download_bytes
@@ -422,24 +519,36 @@ class KeyService:
         for server_id, server_keys in keys_by_server.items():
             server = db.query(Server).filter(Server.id == server_id).first()
             if not server or not server.is_active:
-                # Still mark keys inactive even if server unreachable
                 for key in server_keys:
                     key.is_active = False
                 continue
 
-            try:
-                client = XUIClient(server)
-                for key in server_keys:
-                    try:
-                        client.delete_key(key)
-                    except Exception:
-                        pass
-                    key.is_active = False
-            except Exception:
-                for key in server_keys:
-                    key.is_active = False
+            for key in server_keys:
+                try:
+                    client = KeyService._make_xui_client(db, server, key)
+                    client.delete_key(key)
+                except Exception:
+                    pass
+                key.is_active = False
 
         db.commit()
+
+    @staticmethod
+    def disable_subscription_keys(db: Session, subscription: Subscription) -> int:
+        """
+        Mark all active keys for an expired subscription as inactive in DB.
+        x-ui panels handle actual blocking via expiry_time on the key.
+
+        Returns:
+            Number of keys marked inactive.
+        """
+        count = db.query(Key).filter(
+            Key.subscription_id == subscription.id,
+            Key.is_active == True
+        ).update({Key.is_active: False})
+        return count
+
+        return disabled
 
     @staticmethod
     def has_server_keys(db: Session, subscription: Subscription) -> bool:
@@ -467,6 +576,81 @@ class KeyService:
             Key.server_id.is_(None),
             Key.is_active == True,
         ).all()
+
+    @staticmethod
+    def create_keys_for_new_inbound(
+        db: Session,
+        server_inbound: ServerInbound,
+    ) -> Dict[str, int]:
+        """
+        Create keys on a new inbound for all existing active subscriptions
+        that already have keys on this server.
+
+        Called when a profile is assigned to a server with existing users.
+
+        Args:
+            db: Database session
+            server_inbound: The newly created ServerInbound
+
+        Returns:
+            Dict with created, skipped, failed counts
+        """
+        server = db.query(Server).filter(Server.id == server_inbound.server_id).first()
+        if not server:
+            return {"created": 0, "skipped": 0, "failed": 0}
+
+        stats = {"created": 0, "skipped": 0, "failed": 0}
+
+        # Find all active subscriptions that have keys on this server
+        sub_ids = set(
+            sid for (sid,) in db.query(Key.subscription_id).filter(
+                Key.server_id == server.id,
+                Key.is_active == True,
+            ).distinct().all()
+        )
+
+        for sub_id in sub_ids:
+            sub = db.query(Subscription).filter(
+                Subscription.id == sub_id,
+                Subscription.is_active == True,
+                Subscription.expires_at > datetime.utcnow(),
+                Subscription.plan_type != 'free',
+            ).first()
+            if not sub:
+                stats["skipped"] += 1
+                continue
+
+            # Skip if this subscription already has a key on this inbound
+            already = db.query(Key).filter(
+                Key.subscription_id == sub.id,
+                Key.server_inbound_id == server_inbound.id,
+                Key.is_active == True,
+            ).first()
+            if already:
+                stats["skipped"] += 1
+                continue
+
+            # Determine key number
+            inbound_count = db.query(ServerInbound).filter(
+                ServerInbound.server_id == server.id,
+                ServerInbound.is_active == True,
+            ).count()
+            key_number = inbound_count if inbound_count > 1 else None
+
+            try:
+                client = XUIClient(server, server_inbound=server_inbound)
+                key = client.create_key(
+                    sub, _client_id_for_sub(sub),
+                    key_number=key_number,
+                )
+                db.add(key)
+                db.commit()
+                stats["created"] += 1
+            except Exception as e:
+                logger.warning(f"create_keys_for_new_inbound: failed for sub {sub.id}: {e}")
+                stats["failed"] += 1
+
+        return stats
 
     @staticmethod
     def activate_group_for_all(
@@ -500,6 +684,7 @@ class KeyService:
         active_subs = db.query(Subscription).filter(
             Subscription.is_active == True,
             Subscription.expires_at > datetime.utcnow(),
+            Subscription.plan_type != 'free',
         ).all()
 
         # Filter to subs that have at least one managed key (server_id not null)
@@ -535,23 +720,56 @@ class KeyService:
                 continue
 
             server = random.choice(candidates)
-            try:
-                client = XUIClient(server)
-                key = client.create_key(sub, sub.user.telegram_id)
-                db.add(key)
-                db.commit()
-                db.refresh(key)
-                stats["created"] += 1
-                logger.info(
-                    f"activate_group: created key on {server.name} "
-                    f"for sub {sub.id} (user {sub.user.telegram_id})"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"activate_group: failed to create key on {server.name} "
-                    f"for sub {sub.id}: {e}"
-                )
-                stats["failed"] += 1
+
+            # Get inbounds for this server
+            inbounds = db.query(ServerInbound).filter(
+                ServerInbound.server_id == server.id,
+                ServerInbound.is_active == True,
+            ).all()
+
+            cid = _client_id_for_sub(sub)
+            if not inbounds:
+                # Legacy mode
+                try:
+                    client = XUIClient(server)
+                    key = client.create_key(sub, cid)
+                    db.add(key)
+                    db.commit()
+                    db.refresh(key)
+                    stats["created"] += 1
+                    logger.info(
+                        f"activate_group: created key on {server.name} "
+                        f"for sub {sub.id} (client {cid})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"activate_group: failed to create key on {server.name} "
+                        f"for sub {sub.id}: {e}"
+                    )
+                    stats["failed"] += 1
+            else:
+                # Multi-inbound
+                created_any = False
+                for idx, si in enumerate(inbounds):
+                    key_number = idx + 1 if len(inbounds) > 1 else None
+                    try:
+                        client = XUIClient(server, server_inbound=si)
+                        key = client.create_key(
+                            sub, cid,
+                            key_number=key_number,
+                        )
+                        db.add(key)
+                        created_any = True
+                    except Exception as e:
+                        logger.warning(
+                            f"activate_group: failed on {server.name}/inbound-{si.inbound_id} "
+                            f"for sub {sub.id}: {e}"
+                        )
+                if created_any:
+                    db.commit()
+                    stats["created"] += 1
+                else:
+                    stats["failed"] += 1
 
         return stats
 
@@ -580,7 +798,7 @@ class KeyService:
         if not keys:
             raise ValueError("No active managed keys found for subscription")
 
-        new_expiry_ms = int(subscription.expires_at.timestamp() * 1000)
+        new_expiry_ms = int(subscription.expires_at.replace(tzinfo=timezone.utc).timestamp() * 1000)
         updated_count = 0
         errors = []
 
@@ -597,19 +815,15 @@ class KeyService:
                 logger.warning(f"Server {server_id} not found or inactive, skipping key updates")
                 continue
 
-            try:
-                client = XUIClient(server)
-                for key in server_keys:
-                    try:
-                        client.update_key_expiry(key, new_expiry_ms)
-                        updated_count += 1
-                        logger.info(f"Updated expiry for key {key.remote_key_id} on server {server.name}")
-                    except Exception as e:
-                        logger.warning(f"Failed to update expiry for key {key.remote_key_id}: {e}")
-                        errors.append(f"{server.name}/{key.remote_key_id}: {e}")
-            except Exception as e:
-                logger.error(f"Failed to connect to server {server.name}: {e}")
-                errors.append(f"{server.name}: {e}")
+            for key in server_keys:
+                try:
+                    client = KeyService._make_xui_client(db, server, key)
+                    client.update_key_expiry(key, new_expiry_ms)
+                    updated_count += 1
+                    logger.info(f"Updated expiry for key {key.remote_key_id} on server {server.name}")
+                except Exception as e:
+                    logger.warning(f"Failed to update expiry for key {key.remote_key_id}: {e}")
+                    errors.append(f"{server.name}/{key.remote_key_id}: {e}")
 
         if updated_count == 0:
             raise ValueError(f"Failed to update any keys: {'; '.join(errors)}")

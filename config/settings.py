@@ -42,7 +42,8 @@ PLANS: Dict[str, Dict[str, any]] = {
         'stars_amount': 150,
         'price_display': '275₽',
         'stars_display': '150⭐',
-        'description': '3 месяца'
+        'description': '3 месяца',
+        'plan_type': 'basic',
     },
     '365_days': {
         'days': 365,
@@ -50,9 +51,56 @@ PLANS: Dict[str, Dict[str, any]] = {
         'stars_amount': 500,
         'price_display': '925₽',
         'stars_display': '500⭐',
-        'description': '1 год'
-    }
+        'description': '1 год',
+        'plan_type': 'basic',
+    },
+    'premium_90_days': {
+        'days': 90,
+        'amount': 55000,  # 550 rubles in kopeks
+        'stars_amount': 300,
+        'price_display': '550₽',
+        'stars_display': '300⭐',
+        'description': '3 месяца Premium',
+        'plan_type': 'premium',
+    },
+    'premium_365_days': {
+        'days': 365,
+        'amount': 185000,  # 1850 rubles in kopeks
+        'stars_amount': 1000,
+        'price_display': '1850₽',
+        'stars_display': '1000⭐',
+        'description': '1 год Premium',
+        'plan_type': 'premium',
+    },
 }
+
+# Premium feature: which user IDs see premium plan buttons
+PREMIUM_TESTERS = [331186567]
+
+# Server groups accessible by plan type
+# "basic" gets all groups NOT listed in premium_groups
+# "premium" gets ALL groups (basic + premium)
+PREMIUM_GROUPS = {"Test Premium"}
+
+# Free VPN plan configuration
+FREE_GROUP_NAME = "Free"  # Server group name for free-tier servers
+FREE_SUBSCRIPTION_DAYS = 3650  # ~10 years (effectively permanent)
+FREE_AD_TEXT = (
+    "Для быстрого VPN и обхода белых списков:\n"
+    "👉 @clavis_vpn_bot"
+)
+
+# Free (referral) VPN plan — server group name and duration for referred users
+FREE_GROUP_NAME = "Free"       # ServerGroup name for referral/free-tier servers
+REFERRAL_SUBSCRIPTION_DAYS = 3  # Duration for a referred friend's free subscription
+
+# Ad lines appended to free subscription content (shown as server names in VPN clients)
+# Each line becomes a separate non-connectable entry visible in the server list.
+FREE_AD_LINES = [
+    "Хочешь быстрый VPN?",
+    "С обходом белых списков",
+    "t.me/clavis_vpn_bot",
+]
 
 # Test subscription duration (hours)
 TEST_SUBSCRIPTION_HOURS = 48
@@ -80,3 +128,38 @@ def format_msk(dt: datetime, fmt: str = '%d.%m.%Y %H:%M') -> str:
 SUBSCRIPTION_PORT = int(os.getenv('SUBSCRIPTION_PORT', 8080))
 SUBSCRIPTION_CACHE_TTL = int(os.getenv('SUBSCRIPTION_CACHE_TTL', 300))
 SUBSCRIPTION_CACHE_SIZE = int(os.getenv('SUBSCRIPTION_CACHE_SIZE', 1000))
+
+# ── Clavis app integration ────────────────────────────────────
+# During rollout, all new account/sync/login features are gated
+# to this single developer. When the integration is validated,
+# drop the gate in bot/middlewares/user_registration.py and /start.
+MAIN_DEVELOPER_ID = 331186567
+
+# HMAC secret for deterministic Telegram-device tokens of the form
+# `tg_<telegram_id>_<hmac16>`. MUST be set in .env in production — random
+# 32+ bytes. Rotating invalidates every Telegram session; users re-auth.
+TG_TOKEN_SECRET = os.getenv('TG_TOKEN_SECRET', '')
+
+# Argon2id tuning for recovery-phrase hashing (see services/auth.py)
+FCM_CREDENTIALS_PATH = os.getenv('FCM_CREDENTIALS_PATH', '')
+
+ARGON2_TIME_COST = int(os.getenv('ARGON2_TIME_COST', '3'))
+ARGON2_MEMORY_COST = int(os.getenv('ARGON2_MEMORY_COST', '65536'))  # 64 MiB
+ARGON2_PARALLELISM = int(os.getenv('ARGON2_PARALLELISM', '2'))
+
+# In-app payment plans (direct YooKassa API, not Telegram Payments).
+# plan_id → {days, amount (RUB string), description, plan_type}.
+APP_PLANS = {
+    "90d": {
+        "days": 90,
+        "amount": "275.00",
+        "description": "Clavis VPN — 90 days",
+        "plan_type": "basic",
+    },
+    "365d": {
+        "days": 365,
+        "amount": "925.00",
+        "description": "Clavis VPN — 365 days",
+        "plan_type": "basic",
+    },
+}

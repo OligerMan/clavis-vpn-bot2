@@ -30,9 +30,82 @@ from bot.keyboards.markups import (
     macos_instructions_keyboard,
     old_keys_keyboard,
 )
-from config.settings import SUBSCRIPTION_BASE_URL, DEVICE_LIMIT, format_msk
+from config.settings import SUBSCRIPTION_BASE_URL, DEVICE_LIMIT, MAIN_DEVELOPER_ID, format_msk
 
 logger = logging.getLogger(__name__)
+
+
+def _handle_clavis_start(bot: TeleBot, message: Message, payload: str) -> None:
+    """Handle /start clavis_login and /start clavis_sync for MAIN_DEVELOPER_ID.
+
+    Called only after the admin-gate passes. Creates a login_token or sync_pair
+    directly via the account service and sends the user a button with the
+    HTTPS deep-link wrapper URL.
+    """
+    from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+    from services.account_service import (
+        create_login_token,
+        create_sync_pair,
+        ensure_implicit_account,
+        upsert_telegram_device_for_user,
+    )
+
+    telegram_id = message.from_user.id
+    base = SUBSCRIPTION_BASE_URL.rstrip('/')
+
+    with get_db_session() as db:
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        if user is None:
+            # Middleware should have created this — fallback defensively.
+            user = User(telegram_id=telegram_id, username=message.from_user.username)
+            db.add(user)
+            db.flush()
+        # Ensure account + telegram device exist.
+        account = ensure_implicit_account(db, user)
+        tg_device = upsert_telegram_device_for_user(db, user)
+
+        if payload == "clavis_login":
+            row = create_login_token(db, account.id)
+            login_url = f"{base}/login/{row.token}"
+            kb = InlineKeyboardMarkup()
+            kb.row(InlineKeyboardButton("🔒 Открыть в Clavis", url=login_url))
+            bot.send_message(
+                message.chat.id,
+                "Нажмите кнопку, чтобы войти в Clavis на новом устройстве. Ссылка одноразовая, живёт 10 минут.",
+                reply_markup=kb,
+            )
+            return
+
+        if payload == "clavis_sync":
+            pair = create_sync_pair(db, tg_device)
+            sync_url = f"{base}/sync/{pair.pair_code}"
+
+            # Render QR PNG and send as photo.
+            try:
+                import io
+                import segno
+                qr = segno.make(sync_url, error='h')
+                buf = io.BytesIO()
+                qr.save(buf, kind='png', scale=10, border=2)
+                buf.seek(0)
+                bot.send_photo(
+                    message.chat.id,
+                    buf,
+                    caption=(
+                        f"Код: `{pair.pair_code}`\n"
+                        f"Отсканируй QR на пустом устройстве Clavis. Код живёт 2 минуты."
+                    ),
+                    parse_mode='Markdown',
+                )
+            except Exception as qr_err:
+                logger.warning(f"Sync QR render failed: {qr_err}")
+                bot.send_message(
+                    message.chat.id,
+                    f"Код синхронизации: `{pair.pair_code}`\n"
+                    f"Открой: {sync_url}",
+                    parse_mode='Markdown',
+                )
+            return
 
 
 def register_user_handlers(bot: TeleBot) -> None:
@@ -42,10 +115,43 @@ def register_user_handlers(bot: TeleBot) -> None:
     def handle_start(message: Message):
         """Handle /start command - show welcome message."""
         try:
+            # Extract payload from /start deep link
+            payload = ""
+            if message.text and ' ' in message.text:
+                payload = message.text.split(maxsplit=1)[1].strip()
+
+            # Clavis app integration flows — MAIN_DEVELOPER_ID only during rollout.
+            # Handled before normal /start logic to short-circuit cleanly.
+            if payload in ("clavis_login", "clavis_sync"):
+                if message.from_user.id != MAIN_DEVELOPER_ID:
+                    # Silently ignore — fall through to normal /start behaviour.
+                    pass
+                else:
+                    try:
+                        _handle_clavis_start(bot, message, payload)
+                        return
+                    except Exception as app_err:
+                        logger.error(f"Clavis /start {payload} failed: {app_err}", exc_info=True)
+                        bot.send_message(
+                            message.chat.id,
+                            "Ошибка интеграции Clavis-app. Смотри логи.",
+                            parse_mode=""
+                        )
+                        return
+
+            ref_source = None
+            if payload.startswith('ref_'):
+                ref_source = payload[4:][:100]
+
             with get_db_session() as db:
                 user = db.query(User).filter(
                     User.telegram_id == message.from_user.id
                 ).first()
+
+                # Backfill ref_source for existing users
+                if user and ref_source and not user.ref_source:
+                    user.ref_source = ref_source
+                    db.commit()
 
                 # Legacy or paid users get full menu right away
                 if user:
@@ -53,11 +159,12 @@ def register_user_handlers(bot: TeleBot) -> None:
                     active_sub = SubscriptionService.get_active_subscription(db, user)
                     if has_legacy or (active_sub and not active_sub.is_test):
                         hide_test_key = active_sub is not None
+                        show_invite = bool(active_sub and not active_sub.is_test and getattr(active_sub, 'plan_type', 'basic') not in ('free', None))
                         welcome_text = Messages.WELCOME_LEGACY if has_legacy else Messages.WELCOME
                         bot.send_message(
                             message.chat.id,
                             welcome_text,
-                            reply_markup=full_menu_keyboard(hide_test_key, show_old_keys=has_legacy),
+                            reply_markup=full_menu_keyboard(hide_test_key, show_old_keys=has_legacy, show_invite=show_invite),
                             parse_mode='Markdown'
                         )
                         return
@@ -84,6 +191,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                 # Hide test key button if user already used test OR has paid subscription
                 hide_test_key = False
                 show_old_keys = False
+                show_invite = False
                 if user:
                     # Check if already used test
                     if SubscriptionService.has_test_subscription(db, user):
@@ -92,13 +200,14 @@ def register_user_handlers(bot: TeleBot) -> None:
                     active_sub = SubscriptionService.get_active_subscription(db, user)
                     if active_sub and not active_sub.is_test:
                         hide_test_key = True
+                        show_invite = getattr(active_sub, 'plan_type', 'basic') not in ('free', None)
                     # Check for legacy keys
                     show_old_keys = KeyService.has_legacy_keys(db, user)
 
                 bot.send_message(
                     message.chat.id,
                     Messages.MENU,
-                    reply_markup=full_menu_keyboard(hide_test_key, show_old_keys=show_old_keys),
+                    reply_markup=full_menu_keyboard(hide_test_key, show_old_keys=show_old_keys, show_invite=show_invite),
                     parse_mode='Markdown'
                 )
         except Exception as e:
@@ -293,11 +402,26 @@ def register_user_handlers(bot: TeleBot) -> None:
         try:
             command = message.text.lower().replace('/', '')
 
+            # Get deeplinks for the user if they have an active subscription
+            v2raytun_deeplink = None
+            happ_deeplink = None
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == message.from_user.id).first()
+                if user:
+                    subscription = SubscriptionService.get_active_subscription(db, user)
+                    if subscription:
+                        v2raytun_deeplink = SubscriptionService.get_v2raytun_deeplink(
+                            subscription, SUBSCRIPTION_BASE_URL
+                        )
+                        happ_deeplink = SubscriptionService.get_happ_deeplink(
+                            subscription, SUBSCRIPTION_BASE_URL
+                        )
+
             platform_data = {
-                'android': (Messages.ANDROID_INSTRUCTIONS, android_instructions_keyboard()),
-                'ios': (Messages.IOS_INSTRUCTIONS, ios_instructions_keyboard()),
-                'windows': (Messages.WINDOWS_INSTRUCTIONS, windows_instructions_keyboard()),
-                'macos': (Messages.MACOS_INSTRUCTIONS, macos_instructions_keyboard())
+                'android': (Messages.ANDROID_INSTRUCTIONS, android_instructions_keyboard(v2raytun_deeplink)),
+                'ios': (Messages.IOS_INSTRUCTIONS, ios_instructions_keyboard(happ_deeplink)),
+                'windows': (Messages.WINDOWS_INSTRUCTIONS, windows_instructions_keyboard(v2raytun_deeplink)),
+                'macos': (Messages.MACOS_INSTRUCTIONS, macos_instructions_keyboard(happ_deeplink))
             }
 
             data = platform_data.get(command)
@@ -436,6 +560,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                 # Hide test key button if user already used test OR has paid subscription
                 hide_test_key = False
                 show_old_keys = False
+                show_invite = False
                 if user:
                     # Check if already used test
                     if SubscriptionService.has_test_subscription(db, user):
@@ -444,6 +569,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                     active_sub = SubscriptionService.get_active_subscription(db, user)
                     if active_sub and not active_sub.is_test:
                         hide_test_key = True
+                        show_invite = getattr(active_sub, 'plan_type', 'basic') not in ('free', None)
                     # Check for legacy keys
                     show_old_keys = KeyService.has_legacy_keys(db, user)
 
@@ -451,7 +577,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                     Messages.WELCOME,
                     call.message.chat.id,
                     call.message.id,
-                    reply_markup=full_menu_keyboard(hide_test_key, show_old_keys=show_old_keys),
+                    reply_markup=full_menu_keyboard(hide_test_key, show_old_keys=show_old_keys, show_invite=show_invite),
                     parse_mode='Markdown'
                 )
                 bot.answer_callback_query(call.id)
@@ -625,5 +751,83 @@ def register_user_handlers(bot: TeleBot) -> None:
         except Exception as e:
             logger.error(f"Error in cancel callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id)
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'gen_referral')
+    def callback_gen_referral(call: CallbackQuery):
+        """Generate a referral invite link for the user to share with a friend."""
+        import secrets
+        import string
+        from database.models import ReferralInvite
+        from config.settings import SUBSCRIPTION_BASE_URL
+
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(
+                    User.telegram_id == call.from_user.id
+                ).first()
+
+                if not user:
+                    bot.answer_callback_query(call.id, "Ошибка: пользователь не найден")
+                    return
+
+                # Only paid (non-test, non-free) subscribers can invite
+                active_sub = SubscriptionService.get_active_subscription(db, user)
+                if not active_sub or active_sub.is_test or getattr(active_sub, 'plan_type', 'basic') in ('free', None):
+                    bot.answer_callback_query(call.id, "Приглашать друзей могут только платные пользователи")
+                    return
+
+                # Generate unique 10-char code
+                alphabet = string.ascii_lowercase + string.digits
+                for _ in range(10):
+                    code = ''.join(secrets.choice(alphabet) for _ in range(10))
+                    if not db.query(ReferralInvite).filter(ReferralInvite.code == code).first():
+                        break
+
+                invite = ReferralInvite(
+                    code=code,
+                    inviter_id=user.id,
+                )
+                db.add(invite)
+                db.commit()
+                log_activity(db, call.from_user.id, "invite_created", f"code={code}")
+
+            base = SUBSCRIPTION_BASE_URL.rstrip('/')
+            invite_url = f"{base}/invite/{code}"
+
+            text = (
+                "👥 *Ссылка для приглашения друга*\n\n"
+                "Отправь другу эту ссылку\\. Он откроет её в браузере и получит "
+                "бесплатный VPN на 3 дня — даже если Telegram не работает\\.\n\n"
+                f"`{invite_url}`\n\n"
+                "_Ссылка одноразовая и привязана к одному другу\\._"
+            )
+            bot.answer_callback_query(call.id)
+            bot.send_message(
+                call.message.chat.id,
+                text,
+                parse_mode='MarkdownV2',
+            )
+
+            # Send QR code as photo for showing to a friend in person
+            try:
+                import segno, io as _io
+                qr = segno.make(invite_url, error='h')
+                buf = _io.BytesIO()
+                qr.save(buf, kind='png', scale=10, border=2)
+                buf.seek(0)
+                buf.name = 'invite_qr.png'
+                bot.send_photo(
+                    call.message.chat.id,
+                    buf,
+                    caption="📲 Покажи QR-код другу при встрече — он сканирует и получает VPN",
+                )
+            except Exception as qr_err:
+                logger.warning(f"Failed to generate QR for invite {code}: {qr_err}")
+
+            logger.info(f"Referral invite generated: code={code}, inviter={call.from_user.id}")
+
+        except Exception as e:
+            logger.error(f"Error in gen_referral callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
 
     logger.info("User handlers registered")

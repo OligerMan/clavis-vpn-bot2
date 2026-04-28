@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from subscription.router import router as subscription_router
+from subscription.api import api_router
 from config.settings import SUBSCRIPTION_PORT
 
 logger = logging.getLogger(__name__)
@@ -29,12 +30,13 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=["*"],
         allow_credentials=False,
-        allow_methods=["GET"],
+        allow_methods=["GET", "POST"],  # POST added for /api/v1/*
         allow_headers=["*"],
     )
 
     # Register routers
     app.include_router(subscription_router)
+    app.include_router(api_router)
 
     # Health check endpoint
     @app.get("/health")

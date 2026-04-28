@@ -8,7 +8,7 @@ import random
 import secrets
 import subprocess
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -17,10 +17,10 @@ from py3xui.inbound import Settings, Sniffing, StreamSettings
 from telebot import TeleBot
 from telebot.types import Message, CallbackQuery, ForceReply, InlineKeyboardMarkup, InlineKeyboardButton
 
-from sqlalchemy import func
+from sqlalchemy import func, Integer
 
 from database import get_db_session
-from database.models import Server, User, Subscription, Key, Transaction, ActivityLog
+from database.models import Server, ServerGroup, User, Subscription, Key, Transaction, ActivityLog, ConnectionProfile, ServerInbound, ReferralInvite
 from database.activity_log import log_activity
 from config.settings import ADMIN_IDS, XUI_USERNAME, XUI_PASSWORD, PLANS, format_msk
 from services import KeyService
@@ -124,6 +124,56 @@ def _generate_short_ids() -> list[str]:
     ]
 
 
+def _create_inbound_with_profile(api, profile, remark: str) -> dict:
+    """Create a VLESS Reality inbound using ConnectionProfile settings.
+
+    Returns dict: inbound_id, port, public_key, private_key, short_id, sni
+    """
+    private_key, public_key = _generate_x25519_keys()
+    short_ids = _generate_short_ids()
+    port = random.randint(20000, 60000)
+    sni = profile.sni
+    dest = profile.dest or f"{sni}:443"
+    server_names = [sni]
+    if not sni.startswith("www."):
+        server_names.append(f"www.{sni}")
+    else:
+        server_names.append(sni[4:])
+
+    reality_settings = {
+        "show": False, "xver": 0, "target": dest, "serverNames": server_names,
+        "privateKey": private_key, "minClientVer": "", "maxClientVer": "",
+        "maxTimediff": 0, "shortIds": short_ids,
+        "settings": {"publicKey": public_key, "fingerprint": profile.fingerprint,
+                     "serverName": "", "spiderX": "/"},
+    }
+    stream_settings = StreamSettings(
+        security=profile.security, network=profile.network,
+        tcp_settings={"acceptProxyProtocol": False, "header": {"type": "none"}},
+        reality_settings=reality_settings,
+    )
+    api.inbound.add(Inbound(
+        enable=True, port=port, protocol=profile.protocol,
+        settings=Settings(decryption="none"),
+        stream_settings=stream_settings, sniffing=Sniffing(enabled=True),
+        remark=remark,
+    ))
+
+    all_inbounds = api.inbound.get_list()
+    created = next((ib for ib in all_inbounds if ib.port == port and ib.protocol == profile.protocol), None)
+    if not created:
+        raise RuntimeError("Inbound was created but could not be found on panel")
+
+    return {
+        "inbound_id": created.id,
+        "port": port,
+        "public_key": public_key,
+        "private_key": private_key,
+        "short_id": short_ids[0],
+        "sni": sni,
+    }
+
+
 def _create_vless_reality_inbound(api: Api, remark: str = "clavis") -> dict:
     """Create a VLESS Reality inbound on the panel.
 
@@ -222,62 +272,99 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "/servers — list all servers grouped by server set\n"
             "/groups — quick overview of server groups\n"
             "/add_server — add server (dialog)\n"
+            "/add_group — create a new server group\n"
             "/activate_group — bulk-create keys for a group\n"
             "/check_server — health check (version, uptime, clients)\n"
             "/toggle_server — enable/disable server\n"
             "/delete_server — delete server\n"
+            "\n<b>Connection profiles:</b>\n"
+            "/profiles — list all connection profiles\n"
+            "/import_profile — import profile from existing inbound\n"
+            "/add_profile — create profile manually\n"
+            "/assign_profile — assign profile to server (creates inbound)\n"
             "\n<b>User management:</b>\n"
             "/manage_user — user info, keys, subscription, actions\n"
             "\n<b>Legacy keys:</b>\n"
             "/add_old_keys — import legacy keys from CSV\n"
             "/remove_old_keys — soft-delete all legacy keys\n"
+            "\n<b>Referral links:</b>\n"
+            "/generate_ref_link — generate deep link with ref tag\n"
+            "/ref_links — list, stats, delete, grant access to ref links\n"
             "\n<b>Service analytics:</b>\n"
             "/report — service dashboard (users, subs, payments, servers)\n"
             "/analytics — conversion, ARPU, revenue by plan\n"
             "/traffic — traffic stats per server (live from x-ui)\n"
+            "/sub_graph — subscription growth chart since launch\n"
+            "/invite_stat [N] — top N users by invite activity (default 25)\n"
             "/logs — last N user actions (default 50)\n"
             "/last_logs — only new actions since last call\n"
             "\n<b>Other:</b>\n"
             "/broadcast — interactive broadcast to a list of users\n"
             "/check_reminders — manually run subscription expiry check\n"
             "/backup — send database backup file\n"
+            "/monitor_status — server monitoring state\n"
             "/admin_help — this message",
             parse_mode='HTML',
         )
 
     # ── /report ───────────────────────────────────────────────
-    def _build_report_text() -> str:
+    def _build_report_text(ref_source: str = None) -> str:
         """Build report text (reused by command and refresh callback)."""
         with get_db_session() as db:
             now = datetime.utcnow()
             week_ago = now - timedelta(days=7)
             month_ago = now - timedelta(days=30)
 
-            total_users = db.query(func.count(User.id)).scalar()
-            new_7d = db.query(func.count(User.id)).filter(User.created_at >= week_ago).scalar()
-            new_30d = db.query(func.count(User.id)).filter(User.created_at >= month_ago).scalar()
+            admin_user_ids = db.query(User.id).filter(
+                User.telegram_id.in_(ADMIN_IDS)
+            ).subquery()
+
+            # Build filtered user IDs subquery
+            base_user_q = db.query(User.id).filter(~User.id.in_(admin_user_ids))
+            if ref_source:
+                base_user_q = base_user_q.filter(User.ref_source == ref_source)
+            filtered_user_ids = base_user_q.subquery()
+
+            total_users = db.query(func.count(User.id)).filter(
+                User.id.in_(filtered_user_ids)
+            ).scalar()
+            new_7d = db.query(func.count(User.id)).filter(
+                User.created_at >= week_ago,
+                User.id.in_(filtered_user_ids),
+            ).scalar()
+            new_30d = db.query(func.count(User.id)).filter(
+                User.created_at >= month_ago,
+                User.id.in_(filtered_user_ids),
+            ).scalar()
 
             active_paid = db.query(func.count(Subscription.id)).filter(
                 Subscription.is_active == True,
                 Subscription.expires_at > now,
                 Subscription.is_test == False,
+                Subscription.plan_type != 'free',
+                Subscription.user_id.in_(filtered_user_ids),
+            ).scalar()
+            active_invite = db.query(func.count(Subscription.id)).filter(
+                Subscription.is_active == True,
+                Subscription.expires_at > now,
+                Subscription.is_test == False,
+                Subscription.plan_type == 'free',
+                Subscription.user_id.in_(filtered_user_ids),
             ).scalar()
             active_test = db.query(func.count(Subscription.id)).filter(
                 Subscription.is_active == True,
                 Subscription.expires_at > now,
                 Subscription.is_test == True,
+                Subscription.user_id.in_(filtered_user_ids),
             ).scalar()
             expired = db.query(func.count(Subscription.id)).filter(
                 Subscription.is_active == True,
                 Subscription.expires_at <= now,
+                Subscription.user_id.in_(filtered_user_ids),
             ).scalar()
-
-            admin_user_ids = db.query(User.id).filter(
-                User.telegram_id.in_(ADMIN_IDS)
-            ).subquery()
             real_payments_cutoff = datetime(2026, 2, 20)
             non_admin_tx = db.query(Transaction).filter(
-                ~Transaction.user_id.in_(admin_user_ids),
+                Transaction.user_id.in_(filtered_user_ids),
                 Transaction.created_at >= real_payments_cutoff,
             ).subquery()
 
@@ -292,6 +379,11 @@ def register_admin_handlers(bot: TeleBot) -> None:
             ).scalar()
             failed_count = db.query(func.count(non_admin_tx.c.id)).filter(
                 non_admin_tx.c.status == 'failed'
+            ).scalar()
+
+            new_paid_7d = db.query(func.count(func.distinct(non_admin_tx.c.user_id))).filter(
+                non_admin_tx.c.status == 'completed',
+                non_admin_tx.c.completed_at >= week_ago,
             ).scalar()
 
             rev_7d = db.query(
@@ -320,16 +412,19 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 Key.is_active == True,
                 Key.server_id.isnot(None),
             ).scalar()
-            total_capacity = db.query(
-                func.coalesce(func.sum(Server.capacity), 0)
-            ).filter(Server.is_active == True).scalar()
+            total_capacity = 0  # no longer used
 
         def fmt_rub(kopeks: int) -> str:
             rub = kopeks // 100
             return f"{rub:,}".replace(",", " ")
 
+        header = "*Отчёт по сервису*"
+        if ref_source:
+            header += f" (источник: `{ref_source}`)"
+        header += "\n\n"
+
         return (
-            "*Отчёт по сервису*\n\n"
+            header +
             "*Пользователи*\n"
             f"  Всего: {total_users}\n"
             f"  Новых за 7 дней: {new_7d}\n"
@@ -337,21 +432,32 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "*Подписки*\n"
             f"  Активных платных: {active_paid}\n"
             f"  Активных тестовых: {active_test}\n"
+            f"  Активных инвайт: {active_invite}\n"
             f"  Истекших (всего): {expired}\n\n"
             "*Платежи*\n"
             f"  Успешных: {completed_count} на {fmt_rub(completed_sum_kopeks)}₽\n"
             f"  Ожидающих: {pending_count}\n"
             f"  Неудачных: {failed_count}\n"
+            f"  Новых платных за 7 дней: {new_paid_7d}\n"
             f"  За 7 дней: {rev_7d_count} на {fmt_rub(rev_7d_sum)}₽\n"
             f"  За 30 дней: {rev_30d_count} на {fmt_rub(rev_30d_sum)}₽\n\n"
             "*Серверы*\n"
             f"  Активных: {active_servers} из {total_servers}\n"
-            f"  Ключей: {total_keys} / {total_capacity}\n\n"
+            f"  Ключей: {total_keys}\n\n"
             f"_{format_msk(now)}_"
         )
 
-    _refresh_kb = InlineKeyboardMarkup()
-    _refresh_kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="refresh_report"))
+    def _report_keyboard(ref_source: str = None) -> InlineKeyboardMarkup:
+        kb = InlineKeyboardMarkup()
+        if ref_source:
+            kb.row(
+                InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_report:{ref_source}"),
+                InlineKeyboardButton("Сбросить фильтр", callback_data="refresh_report"),
+            )
+        else:
+            kb.row(InlineKeyboardButton("🔄 Обновить", callback_data="refresh_report"))
+        kb.row(InlineKeyboardButton("Фильтр по источнику", callback_data="filter_rpt_src"))
+        return kb
 
     @bot.message_handler(commands=['report'])
     def handle_report(message: Message):
@@ -359,24 +465,77 @@ def register_admin_handlers(bot: TeleBot) -> None:
             return
         try:
             text = _build_report_text()
-            bot.send_message(message.chat.id, text, parse_mode='Markdown', reply_markup=_refresh_kb)
+            bot.send_message(message.chat.id, text, parse_mode='Markdown', reply_markup=_report_keyboard())
         except Exception as e:
             logger.error(f"Error in /report: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
 
-    @bot.callback_query_handler(func=lambda c: c.data == 'refresh_report')
+    @bot.callback_query_handler(func=lambda c: c.data == 'refresh_report' or c.data.startswith('refresh_report:'))
     def handle_refresh_report(call: CallbackQuery):
         if not is_admin(call.from_user.id):
             return
         try:
-            text = _build_report_text()
+            ref_source = None
+            if ':' in call.data:
+                ref_source = call.data.split(':', 1)[1]
+            text = _build_report_text(ref_source)
             bot.edit_message_text(
                 text, call.message.chat.id, call.message.message_id,
-                parse_mode='Markdown', reply_markup=_refresh_kb,
+                parse_mode='Markdown', reply_markup=_report_keyboard(ref_source),
             )
             bot.answer_callback_query(call.id)
         except Exception as e:
             logger.error(f"Error refreshing /report: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, text=f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda c: c.data == 'filter_rpt_src')
+    def handle_filter_report_sources(call: CallbackQuery):
+        """Show list of known ref_source values for report filtering."""
+        if not is_admin(call.from_user.id):
+            return
+        try:
+            with get_db_session() as db:
+                sources = db.query(
+                    User.ref_source, func.count(User.id)
+                ).filter(
+                    User.ref_source.isnot(None),
+                    ~User.telegram_id.in_(ADMIN_IDS),
+                ).group_by(User.ref_source).order_by(User.ref_source).all()
+
+            if not sources:
+                bot.answer_callback_query(call.id, "Нет пользователей с реферальным источником")
+                return
+
+            kb = InlineKeyboardMarkup()
+            for src, cnt in sources:
+                kb.row(InlineKeyboardButton(f"{src} ({cnt})", callback_data=f"rpt_src:{src}"))
+            kb.row(InlineKeyboardButton("← Назад", callback_data="refresh_report"))
+
+            bot.edit_message_text(
+                "*Выберите источник для фильтрации:*",
+                call.message.chat.id, call.message.message_id,
+                parse_mode='Markdown', reply_markup=kb,
+            )
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in filter_report_sources: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, text=f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('rpt_src:'))
+    def handle_report_by_source(call: CallbackQuery):
+        """Show report filtered by a specific ref_source."""
+        if not is_admin(call.from_user.id):
+            return
+        try:
+            ref_source = call.data.split(':', 1)[1]
+            text = _build_report_text(ref_source)
+            bot.edit_message_text(
+                text, call.message.chat.id, call.message.message_id,
+                parse_mode='Markdown', reply_markup=_report_keyboard(ref_source),
+            )
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in report_by_source: {e}", exc_info=True)
             bot.answer_callback_query(call.id, text=f"Error: {e}")
 
     def _truncate_lines(lines: list[str], max_len: int) -> str:
@@ -399,6 +558,8 @@ def register_admin_handlers(bot: TeleBot) -> None:
         "sub_extended": "Продление",
         "sub_reactivated": "Реактивация",
         "admin_grant_sub": "Выдана подписка",
+        "invite_created": "Инвайт создан",
+        "invite_used": "Инвайт использован",
     }
 
     @bot.message_handler(commands=['logs'])
@@ -507,7 +668,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── /analytics ────────────────────────────────────────────
-    def _build_analytics_text() -> str:
+    def _build_analytics_text(ref_source: str = None) -> str:
         """Build analytics text (reused by command and refresh callback)."""
         with get_db_session() as db:
             now = datetime.utcnow()
@@ -517,43 +678,52 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 User.telegram_id.in_(ADMIN_IDS)
             ).subquery()
 
+            # Build filtered user IDs subquery
+            base_user_q = db.query(User.id).filter(~User.id.in_(admin_user_ids))
+            if ref_source:
+                base_user_q = base_user_q.filter(User.ref_source == ref_source)
+            filtered_user_ids = base_user_q.subquery()
+
+            # Build filtered telegram_id list (for ActivityLog queries)
+            filtered_tg_q = db.query(User.telegram_id).filter(~User.id.in_(admin_user_ids))
+            if ref_source:
+                filtered_tg_q = filtered_tg_q.filter(User.ref_source == ref_source)
+            filtered_tg_ids = [r[0] for r in filtered_tg_q.all()]
+
             # ── Funnel ──
             total_users = db.query(func.count(User.id)).filter(
-                ~User.id.in_(admin_user_ids)
+                User.id.in_(filtered_user_ids)
             ).scalar()
 
             active_paid = db.query(func.count(Subscription.id)).filter(
                 Subscription.is_active == True,
                 Subscription.expires_at > now,
                 Subscription.is_test == False,
-                ~Subscription.user_id.in_(admin_user_ids),
+                Subscription.plan_type != 'free',
+                Subscription.user_id.in_(filtered_user_ids),
             ).scalar()
             active_test = db.query(func.count(Subscription.id)).filter(
                 Subscription.is_active == True,
                 Subscription.expires_at > now,
                 Subscription.is_test == True,
-                ~Subscription.user_id.in_(admin_user_ids),
+                Subscription.user_id.in_(filtered_user_ids),
             ).scalar()
 
             new_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
                 ActivityLog.action == 'new_user',
-                ~ActivityLog.telegram_id.in_(
-                    db.query(User.telegram_id).filter(User.telegram_id.in_(ADMIN_IDS))
-                ),
+                ActivityLog.telegram_id.in_(filtered_tg_ids),
             ).scalar()
-
-            admin_tg_ids = [aid for aid in ADMIN_IDS]
 
             test_tg_from_log = set(
                 r[0] for r in db.query(ActivityLog.telegram_id).filter(
                     ActivityLog.action == 'test_key',
-                    ~ActivityLog.telegram_id.in_(admin_tg_ids),
+                    ActivityLog.telegram_id.in_(filtered_tg_ids),
                 ).all()
             )
             test_tg_from_sub = set(
                 r[0] for r in db.query(User.telegram_id).join(Subscription).filter(
                     Subscription.is_test == True,
-                    ~User.id.in_(admin_user_ids),
+                    User.id.in_(filtered_user_ids),
                 ).all()
             )
             all_test_tg = test_tg_from_log | test_tg_from_sub
@@ -564,7 +734,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     Transaction, User.id == Transaction.user_id
                 ).filter(
                     Transaction.status == 'completed',
-                    ~User.id.in_(admin_user_ids),
+                    User.id.in_(filtered_user_ids),
                     Transaction.created_at >= real_payments_cutoff,
                 ).all()
             )
@@ -577,7 +747,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     Subscription.is_test == True,
                     Subscription.is_active == True,
                     Subscription.expires_at > now,
-                    ~User.id.in_(admin_user_ids),
+                    User.id.in_(filtered_user_ids),
                 ).all()
             )
             undecided_tg = active_test_tg - paid_tg
@@ -589,7 +759,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             new_tg = set(
                 r[0] for r in db.query(ActivityLog.telegram_id).filter(
                     ActivityLog.action == 'new_user',
-                    ~ActivityLog.telegram_id.in_(admin_tg_ids),
+                    ActivityLog.telegram_id.in_(filtered_tg_ids),
                 ).all()
             )
             new_paid = len(new_tg & paid_tg)
@@ -598,9 +768,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             # ── Renewals ──
             renewal_users = db.query(func.count(func.distinct(ActivityLog.telegram_id))).filter(
                 ActivityLog.action == 'sub_extended',
-                ~ActivityLog.telegram_id.in_(
-                    db.query(User.telegram_id).filter(User.telegram_id.in_(ADMIN_IDS))
-                ),
+                ActivityLog.telegram_id.in_(filtered_tg_ids),
             ).scalar()
             renewal_pct = (renewal_users / paid_users * 100) if paid_users > 0 else 0
 
@@ -611,7 +779,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 func.coalesce(func.sum(Transaction.amount), 0),
             ).filter(
                 Transaction.status == 'completed',
-                ~Transaction.user_id.in_(admin_user_ids),
+                Transaction.user_id.in_(filtered_user_ids),
                 Transaction.created_at >= real_payments_cutoff,
             ).group_by(Transaction.plan).all()
 
@@ -632,22 +800,36 @@ def register_admin_handlers(bot: TeleBot) -> None:
             expiring_7d = db.query(func.count(Subscription.id)).filter(
                 Subscription.is_active == True,
                 Subscription.is_test == False,
+                Subscription.plan_type != 'free',
                 Subscription.expires_at > now,
                 Subscription.expires_at <= now + timedelta(days=7),
-                ~Subscription.user_id.in_(admin_user_ids),
+                Subscription.user_id.in_(filtered_user_ids),
             ).scalar()
 
             expiring_30d = db.query(func.count(Subscription.id)).filter(
                 Subscription.is_active == True,
                 Subscription.is_test == False,
+                Subscription.plan_type != 'free',
                 Subscription.expires_at > now,
                 Subscription.expires_at <= now + timedelta(days=30),
-                ~Subscription.user_id.in_(admin_user_ids),
+                Subscription.user_id.in_(filtered_user_ids),
             ).scalar()
 
+            # ── Referral invites (global stats) ──
+            invite_total = db.query(func.count(ReferralInvite.id)).scalar() or 0
+            invite_creators = db.query(func.count(func.distinct(ReferralInvite.inviter_id))).scalar() or 0
+            invite_used = db.query(func.count(ReferralInvite.id)).filter(
+                ReferralInvite.activated_at.isnot(None)
+            ).scalar() or 0
+
         # ── Build message ──
+        header = "*Аналитика*"
+        if ref_source:
+            header += f" (источник: `{ref_source}`)"
+        header += "\n\n"
+
         text = (
-            "*Аналитика*\n\n"
+            header +
             "*Воронка*\n"
             f"  Всего пользователей: {total_users}\n"
             f"  Активных платных: {active_paid}\n"
@@ -674,12 +856,25 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "*Истекают*\n"
             f"  В ближайшие 7 дней: {expiring_7d}\n"
             f"  В ближайшие 30 дней: {expiring_30d}\n\n"
+            f"*Инвайты*\n"
+            f"  Создано инвайтов: {invite_total}\n"
+            f"  Пользователей создали: {invite_creators}\n"
+            f"  Использовано: {invite_used}\n\n"
             f"_{format_msk(now)}_"
         )
         return text
 
-    _refresh_analytics_kb = InlineKeyboardMarkup()
-    _refresh_analytics_kb.add(InlineKeyboardButton("🔄 Обновить", callback_data="refresh_analytics"))
+    def _analytics_keyboard(ref_source: str = None) -> InlineKeyboardMarkup:
+        kb = InlineKeyboardMarkup()
+        if ref_source:
+            kb.row(
+                InlineKeyboardButton("🔄 Обновить", callback_data=f"refresh_analytics:{ref_source}"),
+                InlineKeyboardButton("Сбросить фильтр", callback_data="refresh_analytics"),
+            )
+        else:
+            kb.row(InlineKeyboardButton("🔄 Обновить", callback_data="refresh_analytics"))
+        kb.row(InlineKeyboardButton("Фильтр по источнику", callback_data="filter_anl_src"))
+        return kb
 
     @bot.message_handler(commands=['analytics'])
     def handle_analytics(message: Message):
@@ -687,28 +882,137 @@ def register_admin_handlers(bot: TeleBot) -> None:
             return
         try:
             text = _build_analytics_text()
-            bot.send_message(message.chat.id, text, parse_mode='Markdown', reply_markup=_refresh_analytics_kb)
+            bot.send_message(message.chat.id, text, parse_mode='Markdown', reply_markup=_analytics_keyboard())
         except Exception as e:
             logger.error(f"Error in /analytics: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
 
-    @bot.callback_query_handler(func=lambda c: c.data == 'refresh_analytics')
+    @bot.callback_query_handler(func=lambda c: c.data == 'refresh_analytics' or c.data.startswith('refresh_analytics:'))
     def handle_refresh_analytics(call: CallbackQuery):
         if not is_admin(call.from_user.id):
             return
         try:
-            text = _build_analytics_text()
+            ref_source = None
+            if ':' in call.data:
+                ref_source = call.data.split(':', 1)[1]
+            text = _build_analytics_text(ref_source)
             bot.edit_message_text(
                 text, call.message.chat.id, call.message.message_id,
-                parse_mode='Markdown', reply_markup=_refresh_analytics_kb,
+                parse_mode='Markdown', reply_markup=_analytics_keyboard(ref_source),
             )
             bot.answer_callback_query(call.id)
         except Exception as e:
             logger.error(f"Error refreshing /analytics: {e}", exc_info=True)
             bot.answer_callback_query(call.id, text=f"Error: {e}")
 
+    @bot.callback_query_handler(func=lambda c: c.data == 'filter_anl_src')
+    def handle_filter_analytics_sources(call: CallbackQuery):
+        """Show list of known ref_source values for analytics filtering."""
+        if not is_admin(call.from_user.id):
+            return
+        try:
+            with get_db_session() as db:
+                sources = db.query(
+                    User.ref_source, func.count(User.id)
+                ).filter(
+                    User.ref_source.isnot(None),
+                    ~User.telegram_id.in_(ADMIN_IDS),
+                ).group_by(User.ref_source).order_by(User.ref_source).all()
+
+            if not sources:
+                bot.answer_callback_query(call.id, "Нет пользователей с реферальным источником")
+                return
+
+            kb = InlineKeyboardMarkup()
+            for src, cnt in sources:
+                kb.row(InlineKeyboardButton(f"{src} ({cnt})", callback_data=f"anl_src:{src}"))
+            kb.row(InlineKeyboardButton("← Назад", callback_data="refresh_analytics"))
+
+            bot.edit_message_text(
+                "*Выберите источник для фильтрации:*",
+                call.message.chat.id, call.message.message_id,
+                parse_mode='Markdown', reply_markup=kb,
+            )
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in filter_analytics_sources: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, text=f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith('anl_src:'))
+    def handle_analytics_by_source(call: CallbackQuery):
+        """Show analytics filtered by a specific ref_source."""
+        if not is_admin(call.from_user.id):
+            return
+        try:
+            ref_source = call.data.split(':', 1)[1]
+            text = _build_analytics_text(ref_source)
+            bot.edit_message_text(
+                text, call.message.chat.id, call.message.message_id,
+                parse_mode='Markdown', reply_markup=_analytics_keyboard(ref_source),
+            )
+            bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error in analytics_by_source: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, text=f"Error: {e}")
+
+    # ── /generate_ref_link ─────────────────────────────────────
+    @bot.message_handler(commands=['generate_ref_link'])
+    def handle_generate_ref_link(message: Message):
+        """Generate a deep link with a referral tag."""
+        if not is_admin(message.from_user.id):
+            return
+
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            msg = bot.send_message(
+                message.chat.id,
+                "Введите тег источника (латиница, цифры, `_`, `-`).\n"
+                "Например: `instagram`, `youtube_ad`, `friend`",
+                parse_mode='Markdown',
+                reply_markup=ForceReply(selective=True),
+            )
+            bot.register_next_step_handler(msg, _process_ref_tag)
+            return
+
+        _send_ref_link(message.chat.id, parts[1].strip())
+
+    def _process_ref_tag(message: Message):
+        if not is_admin(message.from_user.id):
+            return
+        tag = (message.text or "").strip()
+        if not tag:
+            bot.send_message(message.chat.id, "Тег не может быть пустым.")
+            return
+        _send_ref_link(message.chat.id, tag)
+
+    def _send_ref_link(chat_id: int, tag: str):
+        import re
+        from database.models import RefLink as _RefLink
+        tag = re.sub(r'[^a-zA-Z0-9_\-]', '', tag)[:50]
+        if not tag:
+            bot.send_message(chat_id, "Тег должен содержать латинские буквы, цифры, `_` или `-`.", parse_mode='Markdown')
+            return
+
+        # Ensure RefLink record exists
+        try:
+            with get_db_session() as db:
+                if not db.query(_RefLink).filter(_RefLink.tag == tag).first():
+                    db.add(_RefLink(tag=tag))
+        except Exception:
+            pass  # non-critical
+
+        username = bot.get_me().username
+        link = f"https://t.me/{username}?start=ref_{tag}"
+        bot.send_message(
+            chat_id,
+            f"Реферальная ссылка для `{tag}`:\n\n`{link}`",
+            parse_mode='Markdown',
+        )
+
     # ── /traffic ──────────────────────────────────────────────
     def _fmt_bytes(b: int) -> str:
+        if b >= 1024**4:
+            return f"{b / 1024**4:.1f} TB"
         if b >= 1024**3:
             return f"{b / 1024**3:.1f} GB"
         if b >= 1024**2:
@@ -744,13 +1048,35 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 groups: dict = _defaultdict(list)
                 errors = []
 
-                for server in servers:
+                # Fetch clients from all servers in parallel to avoid hanging
+                # on slow/unreachable servers (each timeout adds ~2-3 minutes).
+                # SQLAlchemy sessions aren't thread-safe — each worker uses its own.
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                def _fetch(server_id):
                     try:
-                        client = XUIClient(server)
-                        clients = client.list_clients()
-                    except Exception as e:
-                        errors.append(f"{server.name}: {e}")
+                        with get_db_session() as tdb:
+                            srv = tdb.query(Server).get(server_id)
+                            clients = KeyService.list_all_clients_for_server(tdb, srv)
+                        return server_id, clients, None
+                    except Exception as exc:
+                        return server_id, None, exc
+
+                clients_by_server: dict = {}
+                server_name_by_id = {s.id: s.name for s in servers}
+                with ThreadPoolExecutor(max_workers=min(16, len(servers))) as pool:
+                    futures = [pool.submit(_fetch, s.id) for s in servers]
+                    for fut in as_completed(futures):
+                        sid, clients, exc = fut.result()
+                        if exc is not None:
+                            errors.append(f"{server_name_by_id.get(sid, sid)}: {exc}")
+                        else:
+                            clients_by_server[sid] = clients
+
+                for server in servers:
+                    if server.id not in clients_by_server:
                         continue
+                    clients = clients_by_server[server.id]
 
                     # Traffic by email from panel
                     traffic_by_email = {
@@ -758,10 +1084,19 @@ def register_admin_handlers(bot: TeleBot) -> None:
                         for c in clients
                     }
 
-                    # DB keys for this server
+                    # DB keys for this server (all active, for display)
                     db_keys = db.query(Key).filter(
                         Key.server_id == server.id,
                         Key.is_active == True,
+                    ).all()
+
+                    # Keys with non-expired subscriptions (for monthly estimate)
+                    db_keys_active = db.query(Key).join(
+                        Subscription, Key.subscription_id == Subscription.id
+                    ).filter(
+                        Key.server_id == server.id,
+                        Key.is_active == True,
+                        Subscription.expires_at > now,
                     ).all()
 
                     db_count = len(db_keys)
@@ -772,9 +1107,9 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
                     srv_traffic = sum(traffic_by_email.values())
 
-                    # Monthly estimate: per-key traffic / max(age_days, 1) * 30
+                    # Monthly estimate: only keys with active subscriptions
                     srv_monthly = 0
-                    for k in db_keys:
+                    for k in db_keys_active:
                         t = traffic_by_email.get(k.remote_key_id, 0)
                         if t <= 0:
                             continue
@@ -887,8 +1222,24 @@ def register_admin_handlers(bot: TeleBot) -> None:
                         status = "ON" if s.is_active else "OFF"
                         keys_count = len([k for k in s.keys if k.is_active])
 
-                        creds_info = ""
-                        if s.api_credentials:
+                        # Show ServerInbound info if available
+                        si_list = db.query(ServerInbound).filter(
+                            ServerInbound.server_id == s.id,
+                            ServerInbound.is_active == True,
+                        ).all()
+
+                        if si_list:
+                            inbound_parts = []
+                            for si in si_list:
+                                profile = db.query(ConnectionProfile).filter(
+                                    ConnectionProfile.id == si.profile_id
+                                ).first()
+                                pname = profile.name if profile else "?"
+                                inbound_parts.append(
+                                    f"  inbound `{si.inbound_id}`: port `{si.port}` | {pname}"
+                                )
+                            creds_info = "\n".join(inbound_parts)
+                        elif s.api_credentials:
                             try:
                                 creds = json.loads(s.api_credentials)
                                 inbound = creds.get("inbound_id", "?")
@@ -897,16 +1248,18 @@ def register_admin_handlers(bot: TeleBot) -> None:
                                 sni = conn.get("sni", "?")
                                 creds_info = (
                                     f"  inbound: `{inbound}` | "
-                                    f"port: `{port}` | sni: `{sni}`"
+                                    f"port: `{port}` | sni: `{sni}` (legacy)"
                                 )
                             except json.JSONDecodeError:
                                 creds_info = "  credentials: invalid JSON"
+                        else:
+                            creds_info = ""
 
                         lines.append(
                             f"  *{s.id}.* `{s.name}` [{status}]\n"
                             f"  host: `{s.host}`\n"
                             f"{creds_info}\n"
-                            f"  keys: {keys_count}/{s.capacity}"
+                            f"  keys: {keys_count}"
                         )
                     lines.append("")  # blank line between groups
 
@@ -918,6 +1271,545 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         except Exception as e:
             logger.error(f"Error in /servers: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── /profiles ──────────────────────────────────────────────
+    @bot.message_handler(commands=['profiles'])
+    def handle_profiles(message: Message):
+        """List all connection profiles."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            with get_db_session() as db:
+                profiles = db.query(ConnectionProfile).order_by(ConnectionProfile.id).all()
+
+                if not profiles:
+                    bot.send_message(message.chat.id, "No profiles configured. Use /import_profile or /add_profile.")
+                    return
+
+                lines = ["<b>Connection Profiles:</b>\n"]
+                for p in profiles:
+                    status = "ON" if p.is_active else "OFF"
+                    server_count = db.query(ServerInbound).filter(
+                        ServerInbound.profile_id == p.id,
+                        ServerInbound.is_active == True,
+                    ).count()
+                    lines.append(
+                        f"  <b>{p.id}.</b> <code>{p.name}</code> [{status}]\n"
+                        f"  sni: <code>{p.sni}</code> | dest: <code>{p.dest or '-'}</code>\n"
+                        f"  {p.protocol}/{p.security}/{p.network} | flow: <code>{p.flow}</code>\n"
+                        f"  Servers: {server_count}\n"
+                    )
+
+                bot.send_message(message.chat.id, "\n".join(lines), parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"Error in /profiles: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── /add_profile ─────────────────────────────────────────
+    _add_profile_state = {}
+
+    @bot.message_handler(commands=['add_profile'])
+    def handle_add_profile(message: Message):
+        """Create a connection profile manually."""
+        if not is_admin(message.from_user.id):
+            return
+        _add_profile_state[message.chat.id] = {"step": "name"}
+        bot.send_message(
+            message.chat.id,
+            "Enter profile name (e.g. `VLESS Microsoft`):",
+            parse_mode='Markdown',
+            reply_markup=ForceReply(selective=True),
+        )
+
+    @bot.message_handler(
+        func=lambda m: m.chat.id in _add_profile_state
+        and _add_profile_state[m.chat.id]["step"] == "name"
+    )
+    def handle_add_profile_name(message: Message):
+        if not is_admin(message.from_user.id):
+            return
+        state = _add_profile_state[message.chat.id]
+        state["name"] = message.text.strip()
+        state["step"] = "sni"
+        bot.send_message(
+            message.chat.id,
+            "Enter SNI (e.g. `www.microsoft.com`):",
+            parse_mode='Markdown',
+            reply_markup=ForceReply(selective=True),
+        )
+
+    @bot.message_handler(
+        func=lambda m: m.chat.id in _add_profile_state
+        and _add_profile_state[m.chat.id]["step"] == "sni"
+    )
+    def handle_add_profile_sni(message: Message):
+        if not is_admin(message.from_user.id):
+            return
+        state = _add_profile_state.pop(message.chat.id)
+        sni = message.text.strip()
+        dest = f"{sni}:443"
+
+        try:
+            with get_db_session() as db:
+                profile = ConnectionProfile(
+                    name=state["name"],
+                    sni=sni,
+                    dest=dest,
+                )
+                db.add(profile)
+                db.commit()
+                db.refresh(profile)
+
+                bot.send_message(
+                    message.chat.id,
+                    f"Profile created: #{profile.id} `{profile.name}`\n"
+                    f"SNI: `{profile.sni}` | dest: `{profile.dest}`\n\n"
+                    f"Use `/assign_profile <server_id> {profile.id}` to assign to a server.",
+                    parse_mode='Markdown',
+                )
+        except Exception as e:
+            logger.error(f"Error in /add_profile: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── /import_profile (button-based) ──────────────────────
+    @bot.message_handler(commands=['import_profile'])
+    def handle_import_profile(message: Message):
+        """Step 1: show server selection buttons."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            with get_db_session() as db:
+                servers = db.query(Server).filter(
+                    Server.is_active == True,
+                    Server.protocol == 'xui',
+                ).order_by(Server.name).all()
+                server_list = [(s.id, s.name) for s in servers]
+
+            if not server_list:
+                bot.send_message(message.chat.id, "No active XUI servers.")
+                return
+
+            keyboard = InlineKeyboardMarkup()
+            for sid, sname in server_list:
+                keyboard.row(InlineKeyboardButton(sname, callback_data=f"imp_srv_{sid}"))
+            keyboard.row(InlineKeyboardButton("Cancel", callback_data="imp_cancel"))
+
+            bot.send_message(
+                message.chat.id,
+                "<b>Import Profile</b>\n\nSelect server:",
+                parse_mode='HTML',
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.error(f"Error in /import_profile: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('imp_srv_'))
+    def handle_import_profile_server(call: CallbackQuery):
+        """Step 2: connect to panel, show inbound selection buttons."""
+        if not is_admin(call.from_user.id):
+            return
+
+        server_id = int(call.data.replace('imp_srv_', ''))
+        bot.answer_callback_query(call.id)
+
+        try:
+            with get_db_session() as db:
+                server = db.query(Server).filter(Server.id == server_id).first()
+                if not server:
+                    bot.edit_message_text(
+                        f"Server {server_id} not found.",
+                        call.message.chat.id, call.message.id,
+                    )
+                    return
+
+                sname = server.name
+                api_url = server.api_url
+                creds = json.loads(server.api_credentials)
+
+                # IDs of inbounds already imported for this server
+                imported_ids = {
+                    si.inbound_id for si in
+                    db.query(ServerInbound).filter(
+                        ServerInbound.server_id == server_id,
+                    ).all()
+                }
+
+            bot.edit_message_text(
+                f"Connecting to <b>{sname}</b>...",
+                call.message.chat.id, call.message.id,
+                parse_mode='HTML',
+            )
+
+            api = Api(
+                api_url,
+                username=creds["username"],
+                password=creds["password"],
+                use_tls_verify=creds.get("use_tls_verify", True),
+            )
+            api.login()
+            inbounds = api.inbound.get_list()
+
+            # Filter out already-imported inbounds
+            available = [ib for ib in inbounds if ib.id not in imported_ids]
+
+            if not available:
+                bot.edit_message_text(
+                    f"<b>{sname}</b>: all inbounds already imported.",
+                    call.message.chat.id, call.message.id,
+                    parse_mode='HTML',
+                )
+                return
+
+            keyboard = InlineKeyboardMarkup()
+            for ib in available:
+                n_clients = len(ib.settings.clients) if ib.settings and ib.settings.clients else 0
+                remark = ib.remark or ""
+                label = f"#{ib.id} :{ib.port} ({remark}) — {n_clients} clients"
+                keyboard.row(InlineKeyboardButton(
+                    label, callback_data=f"imp_ib_{server_id}_{ib.id}",
+                ))
+            keyboard.row(InlineKeyboardButton("Cancel", callback_data="imp_cancel"))
+
+            bot.edit_message_text(
+                f"<b>Import Profile — {sname}</b>\n\nSelect inbound:",
+                call.message.chat.id, call.message.id,
+                parse_mode='HTML',
+                reply_markup=keyboard,
+            )
+
+        except Exception as e:
+            logger.error(f"Error in import_profile server select: {e}", exc_info=True)
+            bot.edit_message_text(
+                f"Error: {e}",
+                call.message.chat.id, call.message.id,
+            )
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('imp_ib_'))
+    def handle_import_profile_inbound(call: CallbackQuery):
+        """Step 3: import selected inbound as profile."""
+        if not is_admin(call.from_user.id):
+            return
+
+        parts = call.data.replace('imp_ib_', '').split('_')
+        server_id = int(parts[0])
+        target_inbound_id = int(parts[1])
+        bot.answer_callback_query(call.id)
+
+        try:
+            with get_db_session() as db:
+                server = db.query(Server).filter(Server.id == server_id).first()
+                if not server:
+                    bot.edit_message_text(
+                        f"Server {server_id} not found.",
+                        call.message.chat.id, call.message.id,
+                    )
+                    return
+
+                # Double-check not already imported
+                existing_si = db.query(ServerInbound).filter(
+                    ServerInbound.server_id == server_id,
+                    ServerInbound.inbound_id == target_inbound_id,
+                ).first()
+                if existing_si:
+                    bot.edit_message_text(
+                        f"Inbound {target_inbound_id} on {server.name} "
+                        f"already imported as profile #{existing_si.profile_id}.",
+                        call.message.chat.id, call.message.id,
+                    )
+                    return
+
+                bot.edit_message_text(
+                    f"Importing inbound #{target_inbound_id} from <b>{server.name}</b>...",
+                    call.message.chat.id, call.message.id,
+                    parse_mode='HTML',
+                )
+
+                # Connect to panel and find inbound
+                creds = json.loads(server.api_credentials)
+                api = Api(
+                    server.api_url,
+                    username=creds["username"],
+                    password=creds["password"],
+                    use_tls_verify=creds.get("use_tls_verify", True),
+                )
+                api.login()
+                inbounds = api.inbound.get_list()
+
+                target = None
+                for ib in inbounds:
+                    if ib.id == target_inbound_id:
+                        target = ib
+                        break
+
+                if not target:
+                    bot.edit_message_text(
+                        f"Inbound {target_inbound_id} not found on panel.",
+                        call.message.chat.id, call.message.id,
+                    )
+                    return
+
+                # Extract config
+                cfg = _extract_inbound_config(target)
+
+                ss = target.stream_settings
+                reality = getattr(ss, 'reality_settings', None) or {}
+                private_key = reality.get('privateKey', '')
+                dest = reality.get('target', '')
+                server_names = reality.get('serverNames', [])
+
+                # Create or reuse profile
+                profile_name = f"VLESS {cfg['sni']}" if cfg['sni'] else f"VLESS inbound-{target_inbound_id}"
+
+                existing_profile = db.query(ConnectionProfile).filter(
+                    ConnectionProfile.name == profile_name
+                ).first()
+                if existing_profile:
+                    profile = existing_profile
+                else:
+                    profile = ConnectionProfile(
+                        name=profile_name,
+                        protocol=cfg.get('protocol', 'vless'),
+                        security=cfg.get('security', 'reality'),
+                        network='tcp',
+                        flow=cfg.get('flow', 'xtls-rprx-vision'),
+                        fingerprint=cfg.get('fingerprint', 'chrome'),
+                        sni=cfg.get('sni', ''),
+                        dest=dest,
+                    )
+                    db.add(profile)
+                    db.flush()
+
+                si = ServerInbound(
+                    server_id=server.id,
+                    profile_id=profile.id,
+                    inbound_id=target_inbound_id,
+                    port=cfg['port'],
+                    public_key=cfg.get('pbk', ''),
+                    short_id=cfg.get('sid', ''),
+                    private_key=private_key,
+                )
+                db.add(si)
+                db.commit()
+                db.refresh(si)
+                db.refresh(profile)
+
+                info = (
+                    f"<b>Profile imported:</b>\n"
+                    f"  Profile: #{profile.id} <code>{profile.name}</code>\n"
+                    f"  SNI: <code>{profile.sni}</code>\n"
+                    f"  Dest: <code>{dest}</code>\n"
+                    f"  ServerNames: <code>{', '.join(server_names)}</code>\n\n"
+                    f"<b>ServerInbound created:</b>\n"
+                    f"  Server: {server.name} (#{server.id})\n"
+                    f"  Inbound ID: {target_inbound_id}\n"
+                    f"  Port: {cfg['port']}\n"
+                    f"  PBK: <code>{cfg.get('pbk', '')[:20]}...</code>\n"
+                    f"  SID: <code>{cfg.get('sid', '')}</code>\n\n"
+                    f"Use <code>/assign_profile &lt;server_id&gt; {profile.id}</code> "
+                    f"to assign this profile to other servers."
+                )
+                bot.send_message(call.message.chat.id, info, parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"Error in import_profile inbound select: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'imp_cancel')
+    def handle_import_profile_cancel(call: CallbackQuery):
+        """Cancel import profile flow."""
+        bot.answer_callback_query(call.id, "Cancelled")
+        bot.edit_message_text(
+            "Import cancelled.",
+            call.message.chat.id, call.message.id,
+        )
+
+    # ── /assign_profile <server_id> <profile_id> ─────────────
+    @bot.message_handler(commands=['assign_profile'])
+    def handle_assign_profile(message: Message):
+        """Assign a profile to a server — creates a new inbound on the x-ui panel."""
+        if not is_admin(message.from_user.id):
+            return
+
+        parts = message.text.split()
+        if len(parts) < 3:
+            bot.send_message(
+                message.chat.id,
+                "Usage: `/assign_profile <server_id> <profile_id>`",
+                parse_mode='Markdown',
+            )
+            return
+
+        try:
+            server_id = int(parts[1])
+            profile_id = int(parts[2])
+        except ValueError:
+            bot.send_message(message.chat.id, "server_id and profile_id must be integers.")
+            return
+
+        try:
+            with get_db_session() as db:
+                server = db.query(Server).filter(Server.id == server_id).first()
+                if not server:
+                    bot.send_message(message.chat.id, f"Server {server_id} not found.")
+                    return
+
+                profile = db.query(ConnectionProfile).filter(
+                    ConnectionProfile.id == profile_id
+                ).first()
+                if not profile:
+                    bot.send_message(message.chat.id, f"Profile {profile_id} not found.")
+                    return
+
+                # Check if already assigned
+                existing = db.query(ServerInbound).filter(
+                    ServerInbound.server_id == server_id,
+                    ServerInbound.profile_id == profile_id,
+                ).first()
+                if existing:
+                    bot.send_message(
+                        message.chat.id,
+                        f"Profile `{profile.name}` already assigned to `{server.name}`.",
+                        parse_mode='Markdown',
+                    )
+                    return
+
+                bot.send_message(
+                    message.chat.id,
+                    f"Creating inbound on {server.name} with profile {profile.name}...",
+                )
+
+                # Connect to panel
+                creds = json.loads(server.api_credentials)
+                api = Api(
+                    server.api_url,
+                    username=creds["username"],
+                    password=creds["password"],
+                    use_tls_verify=creds.get("use_tls_verify", True),
+                )
+                api.login()
+
+                # Generate keys and create inbound
+                private_key, public_key = _generate_x25519_keys()
+                short_ids = _generate_short_ids()
+                port = random.randint(20000, 60000)
+                dest = profile.dest or f"{profile.sni}:443"
+                sni = profile.sni
+                server_names = [sni]
+                if not sni.startswith("www."):
+                    server_names.append(f"www.{sni}")
+                else:
+                    bare = sni[4:]
+                    server_names.append(bare)
+
+                reality_settings = {
+                    "show": False,
+                    "xver": 0,
+                    "target": dest,
+                    "serverNames": server_names,
+                    "privateKey": private_key,
+                    "minClientVer": "",
+                    "maxClientVer": "",
+                    "maxTimediff": 0,
+                    "shortIds": short_ids,
+                    "settings": {
+                        "publicKey": public_key,
+                        "fingerprint": profile.fingerprint,
+                        "serverName": "",
+                        "spiderX": "/",
+                    }
+                }
+
+                tcp_settings = {
+                    "acceptProxyProtocol": False,
+                    "header": {"type": "none"},
+                }
+
+                stream_settings = StreamSettings(
+                    security=profile.security,
+                    network=profile.network,
+                    tcp_settings=tcp_settings,
+                    reality_settings=reality_settings,
+                )
+
+                sniffing = Sniffing(enabled=True)
+                settings = Settings(decryption="none")
+
+                inbound = Inbound(
+                    enable=True,
+                    port=port,
+                    protocol=profile.protocol,
+                    settings=settings,
+                    stream_settings=stream_settings,
+                    sniffing=sniffing,
+                    remark=f"clavis_{profile.name.lower().replace(' ', '_')}",
+                )
+
+                api.inbound.add(inbound)
+
+                # Re-fetch to get assigned ID
+                all_inbounds = api.inbound.get_list()
+                created = None
+                for ib in all_inbounds:
+                    if ib.port == port and ib.protocol == profile.protocol:
+                        created = ib
+                        break
+
+                if not created:
+                    bot.send_message(message.chat.id, "Inbound created but could not be found on panel.")
+                    return
+
+                # Save ServerInbound
+                si = ServerInbound(
+                    server_id=server.id,
+                    profile_id=profile.id,
+                    inbound_id=created.id,
+                    port=port,
+                    public_key=public_key,
+                    short_id=short_ids[0],
+                    private_key=private_key,
+                )
+                db.add(si)
+                db.commit()
+                db.refresh(si)
+
+                # Check if server has existing subscriptions
+                existing_keys_count = db.query(Key).filter(
+                    Key.server_id == server.id,
+                    Key.is_active == True,
+                ).count()
+
+                result_text = (
+                    f"<b>Inbound created on {server.name}</b>\n"
+                    f"  Profile: {profile.name}\n"
+                    f"  Inbound ID: {created.id}\n"
+                    f"  Port: {port}\n"
+                    f"  SNI: <code>{sni}</code>\n"
+                    f"  PBK: <code>{public_key[:20]}...</code>\n"
+                )
+
+                if existing_keys_count > 0:
+                    result_text += (
+                        f"\nServer has {existing_keys_count} existing keys. "
+                        f"Creating keys for existing subscriptions..."
+                    )
+                    bot.send_message(message.chat.id, result_text, parse_mode='HTML')
+
+                    stats = KeyService.create_keys_for_new_inbound(db, si)
+                    bot.send_message(
+                        message.chat.id,
+                        f"Done: {stats['created']} created, "
+                        f"{stats['skipped']} skipped, {stats['failed']} failed.",
+                    )
+                else:
+                    bot.send_message(message.chat.id, result_text, parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"Error in /assign_profile: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── /add_server (dialog) ─────────────────────────────────
@@ -957,13 +1849,12 @@ def register_admin_handlers(bot: TeleBot) -> None:
         state["name"] = name
         state["step"] = "group"
 
-        # Get existing groups
+        # Get existing groups from ServerGroup table
         try:
             with get_db_session() as db:
-                groups = db.query(Server.server_set).filter(
-                    Server.is_active == True
-                ).distinct().all()
-                existing_groups = sorted(set(g[0] or "default" for g in groups))
+                existing_groups = sorted(
+                    g.name for g in db.query(ServerGroup).all()
+                )
         except Exception:
             existing_groups = []
 
@@ -1038,6 +1929,14 @@ def register_admin_handlers(bot: TeleBot) -> None:
         state = _add_server_state[message.chat.id]
         state["group"] = group_name
         state["step"] = "domain"
+
+        # Also persist new group to ServerGroup table
+        try:
+            with get_db_session() as db:
+                if not db.query(ServerGroup).filter(ServerGroup.name == group_name).first():
+                    db.add(ServerGroup(name=group_name))
+        except Exception:
+            pass  # non-critical, group will still work via server_set
 
         msg = bot.send_message(
             message.chat.id,
@@ -1131,7 +2030,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
     @bot.callback_query_handler(func=lambda call: call.data == 'create_inbound')
     def handle_create_inbound(call: CallbackQuery):
-        """Create a VLESS Reality inbound on the panel and save server."""
+        """Show profile selection buttons for the new inbound."""
         if not is_admin(call.from_user.id):
             return
 
@@ -1141,37 +2040,88 @@ def register_admin_handlers(bot: TeleBot) -> None:
             return
 
         bot.answer_callback_query(call.id)
+
+        try:
+            with get_db_session() as db:
+                profiles = db.query(ConnectionProfile).filter(
+                    ConnectionProfile.is_active == True
+                ).order_by(ConnectionProfile.name).all()
+                profile_list = [(p.id, p.name) for p in profiles]
+
+            if not profile_list:
+                bot.edit_message_text(
+                    "No active connection profiles found. Create one first with /add_profile.",
+                    call.message.chat.id, call.message.id
+                )
+                _add_server_state.pop(call.message.chat.id, None)
+                return
+
+            state["step"] = "select_profile"
+            kb = InlineKeyboardMarkup()
+            for pid, pname in profile_list:
+                kb.add(InlineKeyboardButton(pname, callback_data=f"add_srv_profile_{pid}"))
+            kb.add(InlineKeyboardButton("Cancel", callback_data="add_srv_cancel"))
+
+            bot.edit_message_text(
+                "Select connection profile for the new inbound:",
+                call.message.chat.id, call.message.id,
+                reply_markup=kb
+            )
+        except Exception as e:
+            logger.error(f"Error showing profile list: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: `{e}`", parse_mode='Markdown')
+            _add_server_state.pop(call.message.chat.id, None)
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('add_srv_profile_'))
+    def handle_add_srv_profile(call: CallbackQuery):
+        """Create inbound with selected profile and save Server + ServerInbound."""
+        if not is_admin(call.from_user.id):
+            return
+
+        state = _add_server_state.get(call.message.chat.id)
+        if not state or state.get("step") != "select_profile":
+            bot.answer_callback_query(call.id, "Session expired. Run /add_server again.")
+            return
+
+        try:
+            profile_id = int(call.data.split('_')[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id, "Invalid profile.")
+            return
+
+        bot.answer_callback_query(call.id)
         bot.edit_message_text(
-            "Creating VLESS Reality inbound...",
-            call.message.chat.id,
-            call.message.id
+            "Creating inbound with selected profile...",
+            call.message.chat.id, call.message.id
         )
 
         try:
-            api_url = state["api_url"]
-            api = Api(api_url, username=XUI_USERNAME, password=XUI_PASSWORD, use_tls_verify=True)
-            api.login()
-
-            cfg = _create_vless_reality_inbound(api, remark=state["name"])
-
-            # Save server to DB
-            credentials = {
-                "username": XUI_USERNAME,
-                "password": XUI_PASSWORD,
-                "inbound_id": cfg["inbound_id"],
-                "use_tls_verify": True,
-                "connection_settings": {
-                    "port": cfg["port"],
-                    "sni": cfg["sni"],
-                    "pbk": cfg["pbk"],
-                    "sid": cfg["sid"],
-                    "flow": cfg["flow"],
-                    "fingerprint": cfg["fingerprint"],
-                }
-            }
-
-            group = state.get("group", "default")
             with get_db_session() as db:
+                profile = db.query(ConnectionProfile).filter(
+                    ConnectionProfile.id == profile_id,
+                    ConnectionProfile.is_active == True,
+                ).first()
+                if not profile:
+                    bot.send_message(call.message.chat.id, "Profile not found.")
+                    _add_server_state.pop(call.message.chat.id, None)
+                    return
+
+                profile_name = profile.name
+                profile_sni = profile.sni
+
+                # Connect to panel and create inbound
+                api = Api(state["api_url"], username=XUI_USERNAME, password=XUI_PASSWORD, use_tls_verify=True)
+                api.login()
+
+                cfg = _create_inbound_with_profile(api, profile, remark=state["name"])
+
+                # Save Server
+                credentials = {
+                    "username": XUI_USERNAME,
+                    "password": XUI_PASSWORD,
+                    "use_tls_verify": True,
+                }
+                group = state.get("group", "default")
                 server = Server(
                     name=state["name"],
                     host=state["domain"],
@@ -1184,26 +2134,166 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 )
                 db.add(server)
                 db.flush()
-                server_id = server.id
 
-            bot.send_message(
-                call.message.chat.id,
+                # Save ServerInbound
+                si = ServerInbound(
+                    server_id=server.id,
+                    profile_id=profile.id,
+                    inbound_id=cfg["inbound_id"],
+                    port=cfg["port"],
+                    public_key=cfg["public_key"],
+                    short_id=cfg["short_id"],
+                    private_key=cfg["private_key"],
+                )
+                db.add(si)
+                db.commit()
+                db.refresh(server)
+                db.refresh(si)
+                server_id = server.id
+                si_id = si.id
+
+            # Setup domain blocking
+            domain_block_msg = ""
+            try:
+                from vpn.xui_client import XUIClient
+                with get_db_session() as db:
+                    srv = db.query(Server).get(server_id)
+                    srv_si = db.query(ServerInbound).get(si_id)
+                    xui = XUIClient(srv, server_inbound=srv_si)
+                    block_result = xui.setup_domain_blocking()
+                    parts = []
+                    if block_result["routing_updated"]:
+                        parts.append("routing OK")
+                    if block_result["sniffing_updated"]:
+                        parts.append("sniffing OK")
+                    if block_result["errors"]:
+                        parts.append(f"errors: {block_result['errors']}")
+                    domain_block_msg = f"\nDomain blocking: {', '.join(parts) if parts else 'no changes'}"
+            except Exception as e:
+                domain_block_msg = f"\nDomain blocking setup failed: {e}"
+                logger.error(f"Domain blocking setup failed for {state['name']}: {e}")
+
+            # Recalculate server scores
+            scores_msg = ""
+            try:
+                with get_db_session() as db:
+                    preferred = KeyService.recalculate_server_scores(db)
+                scores_msg = f"\nServer scores recalculated, preferred: {len(preferred)}"
+            except Exception as e:
+                scores_msg = f"\nScore recalc failed: {e}"
+                logger.error(f"Score recalc after add_server failed: {e}")
+
+            success_text = (
                 f"*Server added successfully!*\n\n"
                 f"ID: `{server_id}`\n"
                 f"Name: `{state['name']}`\n"
                 f"Group: `{group}`\n"
                 f"Domain: `{state['domain']}`\n"
-                f"Inbound: `{cfg['inbound_id']}` (newly created)\n\n"
-                f"*Connection settings:*\n"
-                f"{_format_inbound_info(cfg)}",
-                parse_mode='Markdown'
+                f"Profile: `{profile_name}` (SNI: `{profile_sni}`)\n"
+                f"Inbound ID: `{cfg['inbound_id']}`\n"
+                f"Port: `{cfg['port']}`\n"
+                f"PBK: `{cfg['public_key'][:24]}...`"
+                f"{domain_block_msg}"
+                f"{scores_msg}"
             )
+            try:
+                bot.send_message(call.message.chat.id, success_text, parse_mode='Markdown')
+            except Exception as send_err:
+                logger.error(f"Failed to send success message with Markdown: {send_err}")
+                # Fallback: send without markdown so user always gets the result
+                try:
+                    bot.send_message(
+                        call.message.chat.id,
+                        success_text.replace('*', '').replace('`', ''),
+                        parse_mode="",
+                    )
+                except Exception as send_err2:
+                    logger.error(f"Failed to send plain success message: {send_err2}")
 
         except Exception as e:
             logger.error(f"Error creating inbound: {e}", exc_info=True)
-            bot.send_message(call.message.chat.id, f"Error creating inbound: `{e}`", parse_mode='Markdown')
+            try:
+                bot.send_message(
+                    call.message.chat.id,
+                    f"Error creating inbound: {e}",
+                    parse_mode="",
+                )
+            except Exception as send_err:
+                logger.error(f"Failed to send error message: {send_err}")
 
         _add_server_state.pop(call.message.chat.id, None)
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'add_srv_cancel')
+    def handle_add_srv_cancel(call: CallbackQuery):
+        """Cancel /add_server at profile selection step."""
+        if not is_admin(call.from_user.id):
+            return
+        _add_server_state.pop(call.message.chat.id, None)
+        bot.edit_message_text("Cancelled.", call.message.chat.id, call.message.id)
+        bot.answer_callback_query(call.id)
+
+    # ── /add_group ────────────────────────────────────────────
+    _add_group_state: dict = {}  # chat_id -> {"step": "name", "prompt_id": int}
+
+    @bot.message_handler(commands=['add_group'])
+    def handle_add_group(message: Message):
+        """Start add group dialog."""
+        if not is_admin(message.from_user.id):
+            return
+
+        msg = bot.send_message(
+            message.chat.id,
+            "Введите название новой группы серверов\n"
+            "(например `Germany`, `Netherlands`):",
+            parse_mode='Markdown',
+            reply_markup=ForceReply(selective=True),
+        )
+        _add_group_state[message.chat.id] = {"step": "name", "prompt_id": msg.id}
+
+    @bot.message_handler(
+        func=lambda m: (
+            m.chat.id in _add_group_state
+            and _add_group_state[m.chat.id].get("step") == "name"
+            and m.reply_to_message is not None
+        )
+    )
+    def handle_add_group_name(message: Message):
+        """Got group name, save to DB."""
+        if not is_admin(message.from_user.id):
+            return
+
+        _add_group_state.pop(message.chat.id, None)
+        group_name = message.text.strip()
+
+        if not group_name or len(group_name) > 50:
+            bot.send_message(message.chat.id, "Название должно быть от 1 до 50 символов.")
+            return
+
+        try:
+            with get_db_session() as db:
+                existing = db.query(ServerGroup).filter(ServerGroup.name == group_name).first()
+                if existing:
+                    bot.send_message(
+                        message.chat.id,
+                        f"Группа `{group_name}` уже существует (id={existing.id}).",
+                        parse_mode='Markdown',
+                    )
+                    return
+
+                sg = ServerGroup(name=group_name)
+                db.add(sg)
+                db.flush()
+                sg_id = sg.id
+
+            bot.send_message(
+                message.chat.id,
+                f"Группа `{group_name}` создана (id={sg_id}).\n"
+                f"Теперь её можно выбрать при /add\\_server.",
+                parse_mode='Markdown',
+            )
+        except Exception as e:
+            logger.error(f"Error creating group: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Ошибка: {e}")
 
     # ── /groups ───────────────────────────────────────────────
     @bot.message_handler(commands=['groups'])
@@ -1214,19 +2304,24 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         try:
             with get_db_session() as db:
-                servers = db.query(Server).all()
-                if not servers:
-                    bot.send_message(message.chat.id, "No servers configured.")
-                    return
-
                 from collections import defaultdict as _defaultdict
                 groups: dict = _defaultdict(lambda: {"servers": 0, "active": 0, "keys": 0})
+
+                # Include all registered groups (even empty ones)
+                for sg in db.query(ServerGroup).all():
+                    _ = groups[sg.name]  # ensure entry exists
+
+                servers = db.query(Server).all()
                 for s in servers:
                     g = groups[s.server_set or "default"]
                     g["servers"] += 1
                     if s.is_active:
                         g["active"] += 1
                     g["keys"] += len([k for k in s.keys if k.is_active])
+
+                if not groups:
+                    bot.send_message(message.chat.id, "No groups configured.")
+                    return
 
                 lines = ["*Server Groups:*\n"]
                 for name in sorted(groups.keys()):
@@ -1373,6 +2468,21 @@ def register_admin_handlers(bot: TeleBot) -> None:
             except Exception as e:
                 logger.warning(f"Failed to recalculate scores after group activation: {e}")
 
+            # Invalidate subscription caches so new keys appear immediately
+            if stats['created'] > 0:
+                try:
+                    from subscription.cache import invalidate_subscription_cache
+                    with get_db_session() as db:
+                        tokens = db.query(Subscription.token).filter(
+                            Subscription.is_active == True,
+                            Subscription.token.isnot(None),
+                        ).all()
+                        for (token,) in tokens:
+                            invalidate_subscription_cache(token)
+                    logger.info(f"Invalidated {len(tokens)} subscription caches after group activation")
+                except Exception as e:
+                    logger.warning(f"Failed to invalidate caches after group activation: {e}")
+
             bot.send_message(
                 call.message.chat.id,
                 f"*Group `{group_name}` activated!*\n\n"
@@ -1457,7 +2567,11 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     return
 
                 from vpn.xui_client import XUIClient
-                client = XUIClient(server)
+                si = db.query(ServerInbound).filter(
+                    ServerInbound.server_id == server.id,
+                    ServerInbound.is_active == True,
+                ).first()
+                client = XUIClient(server, server_inbound=si)
                 health = client.health_check()
 
                 if health.is_healthy:
@@ -1736,13 +2850,12 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     Key.subscription_id == sub.id
                 ).all()
 
-                from vpn.xui_client import XUIClient
                 for key in all_keys:
                     if key.server_id:
                         server = db.query(Server).filter(Server.id == key.server_id).first()
                         if server:
                             try:
-                                client = XUIClient(server)
+                                client = KeyService._make_xui_client(db, server, key)
                                 client.delete_key(key)
                             except Exception as e:
                                 logger.warning(f"Failed to delete key {key.remote_key_id} from server: {e}")
@@ -1839,7 +2952,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── Grant subscription callback (starts dialog) ───────────
-    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_grantsub_'))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_grantsub_') and not call.data.startswith('mu_grantsub_confirm_') and not call.data.startswith('mu_grantsub_cancel_'))
     def handle_mu_grantsub(call: CallbackQuery):
         """Start dialog to grant a paid subscription."""
         if not is_admin(call.from_user.id):
@@ -1857,7 +2970,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
         bot.register_next_step_handler(msg, _process_grant_subscription, tg_id)
 
     def _process_grant_subscription(message: Message, tg_id: int):
-        """Process the date input and create subscription."""
+        """Process the date input and create/replace subscription."""
         if not is_admin(message.from_user.id):
             return
 
@@ -1884,26 +2997,31 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 ).first()
 
                 if existing:
+                    # Store intent and ask for confirmation
+                    sub_type = "тестовая" if existing.is_test else "платная"
+                    _manage_user_state[message.chat.id] = {
+                        "step": "confirm_grant",
+                        "telegram_id": tg_id,
+                        "expires_at": expires_at,
+                        "existing_sub_id": existing.id,
+                    }
+                    kb = InlineKeyboardMarkup()
+                    kb.row(
+                        InlineKeyboardButton("✅ Заменить", callback_data=f"mu_grantsub_confirm_{tg_id}"),
+                        InlineKeyboardButton("❌ Отмена", callback_data=f"mu_grantsub_cancel_{tg_id}"),
+                    )
                     bot.send_message(
                         message.chat.id,
-                        f"User already has active subscription (id={existing.id}, "
-                        f"expires {format_msk(existing.expires_at)}). "
-                        f"Use *Adjust time* instead.",
+                        f"⚠️ У пользователя уже есть активная {sub_type} подписка "
+                        f"(id={existing.id}, истекает {format_msk(existing.expires_at)}).\n\n"
+                        f"Заменить на новую до *{expires_at.strftime('%d.%m.%Y')}*?\n"
+                        f"Старые ключи проработают ещё 24ч, будут созданы новые.",
                         parse_mode='Markdown',
+                        reply_markup=kb,
                     )
                     return
 
-                sub = Subscription(
-                    user_id=user.id,
-                    name="Main",
-                    token=str(uuid.uuid4()),
-                    expires_at=expires_at,
-                    is_test=False,
-                    is_active=True,
-                )
-                db.add(sub)
-                log_activity(db, tg_id, "admin_grant_sub", f"до {format_msk(expires_at)}")
-                db.flush()
+                _do_grant_subscription(db, tg_id, user, expires_at=expires_at, existing_sub=None)
 
                 text, _ = _format_user_info(db, tg_id)
                 bot.send_message(
@@ -1916,6 +3034,120 @@ def register_admin_handlers(bot: TeleBot) -> None:
         except Exception as e:
             logger.error(f"Error granting subscription: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}")
+
+    def _do_grant_subscription(db, tg_id: int, user, expires_at: datetime, existing_sub):
+        """Create new or replace existing subscription.
+
+        On replace: old keys get 24h expiry on x-ui so they keep working for
+        one more day (user stays connected via Telegram VPN).  New keys are
+        created on fresh servers.  Both old and new keys appear in the
+        subscription URL; old ones expire naturally after 24 hours.
+        """
+        from subscription.cache import invalidate_subscription_cache
+
+        if existing_sub is not None:
+            # ── 1. Set old keys' x-ui expiry to +24h ──
+            old_keys = db.query(Key).filter(
+                Key.subscription_id == existing_sub.id,
+                Key.server_id.isnot(None),
+                Key.is_active == True,
+            ).all()
+
+            grace_expiry_ms = int(
+                (datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(days=1)).timestamp() * 1000
+            )
+            for key in old_keys:
+                try:
+                    server = db.query(Server).filter(Server.id == key.server_id).first()
+                    if server and server.is_active:
+                        client = KeyService._make_xui_client(db, server, key)
+                        client.update_key_expiry(key, grace_expiry_ms)
+                except Exception as e:
+                    logger.warning(f"Failed to set 24h grace on key {key.remote_key_id}: {e}")
+
+            # ── 2. Temporarily deactivate old keys so server selection
+            #        picks fresh servers for new keys ──
+            for key in old_keys:
+                key.is_active = False
+            db.flush()
+
+            # ── 3. Update subscription ──
+            existing_sub.expires_at = expires_at
+            existing_sub.is_test = False
+            existing_sub.is_active = True
+            existing_sub.reminder_7d_sent = False
+            existing_sub.reminder_3d_sent = False
+            existing_sub.reminder_1d_sent = False
+            existing_sub.expiry_notified = False
+            db.flush()
+
+            # ── 4. Create new keys on all groups ──
+            try:
+                KeyService.create_subscription_keys(db, existing_sub, tg_id)
+            except Exception as e:
+                logger.error(f"Failed to create new keys during grant replace: {e}")
+
+            # ── 5. Reactivate old keys — they stay in subscription URL
+            #        for 24h until x-ui expiry kicks in ──
+            for key in old_keys:
+                key.is_active = True
+
+            invalidate_subscription_cache(existing_sub.token)
+        else:
+            sub = Subscription(
+                user_id=user.id,
+                name="Main",
+                token=str(uuid.uuid4()),
+                expires_at=expires_at,
+                is_test=False,
+                is_active=True,
+            )
+            db.add(sub)
+            db.flush()
+        log_activity(db, tg_id, "admin_grant_sub", f"до {format_msk(expires_at)}")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_grantsub_confirm_'))
+    def handle_mu_grantsub_confirm(call: CallbackQuery):
+        """Confirm replacing existing subscription with admin grant."""
+        if not is_admin(call.from_user.id):
+            return
+        bot.answer_callback_query(call.id)
+        tg_id = int(call.data.replace('mu_grantsub_confirm_', ''))
+        state = _manage_user_state.pop(call.message.chat.id, None)
+        if not state or state.get("step") != "confirm_grant" or state.get("telegram_id") != tg_id:
+            bot.edit_message_text("Сессия истекла, повторите команду.", call.message.chat.id, call.message.id)
+            return
+        expires_at = state["expires_at"]
+        existing_sub_id = state["existing_sub_id"]
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == tg_id).first()
+                if not user:
+                    bot.edit_message_text("User not found.", call.message.chat.id, call.message.id)
+                    return
+                existing_sub = db.query(Subscription).filter(Subscription.id == existing_sub_id).first()
+                _do_grant_subscription(db, tg_id, user, expires_at=expires_at, existing_sub=existing_sub)
+                text, _ = _format_user_info(db, tg_id)
+                bot.edit_message_text(
+                    text + f"\n\n_Subscription granted until {format_msk(expires_at)}_",
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=_manage_user_keyboard(tg_id),
+                    parse_mode='Markdown',
+                )
+        except Exception as e:
+            logger.error(f"Error confirming grant subscription: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: {e}", parse_mode="")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_grantsub_cancel_'))
+    def handle_mu_grantsub_cancel(call: CallbackQuery):
+        """Cancel grant subscription replacement."""
+        if not is_admin(call.from_user.id):
+            return
+        bot.answer_callback_query(call.id)
+        tg_id = int(call.data.replace('mu_grantsub_cancel_', ''))
+        _manage_user_state.pop(call.message.chat.id, None)
+        bot.edit_message_text("Отменено.", call.message.chat.id, call.message.id)
 
     # ── Reset test period callback ────────────────────────────
     @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_resettest_'))
@@ -1996,8 +3228,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 # Delete keys from x-ui panels
                 for key in keys:
                     try:
-                        from vpn.xui_client import XUIClient
-                        client = XUIClient(key.server)
+                        client = KeyService._make_xui_client(db, key.server, key)
                         client.delete_key(key)
                         deleted_from_xui += 1
                         logger.info(f"Deleted key {key.remote_key_id} from server {key.server.name}")
@@ -2347,5 +3578,323 @@ You can now start testing from scratch with /start"""
         except Exception as e:
             logger.error(f"Error sending backup: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Backup error: {e}")
+
+    # ── /monitor_status ──────────────────────────────────────
+    @bot.message_handler(commands=['monitor_status'])
+    def handle_monitor_status(message: Message):
+        """Show current server monitoring state."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            state_file = Path(__file__).parent.parent.parent / "data" / "monitor_state.json"
+            state = {}
+            if state_file.exists():
+                raw = json.loads(state_file.read_text(encoding="utf-8"))
+                state = {int(k): v for k, v in raw.items()}
+
+            with get_db_session() as db:
+                servers = db.query(Server).filter(
+                    Server.is_active == True,
+                    Server.protocol == 'xui',
+                ).order_by(Server.name).all()
+                # Extract data inside session to avoid DetachedInstanceError
+                server_info = [(srv.id, srv.name) for srv in servers]
+
+            if not server_info:
+                bot.send_message(message.chat.id, "No active servers.")
+                return
+
+            now = datetime.utcnow()
+            lines = ["<b>Monitor Status</b>\n"]
+
+            for sid, sname in server_info:
+                s = state.get(sid, {})
+                is_up = s.get("is_up", True)
+                status_icon = "OK" if is_up else "DOWN"
+                failures = s.get("consecutive_failures", 0)
+
+                last_up_raw = s.get("last_seen_up")
+                last_up_str = ""
+                if last_up_raw:
+                    try:
+                        delta = now - datetime.fromisoformat(last_up_raw)
+                        mins = int(delta.total_seconds() / 60)
+                        if mins < 60:
+                            last_up_str = f" ({mins}m ago)"
+                        else:
+                            last_up_str = f" ({mins // 60}h {mins % 60}m ago)"
+                    except Exception:
+                        pass
+
+                traffic_str = ""
+                traffic_bytes = s.get("last_traffic_bytes")
+                if traffic_bytes is not None:
+                    traffic_gb = traffic_bytes / (1024 ** 3)
+                    traffic_str = f" | {traffic_gb:.1f} GB"
+
+                stale_str = ""
+                stale_raw = s.get("stale_traffic_alerted_at")
+                if stale_raw:
+                    try:
+                        delta = now - datetime.fromisoformat(stale_raw)
+                        mins = int(delta.total_seconds() / 60)
+                        stale_str = f" | stale {mins}m ago"
+                    except Exception:
+                        pass
+
+                mute_str = ""
+                muted_until_raw = s.get("muted_until")
+                if muted_until_raw:
+                    try:
+                        muted_until = datetime.fromisoformat(muted_until_raw)
+                        if muted_until > now:
+                            mins_left = int((muted_until - now).total_seconds() / 60)
+                            mute_str = f" | 🔇 {mins_left}m"
+                    except Exception:
+                        pass
+
+                fail_str = f" | fails: {failures}" if failures > 0 else ""
+                lines.append(
+                    f"<b>{sname}</b>: <code>{status_icon}</code>"
+                    f"{last_up_str}{fail_str}{traffic_str}{stale_str}{mute_str}"
+                )
+
+            bot.send_message(message.chat.id, "\n".join(lines), parse_mode='HTML')
+
+        except Exception as e:
+            logger.error(f"Error in /monitor_status: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    # ── Mute server alerts ────────────────────────────────────
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mute_srv_'))
+    def handle_mute_server(call: CallbackQuery):
+        """Mute monitoring alerts for a server for 6 hours."""
+        if not is_admin(call.from_user.id):
+            return
+
+        server_id = int(call.data.replace('mute_srv_', ''))
+        bot.answer_callback_query(call.id, "Заглушено на 6 часов")
+
+        try:
+            from main import mute_server_alerts
+            mute_server_alerts(server_id, hours=6)
+
+            with get_db_session() as db:
+                server = db.query(Server).filter(Server.id == server_id).first()
+                sname = server.name if server else f"#{server_id}"
+
+            # Edit the alert message to show it's muted
+            original_text = call.message.html_text or call.message.text or ""
+            bot.edit_message_text(
+                original_text + f"\n\n<i>Оповещения заглушены на 6 часов.</i>",
+                call.message.chat.id,
+                call.message.id,
+                parse_mode='HTML',
+            )
+        except Exception as e:
+            logger.error(f"Error muting server {server_id}: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: {e}")
+
+    # ── /sub_graph ─────────────────────────────────────────────
+    @bot.message_handler(commands=['sub_graph'])
+    def handle_sub_graph(message: Message):
+        """Generate subscription growth chart since launch."""
+        if not is_admin(message.from_user.id):
+            return
+
+        try:
+            import io
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            import matplotlib.dates as mdates
+
+            launch_date = datetime(2026, 2, 20).date()
+            MSK_OFFSET = timedelta(hours=3)
+            today = (datetime.utcnow() + MSK_OFFSET).date()
+
+            with get_db_session() as db:
+                subs = db.query(
+                    Subscription.created_at,
+                    Subscription.expires_at,
+                    Subscription.is_test,
+                    Subscription.user_id,
+                    Subscription.plan_type,
+                ).all()
+
+                users = db.query(User.created_at).all()
+
+            # First paid sub date per user (for "new paid per day")
+            # Store UTC datetime; compare against MSK day boundaries (UTC - 3h)
+            first_paid_date: dict[int, datetime] = {}
+            for created_at, expires_at, is_test, user_id, plan_type in subs:
+                if not created_at or is_test or (plan_type or 'basic') == 'free':
+                    continue
+                prev = first_paid_date.get(user_id)
+                if prev is None or created_at < prev:
+                    first_paid_date[user_id] = created_at
+
+            # Build daily series using MSK day boundaries (stored as UTC)
+            # MSK day d = UTC [d 00:00 - 3h, d 23:59:59 - 3h]
+            dates = []
+            active_series = []
+            paid_series = []
+            test_series = []
+            invite_series = []
+            test_invite_series = []
+            new_users_series = []
+            new_paid_series = []
+
+            d = launch_date
+            while d <= today:
+                # MSK day boundaries expressed in UTC
+                dt_start = datetime(d.year, d.month, d.day, 0, 0, 0) - MSK_OFFSET
+                dt_end   = datetime(d.year, d.month, d.day, 23, 59, 59) - MSK_OFFSET
+
+                active = 0
+                paid = 0
+                test = 0
+                invite = 0
+
+                for created_at, expires_at, is_test, user_id, plan_type in subs:
+                    if not created_at or not expires_at:
+                        continue
+                    if created_at <= dt_end and expires_at > dt_start:
+                        active += 1
+                        if is_test:
+                            test += 1
+                        elif (plan_type or 'basic') == 'free' and created_at >= datetime(2026, 3, 21) - MSK_OFFSET:
+                            invite += 1
+                        else:
+                            paid += 1
+
+                # New users (/start) per day (MSK boundaries)
+                new_users = sum(
+                    1 for (ca,) in users
+                    if ca and dt_start <= ca <= dt_end
+                )
+
+                # New paid users per day (first paid sub on this MSK day)
+                new_paid = sum(
+                    1 for fp in first_paid_date.values()
+                    if dt_start <= fp <= dt_end
+                )
+
+                dates.append(d)
+                active_series.append(active)
+                paid_series.append(paid)
+                test_series.append(test)
+                invite_series.append(invite)
+                test_invite_series.append(test + invite)
+                new_users_series.append(new_users)
+                new_paid_series.append(new_paid)
+
+                d += timedelta(days=1)
+
+            # Plot
+            fig, ax1 = plt.subplots(figsize=(12, 7))
+
+            color_active = '#2196F3'
+            color_paid = '#4CAF50'
+            color_test = '#FF9800'
+            color_invite = '#00BCD4'
+            color_test_invite = '#7C4DFF'
+            color_new_users = '#9C27B0'
+            color_new_paid = '#E91E63'
+
+            ax1.plot(dates, active_series, color=color_active, linewidth=2, label='Активные подписки')
+            ax1.plot(dates, paid_series, color=color_paid, linewidth=2, label='Платные подписки')
+            ax1.set_ylabel('Активные / Платные', color=color_active)
+            ax1.tick_params(axis='y', labelcolor=color_active)
+
+            ax2 = ax1.twinx()
+            ax2.plot(dates, test_series, color=color_test, linewidth=1.5, linestyle='--', label='Тестовые подписки')
+            ax2.plot(dates, invite_series, color=color_invite, linewidth=1.5, linestyle='--', label='Инвайт-подписки')
+            ax2.plot(dates, test_invite_series, color=color_test_invite, linewidth=1.5, linestyle=':', label='Тест + Инвайт')
+            ax2.bar(dates, new_users_series, color=color_new_users, alpha=0.3, width=0.8, label='Новые юзеры/день')
+            ax2.bar(dates, new_paid_series, color=color_new_paid, alpha=0.5, width=0.4, label='Новые платные/день')
+            ax2.set_ylabel('Тестовые / Инвайты / Новые за день', color=color_test)
+            ax2.tick_params(axis='y', labelcolor=color_test)
+
+            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d.%m'))
+            from matplotlib.ticker import MaxNLocator
+            ax1.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
+            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+            ax1.set_title('Подписки с 20.02')
+            ax1.grid(True, alpha=0.3)
+
+            # Combined legend
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=9)
+
+            fig.tight_layout()
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=120)
+            buf.seek(0)
+            buf.name = 'sub_graph.png'
+            plt.close(fig)
+
+            bot.send_photo(message.chat.id, buf)
+
+        except Exception as e:
+            logger.error(f"Error in /sub_graph: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    @bot.message_handler(commands=['invite_stat'])
+    def handle_invite_stat(message: Message):
+        """Show top users by invite activity (created + used)."""
+        if not is_admin(message.from_user.id):
+            return
+
+        # Parse optional N argument
+        limit = 25
+        parts = message.text.strip().split()
+        if len(parts) > 1:
+            try:
+                limit = max(1, int(parts[1]))
+            except ValueError:
+                bot.send_message(message.chat.id, "Использование: /invite_stat [N]")
+                return
+
+        try:
+            with get_db_session() as db:
+                rows = db.query(
+                    User.id,
+                    User.telegram_id,
+                    User.username,
+                    func.count(ReferralInvite.id).label("created"),
+                    func.sum(
+                        func.cast(ReferralInvite.activated_at.isnot(None), Integer)
+                    ).label("used"),
+                ).outerjoin(
+                    ReferralInvite, ReferralInvite.inviter_id == User.id
+                ).group_by(User.id).having(
+                    func.count(ReferralInvite.id) > 0
+                ).order_by(
+                    func.count(ReferralInvite.id).desc(),
+                    func.sum(
+                        func.cast(ReferralInvite.activated_at.isnot(None), Integer)
+                    ).desc(),
+                ).limit(limit).all()
+
+            if not rows:
+                bot.send_message(message.chat.id, "Инвайты ещё не создавались.", parse_mode="")
+                return
+
+            lines = [f"Топ {min(limit, len(rows))} по инвайтам:\n"]
+            for i, row in enumerate(rows, 1):
+                name = f"@{row.username}" if row.username else f"id{row.telegram_id}"
+                used = row.used or 0
+                lines.append(f"{i}. {name} — создано: {row.created}, использовано: {used}")
+
+            bot.send_message(message.chat.id, "\n".join(lines), parse_mode="")
+
+        except Exception as e:
+            logger.error(f"Error in /invite_stat: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}", parse_mode="")
 
     logger.info("Admin handlers registered")

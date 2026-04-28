@@ -3,10 +3,11 @@
 import json
 import logging
 import uuid as uuid_lib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from py3xui import Api, Client
+from py3xui.inbound.sniffing import Sniffing
 
 from database import Key, Server, Subscription
 
@@ -38,21 +39,39 @@ class XUIClient:
         key = client.create_key(subscription, telegram_id=123456)
     """
 
-    def __init__(self, server: Server):
+    def __init__(self, server: Server, server_inbound=None):
         """Initialize the XUI client.
 
         Args:
             server: Server model with api_url and api_credentials
+            server_inbound: Optional ServerInbound for multi-inbound mode.
+                            If provided, uses its inbound_id/port/pbk/sid + profile settings.
+                            If None, falls back to legacy api_credentials.
 
         Raises:
             XUIError: If credentials are invalid or missing
         """
         self.server = server
+        self._server_inbound = server_inbound
         self._api: Optional[Api] = None
         self._credentials = self._parse_credentials()
-        self._connection_settings = ConnectionSettings.from_dict(
-            self._credentials.get("connection_settings", {})
-        )
+
+        if server_inbound:
+            profile = server_inbound.profile
+            self._connection_settings = ConnectionSettings(
+                port=server_inbound.port,
+                sni=profile.sni,
+                public_key=server_inbound.public_key,
+                short_id=server_inbound.short_id,
+                flow=profile.flow,
+                fingerprint=profile.fingerprint,
+                security=profile.security,
+                network=profile.network,
+            )
+        else:
+            self._connection_settings = ConnectionSettings.from_dict(
+                self._credentials.get("connection_settings", {})
+            )
 
     def _parse_credentials(self) -> dict:
         """Parse and validate server credentials."""
@@ -64,7 +83,9 @@ class XUIClient:
         except json.JSONDecodeError as e:
             raise XUIError(f"Invalid credentials JSON: {e}")
 
-        required = ["username", "password", "inbound_id"]
+        required = ["username", "password"]
+        if self._server_inbound is None:
+            required.append("inbound_id")
         missing = [k for k in required if k not in creds]
         if missing:
             raise XUIError(f"Missing required credentials: {', '.join(missing)}")
@@ -113,29 +134,36 @@ class XUIClient:
             self._api = None
             self._connect()
 
-    def _generate_email(self, telegram_id: int, subscription_id: int) -> str:
+    def _generate_email(self, client_id, subscription_id: int) -> str:
         """Generate unique email identifier for a client.
 
-        Format: clavis_{telegram_id}_{subscription_id}_s{server_id}
+        Format with ServerInbound: clavis_{client_id}_{subscription_id}_si{server_inbound_id}
+        Legacy format: clavis_{client_id}_{subscription_id}_s{server_id}
         """
-        return f"clavis_{telegram_id}_{subscription_id}_s{self.server.id}"
+        if self._server_inbound:
+            return f"clavis_{client_id}_{subscription_id}_si{self._server_inbound.id}"
+        return f"clavis_{client_id}_{subscription_id}_s{self.server.id}"
 
     def _get_inbound_id(self) -> int:
         """Get the configured inbound ID."""
+        if self._server_inbound:
+            return self._server_inbound.inbound_id
         return self._credentials["inbound_id"]
 
     def create_key(
         self,
         subscription: Subscription,
-        user_telegram_id: int,
+        client_id,
         remarks: Optional[str] = None,
+        key_number: Optional[int] = None,
     ) -> Key:
         """Create a new VPN key on the server.
 
         Args:
             subscription: Subscription model the key belongs to
-            user_telegram_id: Telegram user ID for email generation
-            remarks: Display name for the key (default: "Clavis VPN")
+            client_id: Identifier for email generation (telegram_id or app_{account_id})
+            remarks: Display name for the key (default: server name)
+            key_number: If set, appends #{number} to display name (for multi-inbound)
 
         Returns:
             Key model with populated key_data (VLESS URI)
@@ -147,12 +175,14 @@ class XUIClient:
 
         # Generate unique identifiers
         client_uuid = str(uuid_lib.uuid4())
-        email = self._generate_email(user_telegram_id, subscription.id)
+        email = self._generate_email(client_id, subscription.id)
         display_name = remarks or self.server.name
+        if key_number is not None:
+            display_name = f"{display_name} #{key_number}"
         inbound_id = self._get_inbound_id()
 
         # Calculate expiry timestamp (milliseconds since epoch)
-        expiry_ms = int(subscription.expires_at.timestamp() * 1000)
+        expiry_ms = int(subscription.expires_at.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
         try:
             # Create client using py3xui
@@ -261,6 +291,7 @@ class XUIClient:
         key = Key(
             subscription_id=subscription.id,
             server_id=self.server.id,
+            server_inbound_id=self._server_inbound.id if self._server_inbound else None,
             protocol="xui",
             remote_key_id=email,  # Use email as remote ID for API lookups
             key_data=vless_uri,
@@ -390,7 +421,7 @@ class XUIClient:
             if hasattr(client, "expiry_time") and client.expiry_time:
                 expiry_ms = client.expiry_time
                 if expiry_ms > 0:
-                    expiry_time = datetime.fromtimestamp(expiry_ms / 1000)
+                    expiry_time = datetime.utcfromtimestamp(expiry_ms / 1000)
 
             return TrafficStats(
                 email=email,
@@ -405,6 +436,55 @@ class XUIClient:
             raise
         except Exception as e:
             raise XUIError(f"Failed to get traffic: {e}", e)
+
+    def list_clients_multi(self, inbound_ids: list[int]) -> list[ClientInfo]:
+        """List clients from multiple inbounds in a single API call.
+
+        Makes ONE get_list() request and aggregates clients from all
+        specified inbound IDs. Use this instead of calling list_clients()
+        per-inbound to avoid redundant logins and API round-trips.
+        """
+        self._ensure_connected()
+
+        try:
+            all_inbounds = self.api.inbound.get_list()
+        except Exception as e:
+            raise XUIError(f"Failed to get inbound list: {e}", e)
+
+        id_set = set(inbound_ids)
+        clients = []
+        for inbound in all_inbounds:
+            if inbound.id not in id_set:
+                continue
+            stats_by_email = {}
+            if inbound.client_stats:
+                for cs in inbound.client_stats:
+                    stats_by_email[cs.email] = cs
+            for client in (inbound.settings.clients or []):
+                expiry_time = None
+                cs = stats_by_email.get(client.email)
+                up = (cs.up if cs else 0) or 0
+                down = (cs.down if cs else 0) or 0
+                if cs and hasattr(cs, "expiry_time") and cs.expiry_time:
+                    if cs.expiry_time > 0:
+                        expiry_time = datetime.utcfromtimestamp(cs.expiry_time / 1000)
+                elif hasattr(client, "expiry_time") and client.expiry_time:
+                    if client.expiry_time > 0:
+                        expiry_time = datetime.utcfromtimestamp(client.expiry_time / 1000)
+                clients.append(ClientInfo(
+                    uuid=client.id,
+                    email=client.email,
+                    enabled=getattr(client, "enable", True),
+                    inbound_id=inbound.id,
+                    upload_bytes=up,
+                    download_bytes=down,
+                    total_bytes=up + down,
+                    expiry_time=expiry_time,
+                    flow=getattr(client, "flow", None),
+                    limit_ip=getattr(client, "limit_ip", 0) or 0,
+                    total_gb=getattr(client, "total_gb", 0) or 0,
+                ))
+        return clients
 
     def list_clients(self) -> list[ClientInfo]:
         """List all clients on the configured inbound.
@@ -442,10 +522,10 @@ class XUIClient:
 
                 if cs and hasattr(cs, "expiry_time") and cs.expiry_time:
                     if cs.expiry_time > 0:
-                        expiry_time = datetime.fromtimestamp(cs.expiry_time / 1000)
+                        expiry_time = datetime.utcfromtimestamp(cs.expiry_time / 1000)
                 elif hasattr(client, "expiry_time") and client.expiry_time:
                     if client.expiry_time > 0:
-                        expiry_time = datetime.fromtimestamp(client.expiry_time / 1000)
+                        expiry_time = datetime.utcfromtimestamp(client.expiry_time / 1000)
 
                 clients.append(
                     ClientInfo(
@@ -480,18 +560,29 @@ class XUIClient:
             self._connect()  # Force fresh connection
 
             # Try to get server status
+            version = uptime = cpu_pct = mem_used_pct = disk_used_pct = xray_state = None
             try:
                 status = self.api.server.get_status()
                 version = getattr(status, "xray_version", None)
                 uptime = getattr(status, "uptime", None)
+                cpu_pct = getattr(status, "cpu", None)
+                if hasattr(status, "mem") and getattr(status.mem, "total", 0) > 0:
+                    mem_used_pct = status.mem.current / status.mem.total * 100
+                if hasattr(status, "disk") and getattr(status.disk, "total", 0) > 0:
+                    disk_used_pct = status.disk.current / status.disk.total * 100
+                if hasattr(status, "xray"):
+                    xray_state = getattr(status.xray, "state", None)
             except Exception:
-                version = None
-                uptime = None
+                pass
 
             return ServerHealth(
                 is_healthy=True,
                 version=version,
                 uptime=uptime,
+                cpu_pct=cpu_pct,
+                mem_used_pct=mem_used_pct,
+                disk_used_pct=disk_used_pct,
+                xray_state=xray_state,
             )
 
         except XUIAuthError as e:
@@ -509,6 +600,19 @@ class XUIClient:
                 is_healthy=False,
                 error_message=f"Unknown error: {e}",
             )
+
+    def get_inbound_traffic(self) -> int | None:
+        """Total bytes (up + down) for the configured inbound.
+
+        Returns None on error so the caller can skip the check.
+        """
+        try:
+            self._ensure_connected()
+            inbound = self.api.inbound.get_by_id(self._get_inbound_id())
+            return (inbound.up or 0) + (inbound.down or 0)
+        except Exception as e:
+            logger.warning(f"Failed to get inbound traffic for {self.server.name}: {e}")
+            return None
 
     def enable_key(self, key: Key) -> bool:
         """Enable a disabled key on the server.
@@ -585,6 +689,118 @@ class XUIClient:
             return None
         except Exception:
             return None
+
+    def setup_domain_blocking(self, blocked_domains: list[str] | None = None) -> dict:
+        """Add routing rules to block domains via blackhole outbound.
+
+        Only enables sniffing on the bot-managed inbound, not all inbounds.
+
+        Args:
+            blocked_domains: List of domains to block. Defaults to
+                             ["oneme.ru", "ok.ru", "max.ru"].
+
+        Returns:
+            dict with keys: routing_updated (bool), sniffing_updated (bool), errors (list)
+        """
+        import httpx
+
+        if blocked_domains is None:
+            blocked_domains = ["oneme.ru", "ok.ru", "max.ru"]
+
+        self._ensure_connected()
+        result = {"routing_updated": False, "sniffing_updated": False, "errors": []}
+
+        # ── 1. Update xray routing config ──
+        try:
+            base = self.server.api_url.rstrip("/")
+            use_tls = self._credentials.get("use_tls_verify", True)
+            cookies = {self.api.cookie_name: self.api.session}
+
+            # Read current xray config
+            resp = httpx.post(
+                f"{base}/panel/xray",
+                cookies=cookies, verify=use_tls, timeout=15,
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            config = json.loads(data["obj"]["xraySetting"]) if isinstance(data["obj"], dict) else json.loads(data["obj"])
+
+            # Ensure blackhole outbound exists
+            outbounds = config.setdefault("outbounds", [])
+            if not any(o.get("tag") == "blocked" for o in outbounds):
+                outbounds.append({"protocol": "blackhole", "tag": "blocked", "settings": {}})
+
+            # Add/merge domain rules
+            routing = config.setdefault("routing", {})
+            rules = routing.setdefault("rules", [])
+            blocked_rule = next((r for r in rules if r.get("outboundTag") == "blocked"), None)
+
+            domain_entries = [f"domain:{d}" for d in blocked_domains]
+            if blocked_rule:
+                existing = blocked_rule.setdefault("domain", [])
+                for entry in domain_entries:
+                    if entry not in existing:
+                        existing.append(entry)
+            else:
+                rules.append({
+                    "type": "field",
+                    "domain": domain_entries,
+                    "outboundTag": "blocked",
+                })
+
+            # Save config
+            save_resp = httpx.post(
+                f"{base}/panel/xray/update",
+                cookies=cookies, verify=use_tls, timeout=15,
+                data={"xraySetting": json.dumps(config)},
+                follow_redirects=True,
+            )
+            save_resp.raise_for_status()
+            save_data = save_resp.json()
+            if save_data.get("success"):
+                result["routing_updated"] = True
+                logger.info(f"[{self.server.name}] Domain blocking routing rules updated")
+            else:
+                result["errors"].append(f"Routing save failed: {save_data}")
+        except Exception as e:
+            result["errors"].append(f"Routing update error: {e}")
+            logger.error(f"[{self.server.name}] Routing update error: {e}")
+
+        # ── 2. Enable sniffing on bot-managed inbound only ──
+        try:
+            inbound_id = self._get_inbound_id()
+            inbounds = self.api.inbound.get_list()
+            ib = next((i for i in inbounds if i.id == inbound_id), None)
+
+            if ib is None:
+                result["errors"].append(f"Inbound {inbound_id} not found")
+            else:
+                sniff = getattr(ib, "sniffing", None)
+                needs_update = False
+                if sniff is None or not getattr(sniff, "enabled", False):
+                    needs_update = True
+                else:
+                    dest = getattr(sniff, "dest_override", []) or []
+                    required = {"http", "tls", "quic", "fakedns"}
+                    if not required.issubset(set(dest)):
+                        needs_update = True
+
+                if needs_update:
+                    ib.sniffing = Sniffing(
+                        enabled=True,
+                        destOverride=["http", "tls", "quic", "fakedns"],
+                    )
+                    self.api.inbound.update(ib.id, ib)
+                    result["sniffing_updated"] = True
+                    logger.info(f"[{self.server.name}] Sniffing enabled on inbound {inbound_id}")
+                else:
+                    logger.info(f"[{self.server.name}] Sniffing already enabled on inbound {inbound_id}")
+        except Exception as e:
+            result["errors"].append(f"Sniffing update error: {e}")
+            logger.error(f"[{self.server.name}] Sniffing update error: {e}")
+
+        return result
 
     def _find_client_by_email(self, email: str) -> Optional[Client]:
         """Find a client by email address.
