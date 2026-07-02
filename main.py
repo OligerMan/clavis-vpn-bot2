@@ -77,13 +77,23 @@ def expire_stale_transactions_job():
 
 def deactivate_expired_subscriptions_job():
     """Disable keys and deactivate subscriptions that have expired."""
+    from config.settings import BOOTSTRAP_SUB_NAME
+    from sqlalchemy import or_
     logger = logging.getLogger(__name__)
     try:
         now = datetime.utcnow()
         with get_db_session() as db:
+            # Bootstrap (free-VPN) subs are handled by reap_bootstrap_subscriptions_job,
+            # which needs their keys still active so it can delete the x-ui clients.
+            # NULL-safe: `name != x` excludes NULL-name rows in SQL, so OR in IS NULL
+            # to keep deactivating legacy subs that have no name set.
             expired_subs = db.query(Subscription).filter(
                 Subscription.is_active == True,
                 Subscription.expires_at < now,
+                or_(
+                    Subscription.name.is_(None),
+                    Subscription.name != BOOTSTRAP_SUB_NAME,
+                ),
             ).all()
 
             if not expired_subs:
@@ -101,6 +111,39 @@ def deactivate_expired_subscriptions_job():
                        f"disabled {total_disabled} key(s) total")
     except Exception as e:
         logger.error(f"Error in deactivate_expired_subscriptions job: {e}", exc_info=True)
+
+
+def reap_bootstrap_subscriptions_job():
+    """Delete expired free-VPN bootstrap subs and their x-ui clients.
+
+    The generic deactivate job only marks keys inactive (x-ui enforces expiry via
+    expiry_time); for throwaway bootstrap keys we also delete the x-ui client so
+    dead entries don't accumulate on the Free server.
+    """
+    from config.settings import BOOTSTRAP_SUB_NAME
+    logger = logging.getLogger(__name__)
+    try:
+        now = datetime.utcnow()
+        with get_db_session() as db:
+            expired = db.query(Subscription).filter(
+                Subscription.name == BOOTSTRAP_SUB_NAME,
+                Subscription.expires_at < now,
+            ).all()
+            if not expired:
+                return
+            reaped = 0
+            for sub in expired:
+                try:
+                    # Deletes the x-ui client(s) and marks keys inactive.
+                    KeyService.delete_subscription_keys(db, sub)
+                except Exception as e:
+                    logger.warning(f"reap bootstrap: delete keys failed for sub {sub.id}: {e}")
+                db.delete(sub)  # cascade removes the (now inactive) key rows
+                reaped += 1
+            db.commit()
+            logger.info(f"Reaped {reaped} expired bootstrap subscription(s)")
+    except Exception as e:
+        logger.error(f"Error in reap_bootstrap_subscriptions job: {e}", exc_info=True)
 
 
 def recalculate_server_scores_job():
@@ -542,6 +585,10 @@ def main():
         # Run every hour
         scheduler.add_job(check_subscriptions_job, 'interval', hours=1, id='subscription_check')
         scheduler.add_job(deactivate_expired_subscriptions_job, 'interval', hours=1, id='deactivate_expired')
+        scheduler.add_job(
+            reap_bootstrap_subscriptions_job, 'interval', minutes=15,
+            id='reap_bootstrap', misfire_grace_time=300,
+        )
         scheduler.add_job(expire_stale_transactions_job, 'interval', minutes=5, id='expire_stale_transactions')
         scheduler.add_job(
             recalculate_server_scores_job, 'interval', hours=12,

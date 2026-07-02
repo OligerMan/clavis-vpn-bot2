@@ -1090,3 +1090,219 @@ async def web_trial(request: Request):
     except Exception as e:
         logger.error(f"Error in /trial: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ──────────────────────────────────────────────────────────────
+# Free-VPN bootstrap (app censorship escape hatch)
+# Contract — see FREE_VPN_BOOTSTRAP_PLAN.md:
+#   GET /app/free-vpn/{install_id}
+#     200 {"link": "vless://..."}      — a working Free-group WS key
+#     429 {"error": "rate_limited"}    — over the per-install rate limit
+#     400                              — malformed install_id
+#     503                              — no Free server / key creation failed
+# Issues a short-TTL (config) Free-group WS key (NOT tcp+REALITY). The sub has no
+# user/account (throwaway) and is reaped by reap_bootstrap_subscriptions_job.
+# ──────────────────────────────────────────────────────────────
+
+_INSTALL_ID_RE = re.compile(r'^[A-Za-z0-9_-]{16,64}$')
+
+
+def _select_free_ws_inbound(db):
+    """Pick a random active Free-group WS inbound. Returns (server, server_inbound) or (None, None)."""
+    import random
+    from config.settings import FREE_GROUP_NAME
+    from database import Server, ServerInbound, ConnectionProfile
+
+    servers = db.query(Server).filter(
+        Server.protocol == 'xui',
+        Server.is_active == True,
+        Server.server_set == FREE_GROUP_NAME,
+    ).all()
+
+    candidates = []
+    for server in servers:
+        if not server.has_capacity:
+            continue
+        inbounds = db.query(ServerInbound).join(
+            ConnectionProfile, ServerInbound.profile_id == ConnectionProfile.id
+        ).filter(
+            ServerInbound.server_id == server.id,
+            ServerInbound.is_active == True,
+            ConnectionProfile.network == 'ws',
+        ).all()
+        for si in inbounds:
+            candidates.append((server, si))
+
+    if not candidates:
+        return None, None
+    return random.choice(candidates)
+
+
+def _live_bootstrap_link(db, token):
+    """Return the vless link of a live (active, non-expired) bootstrap sub, else None."""
+    if not token:
+        return None
+    from datetime import datetime
+    sub = db.query(Subscription).filter(Subscription.token == token).first()
+    if not sub or not sub.is_active or sub.expires_at <= datetime.utcnow():
+        return None
+    key = db.query(Key).filter(
+        Key.subscription_id == sub.id,
+        Key.is_active == True,
+    ).first()
+    if key and key.key_data and key.key_data.startswith("vless://"):
+        return key.key_data
+    return None
+
+
+def _get_or_create_bootstrap_user(db):
+    """Get (or create) the shared guest User that owns all throwaway bootstrap subs.
+
+    Prod's subscriptions.user_id is NOT NULL (legacy schema), so bootstrap subs need
+    a real owner; we funnel them all to one sentinel user instead of littering the
+    users table.
+    """
+    from database import User
+    from config.settings import BOOTSTRAP_GUEST_TELEGRAM_ID
+    user = db.query(User).filter(
+        User.telegram_id == BOOTSTRAP_GUEST_TELEGRAM_ID
+    ).first()
+    if not user:
+        user = User(telegram_id=BOOTSTRAP_GUEST_TELEGRAM_ID, username="[bootstrap]")
+        db.add(user)
+        db.flush()
+    return user
+
+
+@router.get("/app/free-vpn/{install_id}")
+async def free_vpn_bootstrap(install_id: str, request: Request) -> JSONResponse:
+    """Hand out a short-lived Free-group WS key for the app's Telegram-login escape hatch."""
+    import json
+    from datetime import datetime, timedelta
+    from config.settings import (
+        BOOTSTRAP_SUB_NAME,
+        FREE_VPN_BOOTSTRAP_TTL_MINUTES,
+        FREE_VPN_BOOTSTRAP_WINDOW_MINUTES,
+        FREE_VPN_BOOTSTRAP_MAX_PER_WINDOW,
+        FREE_VPN_BOOTSTRAP_MAX_PER_DAY,
+        FREE_VPN_BOOTSTRAP_TRAFFIC_MB,
+        FREE_VPN_BOOTSTRAP_RATE_LIMIT_ENABLED,
+    )
+    from database import BootstrapGrant
+    from vpn.xui_client import XUIClient
+
+    # 1. Validate install_id (base64url, 16–64 chars)
+    if not _INSTALL_ID_RE.match(install_id or ""):
+        raise HTTPException(status_code=400, detail="invalid install_id")
+
+    client_ip = request.client.host if request.client else "unknown"
+    logger.info(f"free-vpn bootstrap request: install_id={install_id[:8]}..., ip={client_ip}")
+
+    now = datetime.utcnow()
+
+    try:
+        with get_db_session() as db:
+            grant = db.query(BootstrapGrant).filter(
+                BootstrapGrant.install_id == install_id
+            ).first()
+
+            # 2. Reuse-over-reissue: a live key is returned without touching the rate limit.
+            if grant:
+                existing = _live_bootstrap_link(db, grant.last_subscription_token)
+                if existing:
+                    logger.info(f"free-vpn bootstrap reuse: install_id={install_id[:8]}...")
+                    return JSONResponse(content={"link": existing})
+
+            # 3. Rate-limit (per install_id) from the pruned issuance history.
+            issues = []
+            if grant and grant.recent_issues:
+                try:
+                    issues = [datetime.fromisoformat(t) for t in json.loads(grant.recent_issues)]
+                except Exception:
+                    issues = []
+            issues = [t for t in issues if now - t < timedelta(hours=24)]
+            # The issuance ledger above is always maintained; only the 429 decision is
+            # gated by the switch, so the limit can be toggled for testing without losing
+            # history (see FREE_VPN_BOOTSTRAP_RATE_LIMIT_ENABLED in config/settings.py).
+            if FREE_VPN_BOOTSTRAP_RATE_LIMIT_ENABLED:
+                in_window = [
+                    t for t in issues
+                    if now - t < timedelta(minutes=FREE_VPN_BOOTSTRAP_WINDOW_MINUTES)
+                ]
+                if (len(in_window) >= FREE_VPN_BOOTSTRAP_MAX_PER_WINDOW
+                        or len(issues) >= FREE_VPN_BOOTSTRAP_MAX_PER_DAY):
+                    logger.info(f"free-vpn bootstrap rate-limited: install_id={install_id[:8]}...")
+                    return JSONResponse(status_code=429, content={"error": "rate_limited"})
+
+            # 4. Pick a Free-group WS inbound.
+            server, si = _select_free_ws_inbound(db)
+            if not server or not si:
+                logger.error("free-vpn bootstrap: no active Free-group WS inbound available")
+                raise HTTPException(status_code=503, detail="no_free_server")
+
+            # 5. Create short-lived sub + WS key (shared guest owner: throwaway).
+            guest = _get_or_create_bootstrap_user(db)
+            expires_at = now + timedelta(minutes=FREE_VPN_BOOTSTRAP_TTL_MINUTES)
+            sub = Subscription(
+                user_id=guest.id,
+                account_id=None,
+                name=BOOTSTRAP_SUB_NAME,
+                is_test=False,
+                is_active=True,
+                expires_at=expires_at,
+                device_limit=1,
+                plan_type='free',
+                expiry_notified=True,  # suppress expiry-reminder noise for throwaway subs
+            )
+            db.add(sub)
+            db.flush()  # assigns sub.id and auto-generated token
+
+            client_id = f"app_boot_{install_id}"
+            tlb = (FREE_VPN_BOOTSTRAP_TRAFFIC_MB * 1024 * 1024
+                   if FREE_VPN_BOOTSTRAP_TRAFFIC_MB else 0)
+            try:
+                xui = XUIClient(server, server_inbound=si)
+                key = xui.create_key(
+                    sub, client_id,
+                    remarks="Clavis Free (login)",
+                    traffic_limit_bytes=tlb,
+                )
+                db.add(key)
+                db.flush()
+            except Exception as e:
+                logger.error(
+                    f"free-vpn bootstrap: key creation failed on {server.name}: {e}",
+                    exc_info=True,
+                )
+                raise HTTPException(status_code=503, detail="key_creation_failed")
+
+            link = key.key_data
+            if not link or not link.startswith("vless://"):
+                logger.error("free-vpn bootstrap: created key has no valid vless link")
+                raise HTTPException(status_code=503, detail="bad_key")
+
+            # 6. Record the grant (rate-limit ledger + reuse pointer).
+            issues.append(now)
+            if not grant:
+                grant = BootstrapGrant(install_id=install_id, first_seen=now)
+                db.add(grant)
+            grant.last_issued_at = now
+            grant.issue_count = (grant.issue_count or 0) + 1
+            grant.recent_issues = json.dumps([t.isoformat() for t in issues])
+            grant.last_subscription_token = sub.token
+
+            db.commit()
+            logger.info(
+                f"free-vpn bootstrap issued: install_id={install_id[:8]}..., "
+                f"sub={sub.id}, server={server.name}"
+            )
+            return JSONResponse(content={"link": link})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"free-vpn bootstrap error: install_id={install_id[:8]}...: {e}",
+            exc_info=True,
+        )
+        raise HTTPException(status_code=503, detail="server_error")

@@ -108,6 +108,35 @@ TEST_SUBSCRIPTION_HOURS = 48
 # Device limit for subscriptions
 DEVICE_LIMIT = 5
 
+# ── Free-VPN bootstrap endpoint (app censorship escape hatch) ──
+# GET /app/free-vpn/{install_id} hands out a short-lived Free-group WS key so a
+# user behind censorship can open Telegram and log in. See FREE_VPN_BOOTSTRAP_PLAN.md.
+# Subscription.name marker — used to reap these throwaway subs and to keep them
+# out of the generic expiry/reminder jobs.
+BOOTSTRAP_SUB_NAME = "free-vpn-bootstrap"
+# Key lifetime. Client drops the key after ~5 min; this is the hard server cap.
+FREE_VPN_BOOTSTRAP_TTL_MINUTES = int(os.getenv('FREE_VPN_BOOTSTRAP_TTL_MINUTES', '60'))
+# Rate limit per install_id: at most MAX_PER_WINDOW issuances per WINDOW_MINUTES,
+# AND at most MAX_PER_DAY per rolling 24h. A legit user needs ~1 per login attempt.
+FREE_VPN_BOOTSTRAP_WINDOW_MINUTES = int(os.getenv('FREE_VPN_BOOTSTRAP_WINDOW_MINUTES', '10'))
+FREE_VPN_BOOTSTRAP_MAX_PER_WINDOW = int(os.getenv('FREE_VPN_BOOTSTRAP_MAX_PER_WINDOW', '1'))
+FREE_VPN_BOOTSTRAP_MAX_PER_DAY = int(os.getenv('FREE_VPN_BOOTSTRAP_MAX_PER_DAY', '5'))
+# Per-key traffic cap (MB). A Telegram login needs a few MB; this bounds a leaked
+# key's abuse within its TTL. 0 = unlimited.
+FREE_VPN_BOOTSTRAP_TRAFFIC_MB = int(os.getenv('FREE_VPN_BOOTSTRAP_TRAFFIC_MB', '1024'))
+# Shared synthetic guest user that owns all throwaway bootstrap subs. Prod's
+# subscriptions.user_id is NOT NULL (legacy schema), so bootstrap subs need a real
+# owner; we funnel them all to one instead of littering the users table. Large
+# negative sentinel — real Telegram IDs are positive, referral guests use small
+# negatives (-row_id), so this never collides.
+BOOTSTRAP_GUEST_TELEGRAM_ID = int(os.getenv('BOOTSTRAP_GUEST_TELEGRAM_ID', '-10000000000'))
+# Master switch for the per-install rate limit. Keep True in production; can be set
+# False via env (FREE_VPN_BOOTSTRAP_RATE_LIMIT_ENABLED=false) for load/QA testing — the
+# issuance ledger keeps recording while off, so re-enabling resumes cleanly. When off,
+# the subscription server logs a WARNING banner on every startup.
+FREE_VPN_BOOTSTRAP_RATE_LIMIT_ENABLED = os.getenv(
+    'FREE_VPN_BOOTSTRAP_RATE_LIMIT_ENABLED', 'true').lower() in ('1', 'true', 'yes')
+
 # Max number of servers a user gets keys on (lazy init)
 USER_SERVER_LIMIT = int(os.getenv('USER_SERVER_LIMIT', '2'))
 

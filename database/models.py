@@ -510,6 +510,31 @@ class WebTrialActivation(Base):
         return f"<WebTrialActivation(id={self.id}, ip={self.ip_address}, visits={self.visit_count})>"
 
 
+class BootstrapGrant(Base):
+    """Rate-limit + reuse ledger for the free-VPN bootstrap endpoint, keyed by install_id.
+
+    One row per app install that ever hit GET /app/free-vpn/{install_id}. Holds the
+    rolling issuance history (for rate limiting) and a pointer to the currently-live
+    bootstrap subscription (for reuse-over-reissue). Rows are kept even after the sub
+    is reaped, so abusive auto-generated install_ids stay observable.
+    """
+
+    __tablename__ = "bootstrap_grants"
+
+    install_id = Column(String(64), primary_key=True)
+    first_seen = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_issued_at = Column(DateTime, nullable=True)
+    issue_count = Column(Integer, default=0, nullable=False)  # total lifetime issuances
+    # JSON array of recent issuance ISO timestamps (pruned to last 24h) — source of
+    # truth for both the short-window and rolling-24h rate limits.
+    recent_issues = Column(Text, default="[]", nullable=False)
+    # Token of the currently-live bootstrap subscription (for reuse-over-reissue).
+    last_subscription_token = Column(String(36), nullable=True)
+
+    def __repr__(self):
+        return f"<BootstrapGrant(install_id={self.install_id[:8]}..., count={self.issue_count})>"
+
+
 # ──────────────────────────────────────────────────────────────
 # Clavis app integration: account / device / login / sync models
 # See F:\Projects\clavis-app\docs\server-integration-spec.md §2.

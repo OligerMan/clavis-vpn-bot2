@@ -50,6 +50,16 @@ def create_app() -> FastAPI:
         """Root endpoint."""
         return {"status": "ok"}
 
+    from config.settings import FREE_VPN_BOOTSTRAP_RATE_LIMIT_ENABLED
+    if not FREE_VPN_BOOTSTRAP_RATE_LIMIT_ENABLED:
+        logger.warning(
+            "==================================================================\n"
+            "  FREE-VPN BOOTSTRAP RATE LIMIT IS DISABLED (testing mode).\n"
+            "  Re-enable before public launch: set\n"
+            "  FREE_VPN_BOOTSTRAP_RATE_LIMIT_ENABLED=true in .env and restart.\n"
+            "=================================================================="
+        )
+
     logger.info("FastAPI application created")
     return app
 
