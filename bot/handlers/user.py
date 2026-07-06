@@ -120,24 +120,27 @@ def register_user_handlers(bot: TeleBot) -> None:
             if message.text and ' ' in message.text:
                 payload = message.text.split(maxsplit=1)[1].strip()
 
-            # Clavis app integration flows — MAIN_DEVELOPER_ID only during rollout.
-            # Handled before normal /start logic to short-circuit cleanly.
-            if payload in ("clavis_login", "clavis_sync"):
-                if message.from_user.id != MAIN_DEVELOPER_ID:
-                    # Silently ignore — fall through to normal /start behaviour.
-                    pass
-                else:
-                    try:
-                        _handle_clavis_start(bot, message, payload)
-                        return
-                    except Exception as app_err:
-                        logger.error(f"Clavis /start {payload} failed: {app_err}", exc_info=True)
-                        bot.send_message(
-                            message.chat.id,
-                            "Ошибка интеграции Clavis-app. Смотри логи.",
-                            parse_mode=""
-                        )
-                        return
+            # Accept a unique-suffixed payload (clavis_login_<nonce>) as well as
+            # the bare command. Telegram Desktop won't re-send an identical
+            # /start when the bot chat is already open, so the app varies the
+            # payload each launch; normalise it back to the base command here.
+            clavis_cmd = None
+            if payload == "clavis_login" or payload.startswith("clavis_login_"):
+                clavis_cmd = "clavis_login"
+            elif payload == "clavis_sync" or payload.startswith("clavis_sync_"):
+                clavis_cmd = "clavis_sync"
+            if clavis_cmd is not None:
+                try:
+                    _handle_clavis_start(bot, message, clavis_cmd)
+                    return
+                except Exception as app_err:
+                    logger.error(f"Clavis /start {payload} failed: {app_err}", exc_info=True)
+                    bot.send_message(
+                        message.chat.id,
+                        "Ошибка интеграции Clavis-app. Смотри логи.",
+                        parse_mode=""
+                    )
+                    return
 
             ref_source = None
             if payload.startswith('ref_'):
@@ -329,7 +332,32 @@ def register_user_handlers(bot: TeleBot) -> None:
                 renewal_reminder = SubscriptionService.get_renewal_reminder(subscription)
 
                 # Determine subscription type
-                subscription_type = "Тестовая" if subscription.is_test else "Платная"
+                if subscription.is_test:
+                    subscription_type = "Тестовая"
+                elif subscription.plan_type == 'unlimited':
+                    subscription_type = "Безлимит"
+                else:
+                    subscription_type = "Стандарт"
+
+                # Whitelist traffic section
+                whitelist_section = ""
+                try:
+                    from services.traffic_limit_service import get_user_whitelist_traffic
+                    wl = get_user_whitelist_traffic(db, user.id)
+                    if wl:
+                        if wl.get("is_unlimited"):
+                            whitelist_section = "\n**Трафик Whitelist:**\n• Безлимит"
+                        else:
+                            lines = [
+                                "\n**Трафик Whitelist:**",
+                                f"• Использовано: {wl['used_gb']} из {wl['limit_gb']} ГБ",
+                                f"• Осталось: {wl['remaining_gb']} ГБ",
+                            ]
+                            if wl["is_exceeded"]:
+                                lines.append("• ⛔ Лимит превышен")
+                            whitelist_section = "\n".join(lines)
+                except Exception:
+                    pass
 
                 # Send status
                 bot.send_message(
@@ -341,6 +369,7 @@ def register_user_handlers(bot: TeleBot) -> None:
                         upload_gb=traffic['upload_gb'],
                         download_gb=traffic['download_gb'],
                         total_gb=traffic['total_gb'],
+                        whitelist_section=whitelist_section,
                         renewal_reminder=renewal_reminder
                     ),
                     reply_markup=status_with_sub_keyboard(),
@@ -366,7 +395,12 @@ def register_user_handlers(bot: TeleBot) -> None:
                     subscription = SubscriptionService.get_active_subscription(db, user)
                     if subscription:
                         days_left = max(0, (subscription.expires_at - datetime.utcnow()).days)
-                        sub_type = "Тестовая" if subscription.is_test else "Платная"
+                        if subscription.is_test:
+                            sub_type = "Тестовая"
+                        elif subscription.plan_type == 'unlimited':
+                            sub_type = "Безлимит"
+                        else:
+                            sub_type = "Стандарт"
                         subscription_status = f"**Статус подписки:** {sub_type} (осталось {days_left} дней)"
 
                 bot.send_message(
@@ -680,7 +714,12 @@ def register_user_handlers(bot: TeleBot) -> None:
                     subscription = SubscriptionService.get_active_subscription(db, user)
                     if subscription:
                         days_left = max(0, (subscription.expires_at - datetime.utcnow()).days)
-                        sub_type = "Тестовая" if subscription.is_test else "Платная"
+                        if subscription.is_test:
+                            sub_type = "Тестовая"
+                        elif subscription.plan_type == 'unlimited':
+                            sub_type = "Безлимит"
+                        else:
+                            sub_type = "Стандарт"
                         subscription_status = f"**Статус подписки:** {sub_type} (осталось {days_left} дней)"
 
                 bot.edit_message_text(
