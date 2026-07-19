@@ -285,6 +285,57 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
             logger.error(f"Error in clipboard import callback: {e}", exc_info=True)
             bot.answer_callback_query(call.id, "Произошла ошибка")
 
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('clavis_applink_'))
+    def handle_clavis_applink(call: CallbackQuery):
+        """Generate a one-time Clavis-app login link ('login by link') for the user.
+
+        Reuses the same account/login-token flow as the /start clavis_login deep-link:
+        ensure the user has a ClavisAccount (back-linking their subscriptions), mint a
+        10-min single-use login token, and present it as copyable text + a tap button.
+        """
+        try:
+            platform = call.data.replace('clavis_applink_', '')
+            from services.account_service import ensure_implicit_account, create_login_token
+
+            telegram_id = call.from_user.id
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == telegram_id).first()
+                if user is None:
+                    user = User(telegram_id=telegram_id, username=call.from_user.username)
+                    db.add(user)
+                    db.flush()
+                account = ensure_implicit_account(db, user)
+                if account is None:
+                    bot.answer_callback_query(call.id, "Не удалось создать аккаунт Clavis")
+                    return
+                row = create_login_token(db, account.id)
+                login_url = f"{SUBSCRIPTION_BASE_URL.rstrip('/')}/login/{row.token}"
+
+            kb = InlineKeyboardMarkup()
+            kb.row(InlineKeyboardButton("🔒 Открыть в Clavis", url=login_url))
+            kb.row(InlineKeyboardButton("◀️ Назад", callback_data=f"{platform}_other_methods"))
+
+            message = (
+                "📲 **Вход в приложение Clavis по ссылке**\n\n"
+                "**Шаг 1:** Откройте приложение Clavis → «Войти» → «Вход по ссылке».\n\n"
+                "**Шаг 2:** Вставьте эту ссылку:\n"
+                f"`{login_url}`\n\n"
+                "Или нажмите **«🔒 Открыть в Clavis»** ниже, чтобы войти сразу.\n\n"
+                "_Ссылка одноразовая и действует 10 минут._"
+            )
+            bot.edit_message_text(
+                message,
+                call.message.chat.id,
+                call.message.id,
+                reply_markup=kb,
+                parse_mode='Markdown',
+            )
+            bot.answer_callback_query(call.id)
+
+        except Exception as e:
+            logger.error(f"Error in clavis applink callback: {e}", exc_info=True)
+            bot.answer_callback_query(call.id, "Произошла ошибка")
+
     @bot.callback_query_handler(func=lambda call: call.data.startswith('vless_keys_'))
     def handle_vless_keys(call: CallbackQuery):
         """Show individual VLESS keys from user's subscription."""
@@ -368,17 +419,36 @@ def register_client_instruction_handlers(bot: TeleBot) -> None:
 
                 message = "\n".join(lines)
 
-                # Telegram message limit is 4096 chars
+                # Telegram message limit is 4096 chars — split into chunks
+                # cutting by complete key blocks to avoid broken Markdown
                 if len(message) > 4096:
-                    message = message[:4090] + "\n..."
+                    chunks = []
+                    current = "\n".join(lines[:2])  # header
+                    for server_name, key_data in key_entries:
+                        block = f"\n**{server_name}:**\n`{key_data}`\n"
+                        if len(current) + len(block) > 4000:
+                            chunks.append(current)
+                            current = block
+                        else:
+                            current += block
+                    if current:
+                        chunks.append(current)
+                else:
+                    chunks = [message]
 
             bot.edit_message_text(
-                message,
+                chunks[0],
                 call.message.chat.id,
                 call.message.id,
                 reply_markup=vless_keys_keyboard(platform),
                 parse_mode='Markdown'
             )
+            for chunk in chunks[1:]:
+                bot.send_message(
+                    call.message.chat.id,
+                    chunk,
+                    parse_mode='Markdown'
+                )
             bot.answer_callback_query(call.id)
 
         except Exception as e:

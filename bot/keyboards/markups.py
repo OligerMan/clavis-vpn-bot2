@@ -69,6 +69,11 @@ def full_menu_keyboard(hide_test_key: bool = False, show_old_keys: bool = False,
             InlineKeyboardButton("👥 Пригласи друга", callback_data="gen_referral")
         )
 
+    # Donation row
+    keyboard.row(
+        InlineKeyboardButton("💝 Пожертвования", callback_data="donation")
+    )
+
     # Support row
     keyboard.row(
         InlineKeyboardButton("❓ Поддержка", callback_data="support")
@@ -104,58 +109,98 @@ def test_key_confirmation_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
-def payment_plans_keyboard(telegram_id: int = None) -> InlineKeyboardMarkup:
-    """
-    Generate payment plans keyboard.
-
-    When STARS_ENABLED: shows plan choice → then payment method selection.
-    When disabled: goes straight to card invoice (choose_plan → card_).
-    Premium plans shown only to PREMIUM_TESTERS.
-    """
-    from config.settings import STARS_ENABLED, PLANS, PREMIUM_TESTERS
-
+def tier_selection_keyboard() -> InlineKeyboardMarkup:
+    """Generate tier selection keyboard (Unlimited vs Standard)."""
     keyboard = InlineKeyboardMarkup(row_width=1)
-
-    if STARS_ENABLED:
-        keyboard.row(
-            InlineKeyboardButton("📅 90 дней — 3 месяца", callback_data="choose_plan_90")
-        )
-        keyboard.row(
-            InlineKeyboardButton("📅 365 дней — 1 год (Выгоднее!)", callback_data="choose_plan_365")
-        )
-    else:
-        p90 = PLANS['90_days']
-        p365 = PLANS['365_days']
-        keyboard.row(
-            InlineKeyboardButton(f"📅 90 дней — {p90['price_display']}", callback_data="card_90")
-        )
-        keyboard.row(
-            InlineKeyboardButton(f"📅 365 дней — {p365['price_display']} (Выгоднее!)", callback_data="card_365")
-        )
-
-    # Premium plans — only for testers
-    if telegram_id and telegram_id in PREMIUM_TESTERS:
-        pp90 = PLANS['premium_90_days']
-        pp365 = PLANS['premium_365_days']
-        if STARS_ENABLED:
-            keyboard.row(
-                InlineKeyboardButton(f"⭐ Premium 90 дней", callback_data="choose_plan_premium_90")
-            )
-            keyboard.row(
-                InlineKeyboardButton(f"⭐ Premium 365 дней", callback_data="choose_plan_premium_365")
-            )
-        else:
-            keyboard.row(
-                InlineKeyboardButton(f"⭐ Premium 90 дней — {pp90['price_display']}", callback_data="card_premium_90")
-            )
-            keyboard.row(
-                InlineKeyboardButton(f"⭐ Premium 365 дней — {pp365['price_display']}", callback_data="card_premium_365")
-            )
-
+    keyboard.row(
+        InlineKeyboardButton("🔥 Безлимит", callback_data="tier_unlimited")
+    )
+    keyboard.row(
+        InlineKeyboardButton("📦 Стандартный", callback_data="tier_standard")
+    )
     keyboard.row(
         InlineKeyboardButton("◀️ Назад", callback_data="back_to_menu")
     )
+    return keyboard
 
+
+def unlimited_plans_keyboard() -> InlineKeyboardMarkup:
+    """Generate plan selection keyboard for Unlimited tier."""
+    from config.settings import STARS_ENABLED, PLANS
+
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    p30 = PLANS['unlimited_30_days']
+    p90 = PLANS['unlimited_90_days']
+
+    if STARS_ENABLED:
+        keyboard.row(
+            InlineKeyboardButton(
+                f"📅 30 дней — {p30['price_display']}",
+                callback_data="choose_plan_unlimited_30"
+            )
+        )
+        keyboard.row(
+            InlineKeyboardButton(
+                f"📅 90 дней — {p90['price_display']} (Выгоднее!)",
+                callback_data="choose_plan_unlimited_90"
+            )
+        )
+    else:
+        keyboard.row(
+            InlineKeyboardButton(
+                f"📅 30 дней — {p30['price_display']}",
+                callback_data="card_unlimited_30"
+            )
+        )
+        keyboard.row(
+            InlineKeyboardButton(
+                f"📅 90 дней — {p90['price_display']} (Выгоднее!)",
+                callback_data="card_unlimited_90"
+            )
+        )
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад", callback_data="payment")
+    )
+    return keyboard
+
+
+def standard_plans_keyboard() -> InlineKeyboardMarkup:
+    """Generate plan selection keyboard for Standard tier."""
+    from config.settings import STARS_ENABLED, PLANS
+
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    p90 = PLANS['90_days']
+    p365 = PLANS['365_days']
+
+    if STARS_ENABLED:
+        keyboard.row(
+            InlineKeyboardButton(
+                f"📅 90 дней — {p90['price_display']}",
+                callback_data="choose_plan_90"
+            )
+        )
+        keyboard.row(
+            InlineKeyboardButton(
+                f"📅 365 дней — {p365['price_display']} (Выгоднее!)",
+                callback_data="choose_plan_365"
+            )
+        )
+    else:
+        keyboard.row(
+            InlineKeyboardButton(
+                f"📅 90 дней — {p90['price_display']}",
+                callback_data="card_90"
+            )
+        )
+        keyboard.row(
+            InlineKeyboardButton(
+                f"📅 365 дней — {p365['price_display']} (Выгоднее!)",
+                callback_data="card_365"
+            )
+        )
+    keyboard.row(
+        InlineKeyboardButton("◀️ Назад", callback_data="payment")
+    )
     return keyboard
 
 
@@ -164,7 +209,7 @@ def payment_method_keyboard(plan_key: str) -> InlineKeyboardMarkup:
     Generate payment method keyboard for a specific plan.
 
     Args:
-        plan_key: plan key from PLANS dict (e.g. '90_days', 'premium_90_days')
+        plan_key: plan key from PLANS dict (e.g. '90_days', 'unlimited_30_days')
     """
     from config.settings import PLANS
     plan = PLANS[plan_key]
@@ -173,8 +218,8 @@ def payment_method_keyboard(plan_key: str) -> InlineKeyboardMarkup:
     suffix_map = {
         '90_days': '90',
         '365_days': '365',
-        'premium_90_days': 'premium_90',
-        'premium_365_days': 'premium_365',
+        'unlimited_30_days': 'unlimited_30',
+        'unlimited_90_days': 'unlimited_90',
     }
     suffix = suffix_map.get(plan_key, plan_key)
 
@@ -513,6 +558,9 @@ def other_connection_methods_keyboard(platform: str, show_outline: bool = False,
     """
     keyboard = InlineKeyboardMarkup()
 
+    keyboard.row(
+        InlineKeyboardButton("📲 Добавить в приложение Clavis", callback_data=f"clavis_applink_{platform}")
+    )
     keyboard.row(
         InlineKeyboardButton("📋 Вставить ссылку с подпиской", callback_data=f"clipboard_import_{platform}")
     )
