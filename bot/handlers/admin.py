@@ -303,6 +303,9 @@ def register_admin_handlers(bot: TeleBot) -> None:
             "/check_reminders — manually run subscription expiry check\n"
             "/backup — send database backup file\n"
             "/monitor_status — server monitoring state\n"
+            "\n<b>App releases:</b>\n"
+            "/release — publish Windows app update (upload .exe → set version)\n"
+            "\n"
             "/admin_help — this message",
             parse_mode='HTML',
         )
@@ -344,6 +347,20 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 Subscription.plan_type != 'free',
                 Subscription.user_id.in_(filtered_user_ids),
             ).scalar()
+            active_standard = db.query(func.count(Subscription.id)).filter(
+                Subscription.is_active == True,
+                Subscription.expires_at > now,
+                Subscription.is_test == False,
+                Subscription.plan_type == 'basic',
+                Subscription.user_id.in_(filtered_user_ids),
+            ).scalar()
+            active_unlimited = db.query(func.count(Subscription.id)).filter(
+                Subscription.is_active == True,
+                Subscription.expires_at > now,
+                Subscription.is_test == False,
+                Subscription.plan_type == 'unlimited',
+                Subscription.user_id.in_(filtered_user_ids),
+            ).scalar()
             active_invite = db.query(func.count(Subscription.id)).filter(
                 Subscription.is_active == True,
                 Subscription.expires_at > now,
@@ -366,6 +383,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
             non_admin_tx = db.query(Transaction).filter(
                 Transaction.user_id.in_(filtered_user_ids),
                 Transaction.created_at >= real_payments_cutoff,
+                Transaction.plan != 'donation',
             ).subquery()
 
             completed = db.query(
@@ -404,6 +422,18 @@ def register_admin_handlers(bot: TeleBot) -> None:
             ).one()
             rev_30d_count, rev_30d_sum = rev_30d
 
+            # Donation stats for report
+            rpt_donation = db.query(
+                func.count(Transaction.id),
+                func.coalesce(func.sum(Transaction.amount), 0),
+            ).filter(
+                Transaction.status == 'completed',
+                Transaction.plan == 'donation',
+                Transaction.user_id.in_(filtered_user_ids),
+                Transaction.created_at >= real_payments_cutoff,
+            ).one()
+            rpt_donation_count, rpt_donation_sum = rpt_donation
+
             total_servers = db.query(func.count(Server.id)).scalar()
             active_servers = db.query(func.count(Server.id)).filter(
                 Server.is_active == True
@@ -430,7 +460,8 @@ def register_admin_handlers(bot: TeleBot) -> None:
             f"  Новых за 7 дней: {new_7d}\n"
             f"  Новых за 30 дней: {new_30d}\n\n"
             "*Подписки*\n"
-            f"  Активных платных: {active_paid}\n"
+            f"  Активных платных: {active_paid}"
+            f" (Стандарт: {active_standard}, Безлимит: {active_unlimited})\n"
             f"  Активных тестовых: {active_test}\n"
             f"  Активных инвайт: {active_invite}\n"
             f"  Истекших (всего): {expired}\n\n"
@@ -440,7 +471,8 @@ def register_admin_handlers(bot: TeleBot) -> None:
             f"  Неудачных: {failed_count}\n"
             f"  Новых платных за 7 дней: {new_paid_7d}\n"
             f"  За 7 дней: {rev_7d_count} на {fmt_rub(rev_7d_sum)}₽\n"
-            f"  За 30 дней: {rev_30d_count} на {fmt_rub(rev_30d_sum)}₽\n\n"
+            f"  За 30 дней: {rev_30d_count} на {fmt_rub(rev_30d_sum)}₽\n"
+            f"  Пожертвования: {rpt_donation_count} на {fmt_rub(rpt_donation_sum)}₽\n\n"
             "*Серверы*\n"
             f"  Активных: {active_servers} из {total_servers}\n"
             f"  Ключей: {total_keys}\n\n"
@@ -779,19 +811,38 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 func.coalesce(func.sum(Transaction.amount), 0),
             ).filter(
                 Transaction.status == 'completed',
+                Transaction.plan != 'donation',
                 Transaction.user_id.in_(filtered_user_ids),
                 Transaction.created_at >= real_payments_cutoff,
             ).group_by(Transaction.plan).all()
 
             total_revenue = 0
-            plan_lines = []
+            tier_groups = {'basic': [], 'unlimited': [], 'other': []}
+            tier_totals = {'basic': 0, 'unlimited': 0, 'other': 0}
             for plan_key, count, amount in plan_stats:
                 plan_info = PLANS.get(plan_key, {})
                 desc = plan_info.get('description', plan_key)
                 price = plan_info.get('price_display', '?')
                 rub = amount // 100
                 total_revenue += amount
-                plan_lines.append(f"  {desc} ({price}): {count} шт — {rub:,}₽".replace(",", " "))
+                line = f"  {desc} ({price}): {count} шт — {rub:,}₽".replace(",", " ")
+                pt = plan_info.get('plan_type', 'other')
+                bucket = pt if pt in tier_groups else 'other'
+                tier_groups[bucket].append(line)
+                tier_totals[bucket] += amount
+
+            # ── Donations ──
+            donation_stats = db.query(
+                func.count(Transaction.id),
+                func.coalesce(func.sum(Transaction.amount), 0),
+            ).filter(
+                Transaction.status == 'completed',
+                Transaction.plan == 'donation',
+                Transaction.user_id.in_(filtered_user_ids),
+                Transaction.created_at >= real_payments_cutoff,
+            ).one()
+            donation_count, donation_sum = donation_stats
+            donation_rub = donation_sum // 100
 
             total_rub = total_revenue // 100
             arpu = (total_rub // paid_users) if paid_users > 0 else 0
@@ -848,11 +899,20 @@ def register_admin_handlers(bot: TeleBot) -> None:
             f"  Доля продлений: {renewal_pct:.1f}%\n\n"
             "*Выручка по тарифам*\n"
         )
-        if plan_lines:
-            text += "\n".join(plan_lines) + "\n"
+        if tier_groups['basic']:
+            text += "  _Стандарт:_\n" + "\n".join(tier_groups['basic']) + "\n"
+            text += f"  Итого Стандарт: {tier_totals['basic'] // 100:,}₽\n".replace(",", " ")
+        if tier_groups['unlimited']:
+            text += "  _Безлимит:_\n" + "\n".join(tier_groups['unlimited']) + "\n"
+            text += f"  Итого Безлимит: {tier_totals['unlimited'] // 100:,}₽\n".replace(",", " ")
+        if tier_groups['other']:
+            text += "  _Прочее:_\n" + "\n".join(tier_groups['other']) + "\n"
         text += (
-            f"  Итого: {total_rub:,}₽\n\n".replace(",", " ") +
+            f"  *Итого: {total_rub:,}₽*\n\n".replace(",", " ") +
             f"*ARPU:* {arpu:,}₽\n\n".replace(",", " ") +
+            "*Пожертвования*\n"
+            f"  Количество: {donation_count}\n"
+            f"  Сумма: {donation_rub:,}₽\n\n".replace(",", " ") +
             "*Истекают*\n"
             f"  В ближайшие 7 дней: {expiring_7d}\n"
             f"  В ближайшие 30 дней: {expiring_30d}\n\n"
@@ -2701,85 +2761,19 @@ def register_admin_handlers(bot: TeleBot) -> None:
     # ── /manage_user ──────────────────────────────────────────
     def _format_user_info(db, telegram_id: int) -> tuple[str, Optional[User]]:
         """Build user info text. Returns (text, user_or_None)."""
-        user = db.query(User).filter(User.telegram_id == telegram_id).first()
-        if not user:
-            return f"User with Telegram ID `{telegram_id}` not found.", None
-
-        lines = [
-            f"*User Management*\n",
-            f"*Telegram ID:* `{user.telegram_id}`",
-            f"*Username:* `@{user.username}`" if user.username else "*Username:* —",
-            f"*Registered:* {format_msk(user.created_at)}",
-        ]
-
-        # Active subscription
-        sub = db.query(Subscription).filter(
-            Subscription.user_id == user.id,
-            Subscription.is_active == True,
-            Subscription.expires_at > datetime.utcnow()
-        ).first()
-
-        if sub:
-            days_left = (sub.expires_at - datetime.utcnow()).days
-            sub_type = "Test" if sub.is_test else "Paid"
-            active_keys = db.query(Key).filter(
-                Key.subscription_id == sub.id,
-                Key.is_active == True
-            ).count()
-            key_servers = db.query(Key.server_id).filter(
-                Key.subscription_id == sub.id,
-                Key.is_active == True
-            ).distinct().all()
-            server_names = []
-            for (sid,) in key_servers:
-                srv = db.query(Server).filter(Server.id == sid).first()
-                if srv:
-                    server_names.append(srv.name)
-
-            lines.append(f"\n*Subscription (id={sub.id}):*")
-            lines.append(f"  Type: {sub_type}")
-            lines.append(f"  Token: `{sub.token[:8]}...`")
-            lines.append(f"  Expires: {format_msk(sub.expires_at)}")
-            lines.append(f"  Days left: {days_left}")
-            lines.append(f"  Keys: {active_keys} on {', '.join(server_names) if server_names else '—'}")
-        else:
-            # Check for any subscription (expired)
-            any_sub = db.query(Subscription).filter(
-                Subscription.user_id == user.id
-            ).order_by(Subscription.created_at.desc()).first()
-            if any_sub:
-                lines.append(f"\n*Subscription (id={any_sub.id}):*")
-                lines.append(f"  Type: {'Test' if any_sub.is_test else 'Paid'}")
-                lines.append(f"  Status: EXPIRED ({format_msk(any_sub.expires_at)})")
-            else:
-                lines.append("\n*Subscription:* None")
-
-        # Has used test
-        has_test = db.query(Subscription).filter(
-            Subscription.user_id == user.id,
-            Subscription.is_test == True
-        ).first() is not None
-        lines.append(f"*Test used:* {'Yes' if has_test else 'No'}")
-
-        # Last transaction
-        tx = db.query(Transaction).filter(
-            Transaction.user_id == user.id
-        ).order_by(Transaction.created_at.desc()).first()
-        if tx:
-            lines.append(f"\n*Last transaction (id={tx.id}):*")
-            lines.append(f"  Plan: `{tx.plan}` | Amount: {tx.amount_rub}₽")
-            lines.append(f"  Status: `{tx.status}`")
-            lines.append(f"  Date: {format_msk(tx.created_at)}")
-
-        return "\n".join(lines), user
+        from services.user_management_service import format_user_info
+        return format_user_info(db, telegram_id)
 
     def _manage_user_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
         """Build inline keyboard for user management."""
         kb = InlineKeyboardMarkup()
         kb.row(InlineKeyboardButton("Refresh keys", callback_data=f"mu_refresh_{telegram_id}"))
+        kb.row(InlineKeyboardButton("🔄 Rotate link (24h grace)", callback_data=f"mu_rotate_{telegram_id}"))
         kb.row(InlineKeyboardButton("Adjust time", callback_data=f"mu_time_{telegram_id}"))
         kb.row(InlineKeyboardButton("Grant subscription", callback_data=f"mu_grantsub_{telegram_id}"))
         kb.row(InlineKeyboardButton("Reset test period", callback_data=f"mu_resettest_{telegram_id}"))
+        kb.row(InlineKeyboardButton("🔗 Sub link", callback_data=f"mu_sublink_{telegram_id}"))
+        kb.row(InlineKeyboardButton("🔄 Reset WL traffic", callback_data=f"mu_resetwl_{telegram_id}"))
         return kb
 
     @bot.message_handler(commands=['manage_user'])
@@ -2823,60 +2817,21 @@ def register_admin_handlers(bot: TeleBot) -> None:
         if not is_admin(call.from_user.id):
             return
 
+        from services.user_management_service import refresh_keys
+
         tg_id = int(call.data.replace('mu_refresh_', ''))
         bot.answer_callback_query(call.id, "Refreshing keys...")
 
         try:
             with get_db_session() as db:
-                user = db.query(User).filter(User.telegram_id == tg_id).first()
-                if not user:
-                    bot.send_message(call.message.chat.id, "User not found")
+                ok, result = refresh_keys(db, tg_id)
+                if not ok:
+                    bot.send_message(call.message.chat.id, result)
                     return
 
-                sub = db.query(Subscription).filter(
-                    Subscription.user_id == user.id,
-                    Subscription.is_active == True,
-                    Subscription.expires_at > datetime.utcnow()
-                ).first()
-
-                if not sub:
-                    bot.send_message(call.message.chat.id, "No active subscription to refresh keys for.")
-                    return
-
-                # Delete ALL keys (active AND inactive) from x-ui and DB
-                # This handles stale keys that were marked inactive in DB
-                # but still exist on the panel
-                all_keys = db.query(Key).filter(
-                    Key.subscription_id == sub.id
-                ).all()
-
-                for key in all_keys:
-                    if key.server_id:
-                        server = db.query(Server).filter(Server.id == key.server_id).first()
-                        if server:
-                            try:
-                                client = KeyService._make_xui_client(db, server, key)
-                                client.delete_key(key)
-                            except Exception as e:
-                                logger.warning(f"Failed to delete key {key.remote_key_id} from server: {e}")
-                    key.is_active = False
-                db.commit()
-
-                # Create new keys (lazy init — up to USER_SERVER_LIMIT)
-                keys = KeyService.ensure_keys_exist(db, sub, user.telegram_id)
-
-                server_names_list = []
-                for key in keys:
-                    if key.server_id:
-                        srv = db.query(Server).filter(Server.id == key.server_id).first()
-                        if srv and srv.name not in server_names_list:
-                            server_names_list.append(srv.name)
-                server_name = ", ".join(server_names_list) if server_names_list else "unknown"
-
-                # Refresh the info message
                 text, _ = _format_user_info(db, tg_id)
                 bot.edit_message_text(
-                    text + f"\n\n_Keys refreshed. New server: {server_name}_",
+                    text + f"\n\n_{result}_",
                     call.message.chat.id,
                     call.message.id,
                     reply_markup=_manage_user_keyboard(tg_id),
@@ -2886,6 +2841,64 @@ def register_admin_handlers(bot: TeleBot) -> None:
         except Exception as e:
             logger.error(f"Error refreshing keys: {e}", exc_info=True)
             bot.send_message(call.message.chat.id, f"Error refreshing keys: {e}")
+
+    # ── Rotate subscription link callback (destructive → confirm) ──
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_rotate_'))
+    def handle_mu_rotate(call: CallbackQuery):
+        """Ask for confirmation before rotating a user's subscription link."""
+        if not is_admin(call.from_user.id):
+            return
+        tg_id = int(call.data.replace('mu_rotate_', ''))
+        bot.answer_callback_query(call.id)
+        kb = InlineKeyboardMarkup()
+        kb.row(
+            InlineKeyboardButton("✅ Rotate", callback_data=f"mu_rotcfm_{tg_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"mu_rotcxl_{tg_id}"),
+        )
+        bot.send_message(
+            call.message.chat.id,
+            f"⚠️ Rotate subscription link for `{tg_id}`?\n\n"
+            f"• Old link dies immediately\n"
+            f"• Old keys keep working 24h, then stop\n"
+            f"• New link + new keys on the *same* servers, same expiry",
+            reply_markup=kb,
+            parse_mode='Markdown',
+        )
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_rotcfm_'))
+    def handle_mu_rotate_confirm(call: CallbackQuery):
+        """Execute the subscription-link rotation."""
+        if not is_admin(call.from_user.id):
+            return
+        from services.user_management_service import rotate_subscription
+
+        tg_id = int(call.data.replace('mu_rotcfm_', ''))
+        bot.answer_callback_query(call.id, "Rotating...")
+        try:
+            with get_db_session() as db:
+                ok, result = rotate_subscription(db, tg_id)
+                if not ok:
+                    bot.edit_message_text(result, call.message.chat.id, call.message.id)
+                    return
+                text, _ = _format_user_info(db, tg_id)
+                bot.edit_message_text(
+                    text + f"\n\n{result}",
+                    call.message.chat.id,
+                    call.message.id,
+                    reply_markup=_manage_user_keyboard(tg_id),
+                    parse_mode='Markdown',
+                )
+        except Exception as e:
+            logger.error(f"Error rotating subscription: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: {e}", parse_mode="")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_rotcxl_'))
+    def handle_mu_rotate_cancel(call: CallbackQuery):
+        """Cancel the rotation."""
+        if not is_admin(call.from_user.id):
+            return
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text("Отменено.", call.message.chat.id, call.message.id)
 
     # ── Adjust time callback (starts dialog) ──────────────────
     @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_time_'))
@@ -2911,6 +2924,8 @@ def register_admin_handlers(bot: TeleBot) -> None:
         if not is_admin(message.from_user.id):
             return
 
+        from services.user_management_service import adjust_time
+
         try:
             hours = int(message.text.strip())
         except (ValueError, AttributeError):
@@ -2919,31 +2934,10 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         try:
             with get_db_session() as db:
-                user = db.query(User).filter(User.telegram_id == tg_id).first()
-                if not user:
-                    bot.send_message(message.chat.id, "User not found")
-                    return
-
-                sub = db.query(Subscription).filter(
-                    Subscription.user_id == user.id,
-                    Subscription.is_active == True,
-                ).order_by(Subscription.created_at.desc()).first()
-
-                if not sub:
-                    bot.send_message(message.chat.id, "No active subscription found.")
-                    return
-
-                old_expiry = sub.expires_at
-                sub.expires_at = sub.expires_at + timedelta(hours=hours)
-                db.commit()
-
-                sign = "+" if hours >= 0 else ""
+                ok, result = adjust_time(db, tg_id, hours)
                 bot.send_message(
                     message.chat.id,
-                    f"Subscription adjusted for user `{tg_id}`:\n"
-                    f"  {sign}{hours}h\n"
-                    f"  Old expiry: {format_msk(old_expiry)}\n"
-                    f"  New expiry: {format_msk(sub.expires_at)}",
+                    f"User `{tg_id}`: {result}",
                     parse_mode='Markdown'
                 )
 
@@ -2952,25 +2946,57 @@ def register_admin_handlers(bot: TeleBot) -> None:
             bot.send_message(message.chat.id, f"Error: {e}")
 
     # ── Grant subscription callback (starts dialog) ───────────
-    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_grantsub_') and not call.data.startswith('mu_grantsub_confirm_') and not call.data.startswith('mu_grantsub_cancel_'))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_grantsub_') and not call.data.startswith('mu_grantsub_cancel_'))
     def handle_mu_grantsub(call: CallbackQuery):
-        """Start dialog to grant a paid subscription."""
+        """Start dialog to grant a paid subscription — first ask plan type."""
         if not is_admin(call.from_user.id):
             return
 
         tg_id = int(call.data.replace('mu_grantsub_', ''))
         bot.answer_callback_query(call.id)
 
-        msg = bot.send_message(
+        kb = InlineKeyboardMarkup()
+        kb.row(
+            InlineKeyboardButton("📦 Стандарт", callback_data=f"mu_grant_type_basic_{tg_id}"),
+            InlineKeyboardButton("🔥 Безлимит", callback_data=f"mu_grant_type_unlimited_{tg_id}"),
+        )
+        kb.row(InlineKeyboardButton("❌ Отмена", callback_data=f"mu_grantsub_cancel_{tg_id}"))
+        bot.send_message(
             call.message.chat.id,
-            f"Enter expiry date for user `{tg_id}` in format `DD.MM.YYYY`\n"
-            f"Example: `01.01.2027`",
+            "Выберите тариф для подписки:",
+            reply_markup=kb,
+        )
+
+    def _do_grant_subscription(db, tg_id: int, user, expires_at: datetime, existing_sub, plan_type: str = "basic"):
+        """Create new or replace existing subscription.  Delegates to shared service."""
+        from services.user_management_service import _do_grant
+        _do_grant(db, tg_id, user, expires_at, existing_sub, plan_type=plan_type)
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_grant_type_'))
+    def handle_mu_grant_type(call: CallbackQuery):
+        """Handle plan type selection — then ask for expiry date."""
+        if not is_admin(call.from_user.id):
+            return
+        bot.answer_callback_query(call.id)
+
+        # Parse: mu_grant_type_basic_123 or mu_grant_type_unlimited_123
+        parts = call.data.split('_')  # ['mu', 'grant', 'type', 'basic'|'unlimited', tg_id]
+        plan_type = parts[3]
+        tg_id = int(parts[4])
+
+        plan_label = "Безлимит" if plan_type == "unlimited" else "Стандарт"
+        bot.edit_message_text(
+            f"Тариф: *{plan_label}*\n\n"
+            f"Введите дату окончания для `{tg_id}` в формате `ДД.ММ.ГГГГ`\n"
+            f"Пример: `01.01.2027`",
+            call.message.chat.id,
+            call.message.id,
             parse_mode='Markdown',
         )
-        bot.register_next_step_handler(msg, _process_grant_subscription, tg_id)
+        bot.register_next_step_handler(call.message, _process_grant_date, tg_id, plan_type)
 
-    def _process_grant_subscription(message: Message, tg_id: int):
-        """Process the date input and create/replace subscription."""
+    def _process_grant_date(message: Message, tg_id: int, plan_type: str):
+        """Process date input and create/replace subscription."""
         if not is_admin(message.from_user.id):
             return
 
@@ -2979,7 +3005,7 @@ def register_admin_handlers(bot: TeleBot) -> None:
                 hour=23, minute=59, second=59
             )
         except (ValueError, AttributeError):
-            bot.send_message(message.chat.id, "Invalid date format. Use `DD.MM.YYYY`. Cancelled.", parse_mode='Markdown')
+            bot.send_message(message.chat.id, "Неверный формат даты. Используйте `ДД.ММ.ГГГГ`. Отменено.", parse_mode='Markdown')
             return
 
         try:
@@ -2989,155 +3015,24 @@ def register_admin_handlers(bot: TeleBot) -> None:
                     bot.send_message(message.chat.id, "User not found")
                     return
 
-                # Check for existing active non-expired subscription
                 existing = db.query(Subscription).filter(
                     Subscription.user_id == user.id,
                     Subscription.is_active == True,
                     Subscription.expires_at > datetime.utcnow(),
                 ).first()
 
-                if existing:
-                    # Store intent and ask for confirmation
-                    sub_type = "тестовая" if existing.is_test else "платная"
-                    _manage_user_state[message.chat.id] = {
-                        "step": "confirm_grant",
-                        "telegram_id": tg_id,
-                        "expires_at": expires_at,
-                        "existing_sub_id": existing.id,
-                    }
-                    kb = InlineKeyboardMarkup()
-                    kb.row(
-                        InlineKeyboardButton("✅ Заменить", callback_data=f"mu_grantsub_confirm_{tg_id}"),
-                        InlineKeyboardButton("❌ Отмена", callback_data=f"mu_grantsub_cancel_{tg_id}"),
-                    )
-                    bot.send_message(
-                        message.chat.id,
-                        f"⚠️ У пользователя уже есть активная {sub_type} подписка "
-                        f"(id={existing.id}, истекает {format_msk(existing.expires_at)}).\n\n"
-                        f"Заменить на новую до *{expires_at.strftime('%d.%m.%Y')}*?\n"
-                        f"Старые ключи проработают ещё 24ч, будут созданы новые.",
-                        parse_mode='Markdown',
-                        reply_markup=kb,
-                    )
-                    return
-
-                _do_grant_subscription(db, tg_id, user, expires_at=expires_at, existing_sub=None)
-
+                _do_grant_subscription(db, tg_id, user, expires_at=expires_at, existing_sub=existing, plan_type=plan_type)
+                plan_label = "Безлимит" if plan_type == "unlimited" else "Стандарт"
                 text, _ = _format_user_info(db, tg_id)
                 bot.send_message(
                     message.chat.id,
-                    text + f"\n\n_Subscription granted until {format_msk(expires_at)}_",
+                    text + f"\n\n_Subscription granted: {plan_label}, до {format_msk(expires_at)}_",
                     reply_markup=_manage_user_keyboard(tg_id),
                     parse_mode='Markdown',
                 )
-
         except Exception as e:
             logger.error(f"Error granting subscription: {e}", exc_info=True)
-            bot.send_message(message.chat.id, f"Error: {e}")
-
-    def _do_grant_subscription(db, tg_id: int, user, expires_at: datetime, existing_sub):
-        """Create new or replace existing subscription.
-
-        On replace: old keys get 24h expiry on x-ui so they keep working for
-        one more day (user stays connected via Telegram VPN).  New keys are
-        created on fresh servers.  Both old and new keys appear in the
-        subscription URL; old ones expire naturally after 24 hours.
-        """
-        from subscription.cache import invalidate_subscription_cache
-
-        if existing_sub is not None:
-            # ── 1. Set old keys' x-ui expiry to +24h ──
-            old_keys = db.query(Key).filter(
-                Key.subscription_id == existing_sub.id,
-                Key.server_id.isnot(None),
-                Key.is_active == True,
-            ).all()
-
-            grace_expiry_ms = int(
-                (datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(days=1)).timestamp() * 1000
-            )
-            for key in old_keys:
-                try:
-                    server = db.query(Server).filter(Server.id == key.server_id).first()
-                    if server and server.is_active:
-                        client = KeyService._make_xui_client(db, server, key)
-                        client.update_key_expiry(key, grace_expiry_ms)
-                except Exception as e:
-                    logger.warning(f"Failed to set 24h grace on key {key.remote_key_id}: {e}")
-
-            # ── 2. Temporarily deactivate old keys so server selection
-            #        picks fresh servers for new keys ──
-            for key in old_keys:
-                key.is_active = False
-            db.flush()
-
-            # ── 3. Update subscription ──
-            existing_sub.expires_at = expires_at
-            existing_sub.is_test = False
-            existing_sub.is_active = True
-            existing_sub.reminder_7d_sent = False
-            existing_sub.reminder_3d_sent = False
-            existing_sub.reminder_1d_sent = False
-            existing_sub.expiry_notified = False
-            db.flush()
-
-            # ── 4. Create new keys on all groups ──
-            try:
-                KeyService.create_subscription_keys(db, existing_sub, tg_id)
-            except Exception as e:
-                logger.error(f"Failed to create new keys during grant replace: {e}")
-
-            # ── 5. Reactivate old keys — they stay in subscription URL
-            #        for 24h until x-ui expiry kicks in ──
-            for key in old_keys:
-                key.is_active = True
-
-            invalidate_subscription_cache(existing_sub.token)
-        else:
-            sub = Subscription(
-                user_id=user.id,
-                name="Main",
-                token=str(uuid.uuid4()),
-                expires_at=expires_at,
-                is_test=False,
-                is_active=True,
-            )
-            db.add(sub)
-            db.flush()
-        log_activity(db, tg_id, "admin_grant_sub", f"до {format_msk(expires_at)}")
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_grantsub_confirm_'))
-    def handle_mu_grantsub_confirm(call: CallbackQuery):
-        """Confirm replacing existing subscription with admin grant."""
-        if not is_admin(call.from_user.id):
-            return
-        bot.answer_callback_query(call.id)
-        tg_id = int(call.data.replace('mu_grantsub_confirm_', ''))
-        state = _manage_user_state.pop(call.message.chat.id, None)
-        if not state or state.get("step") != "confirm_grant" or state.get("telegram_id") != tg_id:
-            bot.edit_message_text("Сессия истекла, повторите команду.", call.message.chat.id, call.message.id)
-            return
-        expires_at = state["expires_at"]
-        existing_sub_id = state["existing_sub_id"]
-        try:
-            with get_db_session() as db:
-                user = db.query(User).filter(User.telegram_id == tg_id).first()
-                if not user:
-                    bot.edit_message_text("User not found.", call.message.chat.id, call.message.id)
-                    return
-                existing_sub = db.query(Subscription).filter(Subscription.id == existing_sub_id).first()
-                _do_grant_subscription(db, tg_id, user, expires_at=expires_at, existing_sub=existing_sub)
-                text, _ = _format_user_info(db, tg_id)
-                bot.edit_message_text(
-                    text + f"\n\n_Subscription granted until {format_msk(expires_at)}_",
-                    call.message.chat.id,
-                    call.message.id,
-                    reply_markup=_manage_user_keyboard(tg_id),
-                    parse_mode='Markdown',
-                )
-        except Exception as e:
-            logger.error(f"Error confirming grant subscription: {e}", exc_info=True)
-            bot.send_message(call.message.chat.id, f"Error: {e}", parse_mode="")
+            bot.send_message(message.chat.id, f"Error: {e}", parse_mode="")
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_grantsub_cancel_'))
     def handle_mu_grantsub_cancel(call: CallbackQuery):
@@ -3148,6 +3043,64 @@ def register_admin_handlers(bot: TeleBot) -> None:
         tg_id = int(call.data.replace('mu_grantsub_cancel_', ''))
         _manage_user_state.pop(call.message.chat.id, None)
         bot.edit_message_text("Отменено.", call.message.chat.id, call.message.id)
+
+    # ── Sub link callback ────────────────────────────────────
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_sublink_'))
+    def handle_mu_sublink(call: CallbackQuery):
+        """Show the user's subscription URL."""
+        if not is_admin(call.from_user.id):
+            return
+        bot.answer_callback_query(call.id)
+        tg_id = int(call.data.replace('mu_sublink_', ''))
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == tg_id).first()
+                if not user:
+                    bot.send_message(call.message.chat.id, "User not found")
+                    return
+                sub = db.query(Subscription).filter(
+                    Subscription.user_id == user.id,
+                    Subscription.is_active == True,
+                ).order_by(Subscription.expires_at.desc()).first()
+                if not sub:
+                    bot.send_message(call.message.chat.id, "No active subscription")
+                    return
+                from config.settings import SUBSCRIPTION_BASE_URL
+                base = SUBSCRIPTION_BASE_URL.rstrip('/')
+                sub_url = f"{base}/sub/{sub.token}"
+                bot.send_message(
+                    call.message.chat.id,
+                    f"`{sub_url}`",
+                    parse_mode='Markdown',
+                )
+        except Exception as e:
+            logger.error(f"Error in mu_sublink: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: {e}", parse_mode="")
+
+    # ── Reset whitelist traffic callback ──────────────────────
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_resetwl_'))
+    def handle_mu_resetwl(call: CallbackQuery):
+        """Reset whitelist traffic consumption to 0 for a user."""
+        if not is_admin(call.from_user.id):
+            return
+        bot.answer_callback_query(call.id)
+        tg_id = int(call.data.replace('mu_resetwl_', ''))
+        try:
+            with get_db_session() as db:
+                user = db.query(User).filter(User.telegram_id == tg_id).first()
+                if not user:
+                    bot.send_message(call.message.chat.id, "User not found")
+                    return
+                from services.traffic_limit_service import reset_user_traffic
+                from config.settings import WHITELIST_GROUP_NAME
+                count = reset_user_traffic(db, user.id, WHITELIST_GROUP_NAME)
+                bot.send_message(
+                    call.message.chat.id,
+                    f"Whitelist traffic reset. Keys updated: {count}",
+                )
+        except Exception as e:
+            logger.error(f"Error in mu_resetwl: {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: {e}", parse_mode="")
 
     # ── Reset test period callback ────────────────────────────
     @bot.callback_query_handler(func=lambda call: call.data.startswith('mu_resettest_'))
@@ -3697,152 +3650,183 @@ You can now start testing from scratch with /start"""
             bot.send_message(call.message.chat.id, f"Error: {e}")
 
     # ── /sub_graph ─────────────────────────────────────────────
+
+    def _build_sub_graph(period: str) -> "io.BytesIO":
+        """Build subscription graph image for a given period.
+
+        period: 'all', 'all_weekly', '90d', '30d'
+        """
+        import io
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from matplotlib.ticker import MaxNLocator
+
+        launch_date = datetime(2026, 2, 20).date()
+        MSK_OFFSET = timedelta(hours=3)
+        today = (datetime.utcnow() + MSK_OFFSET).date()
+
+        if period == '30d':
+            start_date = today - timedelta(days=30)
+        elif period == '90d':
+            start_date = today - timedelta(days=90)
+        else:
+            start_date = launch_date
+
+        with get_db_session() as db:
+            subs = db.query(
+                Subscription.created_at,
+                Subscription.expires_at,
+                Subscription.is_test,
+                Subscription.user_id,
+                Subscription.plan_type,
+            ).all()
+            users = db.query(User.created_at).all()
+
+        first_paid_date: dict[int, datetime] = {}
+        for created_at, expires_at, is_test, user_id, plan_type in subs:
+            if not created_at or is_test or (plan_type or 'basic') == 'free':
+                continue
+            prev = first_paid_date.get(user_id)
+            if prev is None or created_at < prev:
+                first_paid_date[user_id] = created_at
+
+        dates = []
+        active_series = []
+        paid_series = []
+        test_series = []
+        invite_series = []
+        test_invite_series = []
+        new_users_series = []
+        new_paid_series = []
+
+        d = start_date
+        while d <= today:
+            dt_start = datetime(d.year, d.month, d.day, 0, 0, 0) - MSK_OFFSET
+            dt_end   = datetime(d.year, d.month, d.day, 23, 59, 59) - MSK_OFFSET
+
+            active = paid = test = invite = 0
+            for created_at, expires_at, is_test, user_id, plan_type in subs:
+                if not created_at or not expires_at:
+                    continue
+                if created_at <= dt_end and expires_at > dt_start:
+                    active += 1
+                    if is_test:
+                        test += 1
+                    elif (plan_type or 'basic') == 'free' and created_at >= datetime(2026, 3, 21) - MSK_OFFSET:
+                        invite += 1
+                    else:
+                        paid += 1
+
+            new_users = sum(1 for (ca,) in users if ca and dt_start <= ca <= dt_end)
+            new_paid = sum(1 for fp in first_paid_date.values() if dt_start <= fp <= dt_end)
+
+            dates.append(d)
+            active_series.append(active)
+            paid_series.append(paid)
+            test_series.append(test)
+            invite_series.append(invite)
+            test_invite_series.append(test + invite)
+            new_users_series.append(new_users)
+            new_paid_series.append(new_paid)
+            d += timedelta(days=1)
+
+        # Aggregate weekly if requested
+        if period == 'all_weekly' and len(dates) > 7:
+            from itertools import zip_longest
+            w_dates, w_active, w_paid, w_test, w_invite, w_ti = [], [], [], [], [], []
+            w_new_users, w_new_paid = [], []
+            i = 0
+            while i < len(dates):
+                end = min(i + 7, len(dates))
+                w_dates.append(dates[i])
+                w_active.append(active_series[end - 1])
+                w_paid.append(paid_series[end - 1])
+                w_test.append(test_series[end - 1])
+                w_invite.append(invite_series[end - 1])
+                w_ti.append(test_invite_series[end - 1])
+                w_new_users.append(sum(new_users_series[i:end]))
+                w_new_paid.append(sum(new_paid_series[i:end]))
+                i = end
+            dates, active_series, paid_series = w_dates, w_active, w_paid
+            test_series, invite_series, test_invite_series = w_test, w_invite, w_ti
+            new_users_series, new_paid_series = w_new_users, w_new_paid
+
+        # Plot
+        bar_width = 5.0 if period == 'all_weekly' else 0.8
+        bar_width_narrow = 2.5 if period == 'all_weekly' else 0.4
+        fig, ax1 = plt.subplots(figsize=(12, 7))
+
+        ax1.plot(dates, active_series, color='#2196F3', linewidth=2, label='Активные подписки')
+        ax1.plot(dates, paid_series, color='#4CAF50', linewidth=2, label='Платные подписки')
+        ax1.set_ylabel('Активные / Платные', color='#2196F3')
+        ax1.tick_params(axis='y', labelcolor='#2196F3')
+
+        ax2 = ax1.twinx()
+        ax2.plot(dates, test_series, color='#FF9800', linewidth=1.5, linestyle='--', label='Тестовые подписки')
+        ax2.plot(dates, invite_series, color='#00BCD4', linewidth=1.5, linestyle='--', label='Инвайт-подписки')
+        ax2.plot(dates, test_invite_series, color='#7C4DFF', linewidth=1.5, linestyle=':', label='Тест + Инвайт')
+        new_label = 'Новые юзеры/нед' if period == 'all_weekly' else 'Новые юзеры/день'
+        paid_label = 'Новые платные/нед' if period == 'all_weekly' else 'Новые платные/день'
+        ax2.bar(dates, new_users_series, color='#9C27B0', alpha=0.3, width=bar_width, label=new_label)
+        ax2.bar(dates, new_paid_series, color='#E91E63', alpha=0.5, width=bar_width_narrow, label=paid_label)
+        ax2.set_ylabel('Тестовые / Инвайты / Новые', color='#FF9800')
+        ax2.tick_params(axis='y', labelcolor='#FF9800')
+
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d.%m'))
+        ax1.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
+        plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+        titles = {
+            'all': 'Подписки с 20.02',
+            'all_weekly': 'Подписки с 20.02 (по неделям)',
+            '90d': 'Подписки за 90 дней',
+            '30d': 'Подписки за 30 дней',
+        }
+        ax1.set_title(titles.get(period, 'Подписки'))
+        ax1.grid(True, alpha=0.3)
+
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=9)
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=120)
+        buf.seek(0)
+        buf.name = 'sub_graph.png'
+        plt.close(fig)
+        return buf
+
     @bot.message_handler(commands=['sub_graph'])
     def handle_sub_graph(message: Message):
-        """Generate subscription growth chart since launch."""
+        """Show period selection buttons for subscription graph."""
         if not is_admin(message.from_user.id):
             return
+        markup = InlineKeyboardMarkup()
+        markup.row(
+            InlineKeyboardButton("За всё время", callback_data="subgraph_all"),
+            InlineKeyboardButton("За всё время (по неделям)", callback_data="subgraph_all_weekly"),
+        )
+        markup.row(
+            InlineKeyboardButton("За 90 дней", callback_data="subgraph_90d"),
+            InlineKeyboardButton("За 30 дней", callback_data="subgraph_30d"),
+        )
+        bot.send_message(message.chat.id, "Выберите период:", reply_markup=markup)
 
+    @bot.callback_query_handler(func=lambda call: call.data.startswith('subgraph_'))
+    def handle_sub_graph_callback(call: CallbackQuery):
+        if not is_admin(call.from_user.id):
+            return
+        period = call.data.replace('subgraph_', '')  # all, all_weekly, 90d, 30d
+        bot.answer_callback_query(call.id, "Генерирую график...")
         try:
-            import io
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            import matplotlib.dates as mdates
-
-            launch_date = datetime(2026, 2, 20).date()
-            MSK_OFFSET = timedelta(hours=3)
-            today = (datetime.utcnow() + MSK_OFFSET).date()
-
-            with get_db_session() as db:
-                subs = db.query(
-                    Subscription.created_at,
-                    Subscription.expires_at,
-                    Subscription.is_test,
-                    Subscription.user_id,
-                    Subscription.plan_type,
-                ).all()
-
-                users = db.query(User.created_at).all()
-
-            # First paid sub date per user (for "new paid per day")
-            # Store UTC datetime; compare against MSK day boundaries (UTC - 3h)
-            first_paid_date: dict[int, datetime] = {}
-            for created_at, expires_at, is_test, user_id, plan_type in subs:
-                if not created_at or is_test or (plan_type or 'basic') == 'free':
-                    continue
-                prev = first_paid_date.get(user_id)
-                if prev is None or created_at < prev:
-                    first_paid_date[user_id] = created_at
-
-            # Build daily series using MSK day boundaries (stored as UTC)
-            # MSK day d = UTC [d 00:00 - 3h, d 23:59:59 - 3h]
-            dates = []
-            active_series = []
-            paid_series = []
-            test_series = []
-            invite_series = []
-            test_invite_series = []
-            new_users_series = []
-            new_paid_series = []
-
-            d = launch_date
-            while d <= today:
-                # MSK day boundaries expressed in UTC
-                dt_start = datetime(d.year, d.month, d.day, 0, 0, 0) - MSK_OFFSET
-                dt_end   = datetime(d.year, d.month, d.day, 23, 59, 59) - MSK_OFFSET
-
-                active = 0
-                paid = 0
-                test = 0
-                invite = 0
-
-                for created_at, expires_at, is_test, user_id, plan_type in subs:
-                    if not created_at or not expires_at:
-                        continue
-                    if created_at <= dt_end and expires_at > dt_start:
-                        active += 1
-                        if is_test:
-                            test += 1
-                        elif (plan_type or 'basic') == 'free' and created_at >= datetime(2026, 3, 21) - MSK_OFFSET:
-                            invite += 1
-                        else:
-                            paid += 1
-
-                # New users (/start) per day (MSK boundaries)
-                new_users = sum(
-                    1 for (ca,) in users
-                    if ca and dt_start <= ca <= dt_end
-                )
-
-                # New paid users per day (first paid sub on this MSK day)
-                new_paid = sum(
-                    1 for fp in first_paid_date.values()
-                    if dt_start <= fp <= dt_end
-                )
-
-                dates.append(d)
-                active_series.append(active)
-                paid_series.append(paid)
-                test_series.append(test)
-                invite_series.append(invite)
-                test_invite_series.append(test + invite)
-                new_users_series.append(new_users)
-                new_paid_series.append(new_paid)
-
-                d += timedelta(days=1)
-
-            # Plot
-            fig, ax1 = plt.subplots(figsize=(12, 7))
-
-            color_active = '#2196F3'
-            color_paid = '#4CAF50'
-            color_test = '#FF9800'
-            color_invite = '#00BCD4'
-            color_test_invite = '#7C4DFF'
-            color_new_users = '#9C27B0'
-            color_new_paid = '#E91E63'
-
-            ax1.plot(dates, active_series, color=color_active, linewidth=2, label='Активные подписки')
-            ax1.plot(dates, paid_series, color=color_paid, linewidth=2, label='Платные подписки')
-            ax1.set_ylabel('Активные / Платные', color=color_active)
-            ax1.tick_params(axis='y', labelcolor=color_active)
-
-            ax2 = ax1.twinx()
-            ax2.plot(dates, test_series, color=color_test, linewidth=1.5, linestyle='--', label='Тестовые подписки')
-            ax2.plot(dates, invite_series, color=color_invite, linewidth=1.5, linestyle='--', label='Инвайт-подписки')
-            ax2.plot(dates, test_invite_series, color=color_test_invite, linewidth=1.5, linestyle=':', label='Тест + Инвайт')
-            ax2.bar(dates, new_users_series, color=color_new_users, alpha=0.3, width=0.8, label='Новые юзеры/день')
-            ax2.bar(dates, new_paid_series, color=color_new_paid, alpha=0.5, width=0.4, label='Новые платные/день')
-            ax2.set_ylabel('Тестовые / Инвайты / Новые за день', color=color_test)
-            ax2.tick_params(axis='y', labelcolor=color_test)
-
-            ax1.xaxis.set_major_formatter(mdates.DateFormatter('%d.%m'))
-            from matplotlib.ticker import MaxNLocator
-            ax1.xaxis.set_major_locator(MaxNLocator(nbins=10, integer=True))
-            plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
-
-            ax1.set_title('Подписки с 20.02')
-            ax1.grid(True, alpha=0.3)
-
-            # Combined legend
-            lines1, labels1 = ax1.get_legend_handles_labels()
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=9)
-
-            fig.tight_layout()
-
-            buf = io.BytesIO()
-            fig.savefig(buf, format='png', dpi=120)
-            buf.seek(0)
-            buf.name = 'sub_graph.png'
-            plt.close(fig)
-
-            bot.send_photo(message.chat.id, buf)
-
+            buf = _build_sub_graph(period)
+            bot.send_photo(call.message.chat.id, buf)
         except Exception as e:
-            logger.error(f"Error in /sub_graph: {e}", exc_info=True)
-            bot.send_message(message.chat.id, f"Error: {e}")
+            logger.error(f"Error in /sub_graph ({period}): {e}", exc_info=True)
+            bot.send_message(call.message.chat.id, f"Error: {e}")
 
     @bot.message_handler(commands=['invite_stat'])
     def handle_invite_stat(message: Message):
@@ -3896,5 +3880,308 @@ You can now start testing from scratch with /start"""
         except Exception as e:
             logger.error(f"Error in /invite_stat: {e}", exc_info=True)
             bot.send_message(message.chat.id, f"Error: {e}", parse_mode="")
+
+    # ── /release — app release management ───────────────────
+
+    _UPDATES_DIR = Path("/var/www/clavis-updates")
+    _BUILDS_DIR = _UPDATES_DIR / "builds"
+    _MANIFESTS_DIR = _UPDATES_DIR / "manifests"
+    _ACTIVE_MANIFEST = _UPDATES_DIR / "windows.json"
+    _UPDATES_DOMAIN = "cl23.clavisdashboard.ru"
+
+    def _load_builds() -> list:
+        """Load all build manifests from manifests/ directory."""
+        builds = []
+        if not _MANIFESTS_DIR.exists():
+            return builds
+        for f in sorted(_MANIFESTS_DIR.glob("*.json")):
+            try:
+                builds.append(json.loads(f.read_text()))
+            except (json.JSONDecodeError, OSError):
+                pass
+        return builds
+
+    def _save_build_manifest(version: str, filename: str, notes: str) -> None:
+        data = json.dumps({"version": version, "file": filename, "notes": notes})
+        (_MANIFESTS_DIR / f"{version}.json").write_text(data)
+
+    def _delete_build_manifest(version: str) -> None:
+        p = _MANIFESTS_DIR / f"{version}.json"
+        if p.exists():
+            p.unlink()
+
+    def _load_current() -> dict | None:
+        try:
+            return json.loads(_ACTIVE_MANIFEST.read_text()) if _ACTIVE_MANIFEST.exists() else None
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _publish_version(version: str, builds: list) -> None:
+        build = next((b for b in builds if b["version"] == version), None)
+        if not build:
+            raise ValueError(f"Build {version} not found")
+        manifest = json.dumps({
+            "version": version,
+            "url": f"https://{_UPDATES_DOMAIN}/update/builds/{build['file']}",
+            "notes": build.get("notes", ""),
+        })
+        _ACTIVE_MANIFEST.write_text(manifest)
+
+    def _build_file_size(filename: str) -> float | None:
+        p = _BUILDS_DIR / filename
+        return p.stat().st_size / (1024 * 1024) if p.exists() else None
+
+    def _send_release_menu(chat_id: int, text_prefix: str = "") -> None:
+        """Send the main release management menu."""
+        current = _load_current()
+        builds = _load_builds()
+
+        cur_ver = current.get("version", "—") if current else "—"
+        lines = [text_prefix] if text_prefix else []
+        lines.append("*Release Management*\n")
+        lines.append(f"Опубликованная версия: `{cur_ver}`")
+
+        if builds:
+            lines.append(f"\nБилды ({len(builds)}):")
+            for b in builds:
+                marker = " ✅" if current and b["version"] == cur_ver else ""
+                size = _build_file_size(b["file"])
+                size_str = f" ({size:.1f} MB)" if size else " (файл не найден!)"
+                notes_str = f' — {b["notes"]}' if b.get("notes") else ""
+                lines.append(f"  `{b['version']}`{size_str}{notes_str}{marker}")
+        else:
+            lines.append("\nНет подготовленных билдов.")
+
+        markup = InlineKeyboardMarkup()
+        for b in builds:
+            is_current = current and b["version"] == cur_ver
+            row = []
+            if not is_current:
+                row.append(InlineKeyboardButton(
+                    f"📢 Опубликовать {b['version']}",
+                    callback_data=f"rel_pub_{b['version']}",
+                ))
+            row.append(InlineKeyboardButton(
+                f"🗑 {b['version']}",
+                callback_data=f"rel_del_{b['version']}",
+            ))
+            markup.row(*row)
+        markup.row(InlineKeyboardButton("➕ Подготовить билд", callback_data="rel_prepare"))
+
+        bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown", reply_markup=markup)
+
+    @bot.message_handler(commands=['release'])
+    def handle_release(message: Message):
+        """Open release management menu."""
+        logger.info(f"/release from {message.from_user.id}, is_admin={is_admin(message.from_user.id)}")
+        if not is_admin(message.from_user.id):
+            return
+        try:
+            _send_release_menu(message.chat.id)
+        except Exception as e:
+            logger.error(f"Error in /release: {e}", exc_info=True)
+            bot.send_message(message.chat.id, f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("rel_pub_"))
+    def handle_release_publish(call: CallbackQuery):
+        """Publish a build as the current version."""
+        if not is_admin(call.from_user.id):
+            return
+        version = call.data[len("rel_pub_"):]
+        try:
+            builds = _load_builds()
+            _publish_version(version, builds)
+            bot.answer_callback_query(call.id, f"Версия {version} опубликована!")
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            _send_release_menu(call.message.chat.id, f"✅ Версия `{version}` опубликована!\n")
+            logger.info(f"Release {version} published by {call.from_user.id}")
+        except Exception as e:
+            bot.answer_callback_query(call.id, f"Ошибка: {e}", show_alert=True)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("rel_del_"))
+    def handle_release_delete(call: CallbackQuery):
+        """Delete a build (manifest entry + file)."""
+        if not is_admin(call.from_user.id):
+            return
+        version = call.data[len("rel_del_"):]
+        try:
+            current = _load_current()
+            if current and current.get("version") == version:
+                bot.answer_callback_query(
+                    call.id,
+                    "Нельзя удалить опубликованную версию. Сначала опубликуйте другую.",
+                    show_alert=True,
+                )
+                return
+
+            builds = _load_builds()
+            build = next((b for b in builds if b["version"] == version), None)
+            if build:
+                exe = _BUILDS_DIR / build["file"]
+                if exe.exists():
+                    exe.unlink()
+                _delete_build_manifest(version)
+
+            bot.answer_callback_query(call.id, f"Билд {version} удалён")
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            _send_release_menu(call.message.chat.id, f"🗑 Билд `{version}` удалён.\n")
+            logger.info(f"Build {version} deleted by {call.from_user.id}")
+        except Exception as e:
+            bot.answer_callback_query(call.id, f"Ошибка: {e}", show_alert=True)
+
+    _release_prepare_state: dict[int, dict] = {}
+
+    @bot.callback_query_handler(func=lambda c: c.data == "rel_prepare")
+    def handle_release_prepare(call: CallbackQuery):
+        """Start the build preparation flow."""
+        if not is_admin(call.from_user.id):
+            return
+        bot.answer_callback_query(call.id)
+
+        # List .exe files on server that aren't in builds.json yet
+        try:
+            builds = _load_builds()
+            known_files = {b["file"] for b in builds}
+
+            all_files = [f.name for f in sorted(_BUILDS_DIR.glob("*.exe"))] if _BUILDS_DIR.exists() else []
+            new_files = [f for f in all_files if f not in known_files]
+
+            if new_files:
+                markup = InlineKeyboardMarkup()
+                for f in new_files:
+                    size = _build_file_size(f)
+                    label = f"{f} ({size:.1f} MB)" if size else f
+                    markup.row(InlineKeyboardButton(label, callback_data=f"rel_pickfile_{f}"))
+                markup.row(InlineKeyboardButton("✏️ Ввести версию вручную", callback_data="rel_manual"))
+                markup.row(InlineKeyboardButton("❌ Отмена", callback_data="rel_cancel"))
+                bot.send_message(
+                    call.message.chat.id,
+                    "Выберите загруженный файл или введите версию вручную:",
+                    reply_markup=markup,
+                )
+            else:
+                msg = bot.send_message(
+                    call.message.chat.id,
+                    "Нет новых `.exe` файлов на сервере.\n\n"
+                    "Загрузите установщик в `builds/` через SCP.\n\n"
+                    "Или введите версию (файл `clavis-setup-VERSION.exe` должен быть в `builds/`):",
+                    parse_mode="Markdown",
+                )
+                _release_prepare_state[call.message.chat.id] = {"step": "awaiting_version"}
+                bot.register_next_step_handler(msg, _process_prepare_version)
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"Error: {e}")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("rel_pickfile_"))
+    def handle_release_pick_file(call: CallbackQuery):
+        """User picked an .exe file from the list."""
+        if not is_admin(call.from_user.id):
+            return
+        filename = call.data[len("rel_pickfile_"):]
+        bot.answer_callback_query(call.id)
+
+        # Try to extract version from filename: clavis-setup-X.Y.Z.exe
+        version = ""
+        if filename.startswith("clavis-setup-") and filename.endswith(".exe"):
+            version = filename[len("clavis-setup-"):-len(".exe")]
+
+        _release_prepare_state[call.message.chat.id] = {
+            "step": "awaiting_notes",
+            "file": filename,
+            "version": version,
+        }
+        msg = bot.send_message(
+            call.message.chat.id,
+            f"Файл: `{filename}`\nВерсия: `{version}`\n\n"
+            "Введите заметки к релизу (или `-` чтобы пропустить):",
+            parse_mode="Markdown",
+        )
+        bot.register_next_step_handler(msg, _process_prepare_notes)
+
+    @bot.callback_query_handler(func=lambda c: c.data == "rel_manual")
+    def handle_release_manual(call: CallbackQuery):
+        """User wants to enter version manually."""
+        if not is_admin(call.from_user.id):
+            return
+        bot.answer_callback_query(call.id)
+        _release_prepare_state[call.message.chat.id] = {"step": "awaiting_version"}
+        msg = bot.send_message(call.message.chat.id, "Введите версию (X.Y.Z):")
+        bot.register_next_step_handler(msg, _process_prepare_version)
+
+    @bot.callback_query_handler(func=lambda c: c.data == "rel_cancel")
+    def handle_release_cancel(call: CallbackQuery):
+        if not is_admin(call.from_user.id):
+            return
+        _release_prepare_state.pop(call.message.chat.id, None)
+        bot.answer_callback_query(call.id, "Отменено")
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+
+    def _process_prepare_version(message: Message):
+        """Process manually entered version."""
+        chat_id = message.chat.id
+        version = message.text.strip() if message.text else ""
+
+        if not version or not all(p.isdigit() for p in version.split(".")):
+            bot.send_message(chat_id, "Неверный формат. Введите как `X.Y.Z`:", parse_mode="Markdown")
+            bot.register_next_step_handler(message, _process_prepare_version)
+            return
+
+        filename = f"clavis-setup-{version}.exe"
+        size = _build_file_size(filename)
+        if size is None:
+            bot.send_message(
+                chat_id,
+                f"`{filename}` не найден на сервере.\n\n"
+                "Загрузите через SCP в `builds/`.",
+                parse_mode="Markdown",
+            )
+            _release_prepare_state.pop(chat_id, None)
+            return
+
+        # Check if already in builds
+        builds = _load_builds()
+        if any(b["version"] == version for b in builds):
+            bot.send_message(chat_id, f"Билд `{version}` уже существует.", parse_mode="Markdown")
+            _release_prepare_state.pop(chat_id, None)
+            return
+
+        _release_prepare_state[chat_id] = {
+            "step": "awaiting_notes",
+            "file": filename,
+            "version": version,
+        }
+        msg = bot.send_message(
+            chat_id,
+            f"Файл: `{filename}` ({size:.1f} MB)\nВерсия: `{version}`\n\n"
+            "Введите заметки к релизу (или `-` чтобы пропустить):",
+            parse_mode="Markdown",
+        )
+        bot.register_next_step_handler(msg, _process_prepare_notes)
+
+    def _process_prepare_notes(message: Message):
+        """Process release notes and finalize build preparation."""
+        chat_id = message.chat.id
+        state = _release_prepare_state.pop(chat_id, None)
+        if not state:
+            return
+
+        notes_text = message.text.strip() if message.text else ""
+        if notes_text == "-":
+            notes_text = ""
+
+        version = state["version"]
+        filename = state["file"]
+
+        try:
+            _save_build_manifest(version, filename, notes_text)
+
+            bot.send_message(
+                chat_id,
+                f"✅ Билд `{version}` подготовлен.\n"
+                "Используйте /release чтобы опубликовать.",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            bot.send_message(chat_id, f"Ошибка: {e}")
 
     logger.info("Admin handlers registered")

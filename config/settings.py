@@ -42,7 +42,7 @@ PLANS: Dict[str, Dict[str, any]] = {
         'stars_amount': 150,
         'price_display': '275₽',
         'stars_display': '150⭐',
-        'description': '3 месяца',
+        'description': '3 месяца Стандарт',
         'plan_type': 'basic',
     },
     '365_days': {
@@ -51,36 +51,44 @@ PLANS: Dict[str, Dict[str, any]] = {
         'stars_amount': 500,
         'price_display': '925₽',
         'stars_display': '500⭐',
-        'description': '1 год',
+        'description': '1 год Стандарт',
         'plan_type': 'basic',
     },
-    'premium_90_days': {
-        'days': 90,
-        'amount': 55000,  # 550 rubles in kopeks
-        'stars_amount': 300,
-        'price_display': '550₽',
-        'stars_display': '300⭐',
-        'description': '3 месяца Premium',
-        'plan_type': 'premium',
+    'unlimited_30_days': {
+        'days': 30,
+        'amount': 39000,  # 390 rubles in kopeks
+        'stars_amount': 210,
+        'price_display': '390₽',
+        'stars_display': '210⭐',
+        'description': '30 дней Безлимит',
+        'plan_type': 'unlimited',
     },
-    'premium_365_days': {
-        'days': 365,
-        'amount': 185000,  # 1850 rubles in kopeks
-        'stars_amount': 1000,
-        'price_display': '1850₽',
-        'stars_display': '1000⭐',
-        'description': '1 год Premium',
-        'plan_type': 'premium',
+    'unlimited_90_days': {
+        'days': 90,
+        'amount': 99000,  # 990 rubles in kopeks
+        'stars_amount': 540,
+        'price_display': '990₽',
+        'stars_display': '540⭐',
+        'description': '3 месяца Безлимит',
+        'plan_type': 'unlimited',
     },
 }
 
-# Premium feature: which user IDs see premium plan buttons
-PREMIUM_TESTERS = [331186567]
+# Anti-abuse conversion rates for plan type changes.
+# When switching plan types, remaining days are converted at the least favorable rate.
+# (value_per_day_of_old_plan, cost_per_day_of_new_plan)
+PLAN_CONVERSION_RATES = {
+    ('basic', 'unlimited'): (925 / 365, 390 / 30),
+    ('unlimited', 'basic'): (990 / 90, 275 / 90),
+}
 
 # Server groups accessible by plan type
 # "basic" gets all groups NOT listed in premium_groups
 # "premium" gets ALL groups (basic + premium)
 PREMIUM_GROUPS = {"Test Premium"}
+
+# Groups only assigned to MAIN_DEVELOPER_ID (admin testing)
+ADMIN_ONLY_GROUPS = {"Backup 2", "ru-nl backup"}
 
 # Free VPN plan configuration
 FREE_GROUP_NAME = "Free"  # Server group name for free-tier servers
@@ -114,6 +122,11 @@ DEVICE_LIMIT = 5
 # Subscription.name marker — used to reap these throwaway subs and to keep them
 # out of the generic expiry/reminder jobs.
 BOOTSTRAP_SUB_NAME = "free-vpn-bootstrap"
+# Subscription.name marker for the *old* sub after an admin "rotate link" action: its
+# keys are put on a short grace timer, then reaped with the same job as bootstrap subs.
+ROTATED_GRACE_SUB_NAME = "rotated-grace"
+# Hours the old keys keep working after a link rotation before they expire/are reaped.
+ROTATE_GRACE_HOURS = 24
 # Key lifetime. Client drops the key after ~5 min; this is the hard server cap.
 FREE_VPN_BOOTSTRAP_TTL_MINUTES = int(os.getenv('FREE_VPN_BOOTSTRAP_TTL_MINUTES', '60'))
 # Rate limit per install_id: at most MAX_PER_WINDOW issuances per WINDOW_MINUTES,
@@ -159,10 +172,8 @@ SUBSCRIPTION_CACHE_TTL = int(os.getenv('SUBSCRIPTION_CACHE_TTL', 300))
 SUBSCRIPTION_CACHE_SIZE = int(os.getenv('SUBSCRIPTION_CACHE_SIZE', 1000))
 
 # ── Clavis app integration ────────────────────────────────────
-# During rollout, all new account/sync/login features are gated
-# to this single developer. When the integration is validated,
-# drop the gate in bot/middlewares/user_registration.py and /start.
 MAIN_DEVELOPER_ID = 331186567
+
 
 # HMAC secret for deterministic Telegram-device tokens of the form
 # `tg_<telegram_id>_<hmac16>`. MUST be set in .env in production — random
@@ -171,6 +182,15 @@ TG_TOKEN_SECRET = os.getenv('TG_TOKEN_SECRET', '')
 
 # Argon2id tuning for recovery-phrase hashing (see services/auth.py)
 FCM_CREDENTIALS_PATH = os.getenv('FCM_CREDENTIALS_PATH', '')
+
+# In-app support chat via Telegram Forum Topics.
+# chat_id of the supergroup with topics enabled; bot must be admin with can_manage_topics.
+SUPPORT_GROUP_ID = int(os.getenv('SUPPORT_GROUP_ID', '0'))
+SUPPORT_RATE_LIMIT_SECONDS = int(os.getenv('SUPPORT_RATE_LIMIT_SECONDS', '10'))
+
+# Whitelist traffic limits
+WHITELIST_TRAFFIC_LIMIT_GB = int(os.getenv('WHITELIST_TRAFFIC_LIMIT_GB', '25'))
+WHITELIST_GROUP_NAME = os.getenv('WHITELIST_GROUP_NAME', 'Whitelist')
 
 ARGON2_TIME_COST = int(os.getenv('ARGON2_TIME_COST', '3'))
 ARGON2_MEMORY_COST = int(os.getenv('ARGON2_MEMORY_COST', '65536'))  # 64 MiB
