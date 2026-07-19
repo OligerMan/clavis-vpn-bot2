@@ -132,6 +132,11 @@ class SubscriptionService:
             # Reset renewal reminder flags
             active_sub.reset_reminder_flags()
 
+            # Keep the sub linked to the user's Clavis account (app resolves by
+            # account_id); covers old subs created before that link existed.
+            if user.account_id and not active_sub.account_id:
+                active_sub.account_id = user.account_id
+
             db.commit()
             db.refresh(active_sub)
 
@@ -156,6 +161,10 @@ class SubscriptionService:
 
             # Reset renewal reminder flags
             expired_sub.reset_reminder_flags()
+
+            # Link to the user's Clavis account (app resolves by account_id).
+            if user.account_id and not expired_sub.account_id:
+                expired_sub.account_id = user.account_id
 
             db.commit()
             db.refresh(expired_sub)

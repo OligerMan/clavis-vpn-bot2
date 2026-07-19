@@ -35,6 +35,7 @@ class User(Base):
     username = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     ref_source = Column(String(100), nullable=True, index=True)
+    total_donated = Column(Integer, default=0)
     # Link to Clavis app account — nullable (only set for users who went
     # through the app-integration flow; old and gated users stay NULL).
     account_id = Column(String(36), ForeignKey("clavis_accounts.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -112,6 +113,28 @@ def generate_subscription_token(mapper, connection, target):
     """Auto-generate UUID token for new subscriptions."""
     if not target.token:
         target.token = str(uuid.uuid4())
+
+
+@event.listens_for(Subscription, "before_insert")
+def link_subscription_to_account(mapper, connection, target):
+    """Auto-link a new subscription to its user's Clavis account.
+
+    The app resolves a user's VPN via ``subscriptions.account_id`` (see
+    account_service._subscription_url_for_account), so every subscription a Telegram
+    user creates — payment, admin grant, link rotation, … — must carry their
+    ``account_id``. Guest / app-only users (``users.account_id`` NULL) are a harmless
+    no-op, and rows that already set ``account_id`` explicitly (e.g. in-app payments)
+    are left untouched.
+    """
+    if target.account_id is not None or target.user_id is None:
+        return
+    from sqlalchemy import text
+    row = connection.execute(
+        text("SELECT account_id FROM users WHERE id = :uid"),
+        {"uid": target.user_id},
+    ).fetchone()
+    if row is not None and row[0]:
+        target.account_id = row[0]
 
 
 class Key(Base):
@@ -691,3 +714,90 @@ class AppPayment(Base):
 def _generate_app_payment_id(mapper, connection, target):
     if not target.id:
         target.id = str(uuid.uuid4())
+
+
+# ── Support chat (Telegram Forum Topics) ─────────────────────
+class SupportChat(Base):
+    """Per-account support chat. Maps to a Telegram forum topic."""
+
+    __tablename__ = "support_chats"
+
+    id = Column(String(36), primary_key=True)
+    account_id = Column(
+        String(36),
+        ForeignKey("clavis_accounts.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    topic_id = Column(Integer, nullable=False)
+    topic_name = Column(String(255), nullable=False)
+    is_closed = Column(Boolean, default=False)
+    info_message_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    account = relationship("ClavisAccount")
+    messages = relationship("SupportMessage", back_populates="chat", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<SupportChat(id={self.id}, account={self.account_id}, topic={self.topic_id})>"
+
+
+@event.listens_for(SupportChat, "before_insert")
+def _generate_support_chat_id(mapper, connection, target):
+    if not target.id:
+        target.id = str(uuid.uuid4())
+
+
+class SupportMessage(Base):
+    """A single message in a support chat."""
+
+    __tablename__ = "support_messages"
+
+    id = Column(String(36), primary_key=True)
+    chat_id = Column(
+        String(36),
+        ForeignKey("support_chats.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    direction = Column(String(8), nullable=False)  # "user" / "admin"
+    text = Column(Text, nullable=True)
+    image_file_id = Column(String(255), nullable=True)
+    image_mime = Column(String(32), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    chat = relationship("SupportChat", back_populates="messages")
+
+    __table_args__ = (
+        Index("ix_support_messages_chat_created", "chat_id", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<SupportMessage(id={self.id}, dir={self.direction})>"
+
+
+@event.listens_for(SupportMessage, "before_insert")
+def _generate_support_message_id(mapper, connection, target):
+    if not target.id:
+        target.id = str(uuid.uuid4())
+
+
+class TrafficLimit(Base):
+    """Per-user traffic limit override for a server group (e.g. Whitelist)."""
+
+    __tablename__ = "traffic_limits"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    server_group = Column(String(50), nullable=False)
+    monthly_limit_gb = Column(Integer, nullable=False)
+    reset_counter = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user = relationship("User")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "server_group", name="uq_traffic_limits_user_group"),
+    )
