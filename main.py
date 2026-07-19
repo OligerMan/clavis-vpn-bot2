@@ -28,6 +28,17 @@ MONITOR_STALE_TRAFFIC_COOLDOWN_HOURS = 1
 MONITOR_PEAK_HOURS_MSK = (10, 22)
 MONITOR_CPU_ALERT_PCT = 90.0
 MONITOR_DISK_ALERT_PCT = 95.0
+# Require this many consecutive failed health checks before alerting a panel DOWN.
+# Debounce for transient DNS/timeout blips on the monitoring host that recover on the
+# next 30-min cycle (the main source of "panel down → panel up" spam). 3 checks ≈
+# 60-90 min of continuous failure before a real alert.
+MONITOR_DOWN_THRESHOLD = 3
+# If at least this fraction of the checked panels fail in a single cycle (and at least
+# MONITOR_MIN_SERVERS_FOR_GLOBAL were checked), it's almost certainly a monitor-side
+# (DNS/network) outage rather than many independent panel failures — suppress DOWN
+# handling for that cycle instead of flapping the whole fleet.
+MONITOR_GLOBAL_OUTAGE_FRAC = 0.5
+MONITOR_MIN_SERVERS_FOR_GLOBAL = 4
 
 # Monitor state: server_id -> {is_up, last_seen_up, last_seen_down, last_traffic_bytes, stale_traffic_alerted_at, consecutive_failures}
 _MONITOR_STATE_FILE = Path(__file__).parent / "data" / "monitor_state.json"
@@ -114,19 +125,20 @@ def deactivate_expired_subscriptions_job():
 
 
 def reap_bootstrap_subscriptions_job():
-    """Delete expired free-VPN bootstrap subs and their x-ui clients.
+    """Delete expired throwaway subs and their x-ui clients.
 
-    The generic deactivate job only marks keys inactive (x-ui enforces expiry via
-    expiry_time); for throwaway bootstrap keys we also delete the x-ui client so
-    dead entries don't accumulate on the Free server.
+    Covers free-VPN bootstrap subs and the old subs left behind by an admin "rotate
+    link" action. The generic deactivate job only marks keys inactive (x-ui enforces
+    expiry via expiry_time); for these throwaway keys we also delete the x-ui client so
+    dead entries don't accumulate on the servers.
     """
-    from config.settings import BOOTSTRAP_SUB_NAME
+    from config.settings import BOOTSTRAP_SUB_NAME, ROTATED_GRACE_SUB_NAME
     logger = logging.getLogger(__name__)
     try:
         now = datetime.utcnow()
         with get_db_session() as db:
             expired = db.query(Subscription).filter(
-                Subscription.name == BOOTSTRAP_SUB_NAME,
+                Subscription.name.in_([BOOTSTRAP_SUB_NAME, ROTATED_GRACE_SUB_NAME]),
                 Subscription.expires_at < now,
             ).all()
             if not expired:
@@ -196,6 +208,18 @@ def backup_database_job():
         logger.info("Database backup sent to admin")
     except Exception as e:
         logger.error(f"Error in database backup job: {e}", exc_info=True)
+
+
+def monthly_traffic_reset_job():
+    """Reset Whitelist traffic limits on the 1st of each month."""
+    logger = logging.getLogger(__name__)
+    try:
+        from services.traffic_limit_service import monthly_reset_all
+        with get_db_session() as db:
+            stats = monthly_reset_all(db)
+            logger.info(f"Monthly traffic reset: {stats}")
+    except Exception as e:
+        logger.error(f"Error in monthly traffic reset job: {e}", exc_info=True)
 
 
 def fcm_expiry_notifications_job():
@@ -281,7 +305,14 @@ def mute_server_alerts(server_id: int, hours: int = 6) -> None:
     global _monitor_state
     muted_until = (datetime.utcnow() + timedelta(hours=hours)).isoformat()
     _monitor_state.setdefault(server_id, {})["muted_until"] = muted_until
-    _save_monitor_state(_monitor_state)
+    # Merge into file instead of overwriting — avoids clobbering state from monitor job
+    try:
+        saved = _load_monitor_state()
+        saved.setdefault(server_id, {})["muted_until"] = muted_until
+        _save_monitor_state(saved)
+    except Exception:
+        _save_monitor_state(_monitor_state)
+    logging.getLogger(__name__).info(f"Server {server_id} muted until {muted_until}")
 
 
 def _fmt_uptime(seconds) -> str:
@@ -361,6 +392,9 @@ def monitor_servers_job():
 
         bot = get_bot()
 
+        # Pass 1: health-check every (non-muted) panel before deciding anything, so a
+        # monitor-side outage (many failing at once) can be told from real failures.
+        results = []  # (sd, prev, health)
         for sd in server_data:
             sid = sd["id"]
             sname = sd["name"]
@@ -379,10 +413,11 @@ def monitor_servers_job():
             if muted_until_raw:
                 try:
                     if datetime.utcnow() < datetime.fromisoformat(muted_until_raw):
-                        logger.debug(f"Monitor: {sname} is muted, skipping alerts")
+                        logger.info(f"Monitor: {sname} is muted until {muted_until_raw}, skipping")
                         continue
                     else:
-                        prev["muted_until"] = None  # Mute expired
+                        logger.info(f"Monitor: {sname} mute expired")
+                        prev["muted_until"] = None
                 except Exception:
                     prev["muted_until"] = None
 
@@ -416,6 +451,26 @@ def monitor_servers_job():
                 from vpn.xui_models import ServerHealth
                 health = ServerHealth(is_healthy=False, error_message=str(e))
 
+            results.append((sd, prev, health))
+
+        # Detect a monitor-side (DNS/network) outage: if a large share of panels fail
+        # in the same cycle it's this host, not the fleet — don't flap everything.
+        n_checked = len(results)
+        n_failed = sum(1 for _, _, h in results if not h.is_healthy)
+        global_outage = (
+            n_checked >= MONITOR_MIN_SERVERS_FOR_GLOBAL
+            and n_failed >= n_checked * MONITOR_GLOBAL_OUTAGE_FRAC
+        )
+        if global_outage:
+            logger.warning(
+                f"Monitor: {n_failed}/{n_checked} panels unreachable this cycle — "
+                f"treating as monitor-side (DNS/network) blip, suppressing DOWN alerts"
+            )
+
+        # Pass 2: apply state transitions and send alerts.
+        for sd, prev, health in results:
+            sid = sd["id"]
+            sname = sd["name"]
             was_up = prev.get("is_up", True)
 
             if health.is_healthy:
@@ -459,59 +514,68 @@ def monitor_servers_job():
                         server_id=sid,
                     )
 
-                # Stale traffic check (peak hours MSK only)
-                start_h, end_h = MONITOR_PEAK_HOURS_MSK
-                if start_h <= now_msk_hour < end_h:
-                    active_keys = sd["key_count"]
-                    if active_keys >= MONITOR_STALE_TRAFFIC_MIN_KEYS:
-                        traffic = client.get_inbound_traffic()
-                        if traffic is not None:
-                            last_traffic = prev.get("last_traffic_bytes")
-                            if last_traffic is not None and traffic <= last_traffic:
-                                last_alert_raw = prev.get("stale_traffic_alerted_at")
-                                last_alert = (
-                                    datetime.fromisoformat(last_alert_raw)
-                                    if last_alert_raw else None
-                                )
-                                cooldown_ok = (
-                                    last_alert is None
-                                    or (now_utc - last_alert) >= timedelta(
-                                        hours=MONITOR_STALE_TRAFFIC_COOLDOWN_HOURS
-                                    )
-                                )
-                                if cooldown_ok:
-                                    traffic_gb = traffic / (1024 ** 3)
-                                    _send_monitor_alert(
-                                        bot,
-                                        f"<b>Server {sname} — No traffic growth</b>\n"
-                                        f"Traffic unchanged at {traffic_gb:.1f} GB "
-                                        f"during peak hours ({now_msk_hour}:xx MSK) "
-                                        f"with {active_keys} active keys.\n"
-                                        f"Check if server is blocked.",
-                                        server_id=sid,
-                                    )
-                                    prev["stale_traffic_alerted_at"] = now_utc.isoformat()
-                            prev["last_traffic_bytes"] = traffic
+                # Stale traffic check — disabled temporarily
+                # start_h, end_h = MONITOR_PEAK_HOURS_MSK
+                # if start_h <= now_msk_hour < end_h:
+                #     active_keys = sd["key_count"]
+                #     if active_keys >= MONITOR_STALE_TRAFFIC_MIN_KEYS:
+                #         traffic = client.get_inbound_traffic()
+                #         if traffic is not None:
+                #             last_traffic = prev.get("last_traffic_bytes")
+                #             if last_traffic is not None and traffic <= last_traffic:
+                #                 last_alert_raw = prev.get("stale_traffic_alerted_at")
+                #                 last_alert = (
+                #                     datetime.fromisoformat(last_alert_raw)
+                #                     if last_alert_raw else None
+                #                 )
+                #                 cooldown_ok = (
+                #                     last_alert is None
+                #                     or (now_utc - last_alert) >= timedelta(
+                #                         hours=MONITOR_STALE_TRAFFIC_COOLDOWN_HOURS
+                #                     )
+                #                 )
+                #                 if cooldown_ok:
+                #                     traffic_gb = traffic / (1024 ** 3)
+                #                     _send_monitor_alert(
+                #                         bot,
+                #                         f"<b>Server {sname} — No traffic growth</b>\n"
+                #                         f"Traffic unchanged at {traffic_gb:.1f} GB "
+                #                         f"during peak hours ({now_msk_hour}:xx MSK) "
+                #                         f"with {active_keys} active keys.\n"
+                #                         f"Check if server is blocked.",
+                #                         server_id=sid,
+                #                     )
+                #                     prev["stale_traffic_alerted_at"] = now_utc.isoformat()
+                #             prev["last_traffic_bytes"] = traffic
 
             else:
+                # Monitor-side outage this cycle: don't count it against any panel.
+                if global_outage:
+                    continue
                 prev["consecutive_failures"] = prev.get("consecutive_failures", 0) + 1
+                fails = prev["consecutive_failures"]
 
-                if was_up:
+                # Debounce: only declare DOWN after MONITOR_DOWN_THRESHOLD consecutive
+                # failures, so a single bad cycle doesn't spam a DOWN→ONLINE pair.
+                if was_up and fails >= MONITOR_DOWN_THRESHOLD:
                     prev["is_up"] = False
                     prev["last_seen_down"] = now_utc.isoformat()
                     from html import escape as _esc
                     _send_monitor_alert(
                         bot,
                         f"<b>Server {sname} — DOWN</b>\n"
+                        f"Unreachable for {fails} consecutive checks.\n"
                         f"Error: {_esc(str(health.error_message))}",
                         server_id=sid,
                     )
-                    logger.warning(f"Monitor: {sname} went DOWN: {health.error_message}")
-                else:
-                    logger.warning(
-                        f"Monitor: {sname} still DOWN "
-                        f"(failure #{prev['consecutive_failures']})"
+                    logger.warning(f"Monitor: {sname} went DOWN after {fails} checks: {health.error_message}")
+                elif was_up:
+                    logger.info(
+                        f"Monitor: {sname} health check failed "
+                        f"({fails}/{MONITOR_DOWN_THRESHOLD}), not alerting yet: {health.error_message}"
                     )
+                else:
+                    logger.warning(f"Monitor: {sname} still DOWN (failure #{fails})")
 
         _save_monitor_state(_monitor_state)
 
@@ -611,6 +675,11 @@ def main():
             fcm_expiry_notifications_job, 'cron',
             hour=7, minute=0,  # 07:00 UTC = 10:00 MSK
             id='fcm_expiry_notifications', misfire_grace_time=3600,
+        )
+        scheduler.add_job(
+            monthly_traffic_reset_job, 'cron',
+            day=1, hour=0, minute=5,  # 00:05 UTC = 03:05 MSK
+            id='monthly_traffic_reset', misfire_grace_time=3600,
         )
         # Run once on startup
         recalculate_server_scores_job()
