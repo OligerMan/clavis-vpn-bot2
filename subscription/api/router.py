@@ -11,7 +11,8 @@ import logging
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -114,6 +115,19 @@ class PaymentStatusOut(BaseModel):
     paid: bool
 
 
+class SupportMessageOut(BaseModel):
+    id: str
+    direction: str
+    text: Optional[str] = None
+    image_url: Optional[str] = None
+    created_at: int
+
+
+class SupportMessagesOut(BaseModel):
+    messages: List[SupportMessageOut]
+    has_more: bool
+
+
 # ── helpers ────────────────────────────────────────────────────
 
 _VALID_TYPES = {"telegram", "ios", "android", "macos", "windows", "linux"}
@@ -131,21 +145,12 @@ def _ts(dt: datetime) -> int:
 
 @api_router.post("/device/register", response_model=DeviceRegisterOut)
 async def device_register(body: DeviceRegisterIn, db: Session = Depends(get_db_dep)):
-    """Create an ephemeral device with account_id NULL."""
+    """Create an ephemeral device (serialized + deduped per install_id)."""
     if body.device_type not in _VALID_TYPES:
         raise HTTPException(status_code=400, detail="invalid device_type")
-
-    install_id = (body.install_id or "").strip() or None
-    dev = Device(
-        device_token=random_device_token(),
-        device_type=body.device_type,
-        device_name=body.device_name,
-        install_id=install_id,
-        created_at=datetime.utcnow(),
-        last_seen=datetime.utcnow(),
+    dev = account_service.register_ephemeral_device(
+        db, body.install_id, body.device_type, body.device_name
     )
-    db.add(dev)
-    db.flush()
     return {"device_token": dev.device_token}
 
 
@@ -189,10 +194,13 @@ async def login_request(
 @api_router.post("/login/claim", response_model=LoginClaimOut)
 async def login_claim(
     body: LoginClaimIn,
-    device: Device = Depends(require_ephemeral_device),
+    device: Device = Depends(require_device),  # switch/merge from an already-attached device
     db: Session = Depends(get_db_dep),
 ):
-    account = account_service.claim_login_token(db, device, body.one_time_token)
+    account, error = account_service.claim_login_token(db, device, body.one_time_token)
+    if error in ("source_has_account", "multiple_active_subscriptions"):
+        # Invalid state (real TG source, or 2+ active paid subs) — resolved by support.
+        raise HTTPException(status_code=409, detail=error)
     if account is None:
         raise HTTPException(status_code=401, detail="invalid_token")
     sub_url = account_service._subscription_url_for_account(db, account.id)
@@ -331,3 +339,97 @@ async def payment_webhook(request: Request, db: Session = Depends(get_db_dep)):
     except Exception as e:
         logger.error(f"Payment webhook error: {e}", exc_info=True)
     return {}
+
+
+# ── support chat ──────────────────────────────────────────────
+
+_ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+_MAX_IMAGE_SIZE = 5 * 1024 * 1024
+
+
+@api_router.post("/support/send", response_model=SupportMessageOut)
+async def support_send(
+    request: Request,
+    device: Device = Depends(require_full_device),
+    db: Session = Depends(get_db_dep),
+):
+    from services import support_service
+
+    text = None
+    image_bytes = None
+    image_filename = None
+    content_type = request.headers.get("content-type", "")
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        text = form.get("text")
+        image = form.get("image")
+        if image and hasattr(image, "filename") and image.filename:
+            if image.content_type not in _ALLOWED_IMAGE_TYPES:
+                raise HTTPException(status_code=400, detail="unsupported_image_type")
+            image_bytes = await image.read()
+            if len(image_bytes) > _MAX_IMAGE_SIZE:
+                raise HTTPException(status_code=400, detail="image_too_large")
+            image_filename = image.filename
+    else:
+        body = await request.json()
+        text = body.get("text")
+
+    if text and len(text) > 4000:
+        text = text[:4000]
+
+    try:
+        msg = support_service.send_user_message(
+            db, device.account_id, text, device.device_name,
+            image_bytes=image_bytes, image_filename=image_filename,
+        )
+    except ValueError as e:
+        detail = str(e)
+        if "rate_limited" in detail:
+            raise HTTPException(status_code=429, detail="rate_limited")
+        raise HTTPException(status_code=400, detail=detail)
+
+    return _support_msg_out(msg)
+
+
+@api_router.get("/support/messages", response_model=SupportMessagesOut)
+async def support_messages(
+    before: Optional[int] = None,
+    limit: int = 50,
+    device: Device = Depends(require_full_device),
+    db: Session = Depends(get_db_dep),
+):
+    from services import support_service
+
+    clamped = min(max(1, limit), 100)
+    msgs = support_service.get_messages(db, device.account_id, before_ts=before, limit=clamped)
+
+    return {
+        "messages": [_support_msg_out(m) for m in msgs],
+        "has_more": len(msgs) == clamped,
+    }
+
+
+@api_router.get("/support/image/{message_id}")
+async def support_image(
+    message_id: str,
+    device: Device = Depends(require_full_device),
+    db: Session = Depends(get_db_dep),
+):
+    from services import support_service
+
+    result = support_service.get_image(db, device.account_id, message_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="not_found")
+    data, mime = result
+    return Response(content=data, media_type=mime)
+
+
+def _support_msg_out(m) -> dict:
+    return {
+        "id": m.id,
+        "direction": m.direction,
+        "text": m.text,
+        "image_url": f"/api/v1/support/image/{m.id}" if m.image_file_id else None,
+        "created_at": _ts(m.created_at),
+    }

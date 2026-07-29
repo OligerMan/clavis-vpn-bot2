@@ -230,6 +230,15 @@ async def _sync_from_yookassa(db: Session, row: AppPayment) -> None:
 
 
 def _activate_subscription(db: Session, account_id: str, plan_id: str) -> None:
+    """Serialized entry point — activation is locked per account so it can't race a
+    concurrent login-merge on the same account. Commits inside the lock."""
+    from services.account_service import account_lock
+    with account_lock(account_id):
+        _activate_subscription_impl(db, account_id, plan_id)
+        db.commit()
+
+
+def _activate_subscription_impl(db: Session, account_id: str, plan_id: str) -> None:
     """Create or extend subscription for the given account after successful payment."""
     from services.key_service import KeyService
     from subscription.cache import invalidate_subscription_cache

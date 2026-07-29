@@ -9,12 +9,14 @@ import hashlib
 import hmac
 import logging
 import secrets
+import threading
 from datetime import datetime, timedelta
 from typing import Optional
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from mnemonic import Mnemonic
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from config.settings import (
@@ -75,20 +77,75 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
-def _merge_install_id_duplicates(db: Session, caller: Device, target_account_id: str) -> int:
-    """Spec §3.11 — delete older device rows with the same install_id on the
-    target account before promoting ``caller``.
+# In-process locks, keyed by name, so concurrent registers (per install_id) and concurrent
+# login-claims/merges (per target account) serialize. Each holder commits inside the lock so
+# its effect is visible to the next waiter (requests use separate sessions).
+_locks_guard = threading.Lock()
+_install_locks: dict[str, threading.Lock] = {}
+_account_locks: dict[str, threading.Lock] = {}
+_user_locks: dict[str, threading.Lock] = {}
 
-    No-op when ``caller.install_id`` is NULL (old clients). Returns the number
-    of rows removed. Safe to call in every promote path (create / recover /
-    login-claim / sync-claim) — keeps at most one row per (install_id, account).
+
+def _named_lock(registry: dict, key: str) -> threading.Lock:
+    with _locks_guard:
+        lk = registry.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            registry[key] = lk
+        return lk
+
+
+def account_lock(account_id: str):
+    """Serialize account-level mutations (login-merge, payment activation) in-process."""
+    return _named_lock(_account_locks, account_id)
+
+
+def register_ephemeral_device(db: Session, install_id: Optional[str],
+                              device_type: str, device_name: Optional[str]) -> Device:
+    """Create an ephemeral (account_id NULL) device. Serialized per install_id and
+    supersedes prior ephemeral rows for the same install (the client keeps only its latest
+    token). Commits inside the lock so a concurrent register sees the result."""
+    from services.auth import random_device_token
+    install_id = (install_id or "").strip() or None
+
+    def _do() -> Device:
+        if install_id:
+            db.query(Device).filter(
+                Device.install_id == install_id,
+                Device.account_id.is_(None),
+            ).delete(synchronize_session=False)
+        dev = Device(
+            device_token=random_device_token(),
+            device_type=device_type,
+            device_name=device_name,
+            install_id=install_id,
+            created_at=_now(),
+            last_seen=_now(),
+        )
+        db.add(dev)
+        db.commit()
+        db.refresh(dev)
+        return dev
+
+    if install_id:
+        with _named_lock(_install_locks, install_id):
+            return _do()
+    return _do()
+
+
+def _merge_install_id_duplicates(db: Session, caller: Device, target_account_id: str) -> int:
+    """Spec §3.11 — before promoting ``caller``, delete other device rows with the same
+    install_id that are either on the target account OR still ephemeral (superseded).
+
+    No-op when ``caller.install_id`` is NULL (old clients). Keeps at most one row per
+    install_id on the account and leaves no stray ephemeral for that install.
     """
     if not caller.install_id:
         return 0
     removed = (
         db.query(Device)
         .filter(
-            Device.account_id == target_account_id,
+            or_(Device.account_id == target_account_id, Device.account_id.is_(None)),
             Device.install_id == caller.install_id,
             Device.id != caller.id,
         )
@@ -96,26 +153,58 @@ def _merge_install_id_duplicates(db: Session, caller: Device, target_account_id:
     )
     if removed:
         logger.info(
-            f"Install-id merge: removed {removed} stale device(s) on account "
-            f"{target_account_id} with install_id={caller.install_id[:8]}..."
+            f"Install-id merge: removed {removed} stale device(s) for "
+            f"install_id={caller.install_id[:8]}... (target {target_account_id})"
         )
     return removed
 
 
+def _dedup_devices_by_install_id(db: Session, account_id: str) -> int:
+    """After migrating devices onto an account, keep at most one row per install_id (the
+    most-recently-seen); delete older duplicates. install_id NULL rows are left as-is."""
+    from collections import defaultdict
+    rows = (
+        db.query(Device)
+        .filter(Device.account_id == account_id, Device.install_id.isnot(None))
+        .all()
+    )
+    by_install: dict = defaultdict(list)
+    for d in rows:
+        by_install[d.install_id].append(d)
+    removed = 0
+    for group in by_install.values():
+        if len(group) <= 1:
+            continue
+        group.sort(key=lambda d: d.last_seen or d.created_at or _now(), reverse=True)
+        for d in group[1:]:
+            db.delete(d)
+            removed += 1
+    if removed:
+        logger.info(f"Dedup devices on account {account_id}: removed {removed} install-id dup(s)")
+    return removed
+
+
 def _subscription_url_for_account(db: Session, account_id: str) -> Optional[str]:
-    """Return the subscription URL for the account's latest active sub, if any."""
+    """Return the subscription URL for the account's live sub, if any.
+
+    If any PAID (non-free, non-test) sub is active, it wins outright — free/test subs are
+    ignored entirely, even if a free sub expires later. Only when there is no paid sub do
+    we fall back to a free/test one.
+    """
     from config.settings import SUBSCRIPTION_BASE_URL
 
+    live = db.query(Subscription).filter(
+        Subscription.account_id == account_id,
+        Subscription.is_active == True,  # noqa: E712
+        Subscription.expires_at > _now(),
+    )
     sub = (
-        db.query(Subscription)
-        .filter(
-            Subscription.account_id == account_id,
-            Subscription.is_active == True,  # noqa: E712
-            Subscription.expires_at > _now(),
-        )
+        live.filter(Subscription.is_test == False, Subscription.plan_type != "free")  # noqa: E712
         .order_by(Subscription.expires_at.desc())
         .first()
     )
+    if sub is None:  # no paid sub → free/test fallback
+        sub = live.order_by(Subscription.expires_at.desc()).first()
     if sub is None:
         return None
     return f"{SUBSCRIPTION_BASE_URL.rstrip('/')}/sub/{sub.token}"
@@ -206,34 +295,239 @@ def create_login_token(db: Session, account_id: str) -> LoginToken:
 
 def claim_login_token(
     db: Session, device: Device, token: str
-) -> Optional[ClavisAccount]:
-    """Claim a login token. Device must be ephemeral. Returns the linked account.
+) -> tuple[Optional[ClavisAccount], Optional[str]]:
+    """Claim a login token; switch the device onto the token's account and merge.
 
-    Returns None if the token is unknown / expired / already claimed.
+    The device may already be attached to a throwaway (userless) app account: it is
+    switched, all its devices are migrated, and any active PAID subscription it leaves
+    behind is folded into the target account. See server-integration-spec §11.
+
+    Returns ``(account, error)``:
+      - ``(account, None)``                    — success
+      - ``(None, "invalid")``                  — unknown / expired / already-claimed token
+      - ``(None, "source_has_account")``       — device is leaving a real (Telegram-linked)
+        account; invalid state resolved by support (HTTP 409).
+      - ``(None, "multiple_active_subscriptions")`` — 2+ active paid subs on the source or
+        target account; invalid state resolved by support (HTTP 409).
     """
     now = _now()
-    row = (
-        db.query(LoginToken)
-        .filter(LoginToken.token == token)
+    row = db.query(LoginToken).filter(LoginToken.token == token).first()
+    if row is None or row.expires_at < now or row.claimed_at is not None:
+        return None, "invalid"
+
+    # Serialize per target account: closes the double-claim window (B2) and concurrent
+    # merges into the same account (B3). Commit inside the lock so the next waiter sees it.
+    with _named_lock(_account_locks, row.account_id):
+        db.refresh(row)  # re-read under lock in case a concurrent claim just committed
+        if row.claimed_at is not None or row.expires_at < now:
+            return None, "invalid"
+
+        leaving_account_id = device.account_id
+        switching = bool(leaving_account_id) and leaving_account_id != row.account_id
+
+        src_sub = None
+        if switching:
+            # Only a throwaway (userless) source may be merged; a real TG-linked source is
+            # an invalid state for support.
+            if db.query(User).filter(User.account_id == leaving_account_id).first() is not None:
+                return None, "source_has_account"
+            # Anomaly: 2+ active paid subs on either side is invalid — support handles it.
+            src_paid = _count_active_paid_subs(db, leaving_account_id)
+            if src_paid > 1:
+                return None, "multiple_active_subscriptions"
+            if src_paid == 1:
+                if _count_active_paid_subs(db, row.account_id) > 1:
+                    return None, "multiple_active_subscriptions"
+                src_sub = _mergeable_subscription_for_account(db, leaving_account_id)
+
+        _merge_install_id_duplicates(db, device, row.account_id)
+        row.claimed_at = now
+        row.claimed_by_device = device.id
+        device.account_id = row.account_id
+        device.last_seen = now
+
+        account = db.query(ClavisAccount).filter(ClavisAccount.id == row.account_id).first()
+        if account is not None:
+            account.last_active = now
+
+        merged = False
+        if switching and account is not None:
+            _migrate_all_devices(db, leaving_account_id, account.id)
+            _dedup_devices_by_install_id(db, account.id)
+            if src_sub is not None:
+                _carry_subscription_into_account(db, src_sub, account)
+                merged = True
+            # Persist the re-anchor/grace account_id moves BEFORE selecting rows to delete,
+            # so cleanup doesn't re-select the survivor sub (session has autoflush off).
+            db.flush()
+            _delete_abandoned_account(db, leaving_account_id, account.id)
+
+        if merged:
+            _log_merge_for_antifraud(db, device, leaving_account_id, account)
+
+        db.commit()
+        return account, None
+
+
+# ── login-merge helpers (spec §11) ─────────────────────────────
+
+def _mergeable_subscription_for_account(db: Session, account_id: str) -> Optional[Subscription]:
+    """Latest active, non-expired, non-free, non-test subscription — the only kind that
+    carries real paid value into a login-merge (free/test ignored on both sides)."""
+    return (
+        db.query(Subscription)
+        .filter(
+            Subscription.account_id == account_id,
+            Subscription.is_active == True,   # noqa: E712
+            Subscription.is_test == False,    # noqa: E712
+            Subscription.plan_type != "free",
+            Subscription.expires_at > _now(),
+        )
+        .order_by(Subscription.expires_at.desc())
         .first()
     )
-    if row is None:
-        return None
-    if row.expires_at < now:
-        return None
-    if row.claimed_at is not None:
-        return None
 
-    _merge_install_id_duplicates(db, device, row.account_id)
-    row.claimed_at = now
-    row.claimed_by_device = device.id
-    device.account_id = row.account_id
-    device.last_seen = now
 
-    account = db.query(ClavisAccount).filter(ClavisAccount.id == row.account_id).first()
-    if account is not None:
-        account.last_active = now
-    return account
+def _count_active_paid_subs(db: Session, account_id: str) -> int:
+    """Count active, non-expired, non-free, non-test subs. >1 is an anomaly (the invariant
+    is at most one paid sub per account)."""
+    return (
+        db.query(Subscription)
+        .filter(
+            Subscription.account_id == account_id,
+            Subscription.is_active == True,   # noqa: E712
+            Subscription.is_test == False,    # noqa: E712
+            Subscription.plan_type != "free",
+            Subscription.expires_at > _now(),
+        )
+        .count()
+    )
+
+
+def _purge_expired_subs(db: Session, account_id: str) -> int:
+    """Discard expired subs on the account (we never keep them) so a re-anchor leaves a
+    single live sub. ORM delete cascades their keys."""
+    n = 0
+    for sub in (
+        db.query(Subscription)
+        .filter(Subscription.account_id == account_id, Subscription.expires_at <= _now())
+        .all()
+    ):
+        db.delete(sub)
+        n += 1
+    return n
+
+
+def _log_merge_for_antifraud(db: Session, device: Device, source_account_id: str,
+                             target_account: ClavisAccount) -> None:
+    """Record a subscription-carrying login-merge in activity_logs for fraud analysis
+    (many throwaway devices funnelling paid subs into one Telegram account)."""
+    from database.activity_log import log_activity
+    tg = db.query(User).filter(User.account_id == target_account.id).first()
+    tg_id = tg.telegram_id if tg else 0
+    inst = (device.install_id or "?")[:12]
+    log_activity(
+        db, tg_id, "login_merge",
+        f"install={inst} src_acct={source_account_id[:8]} dst_acct={target_account.id[:8]}",
+    )
+
+
+def _reprovision_keys(db: Session, sub: Subscription, user: Optional[User]) -> None:
+    """Re-provision keys / expiry for the surviving sub. Best-effort (panel errors caught
+    + logged), so a login-merge is never rolled back by a temporarily-down panel."""
+    from services.payment_service import _ensure_keys_and_expiry
+    _ensure_keys_and_expiry(db, sub, user)
+
+
+def _migrate_all_devices(db: Session, from_account_id: str, to_account_id: str) -> int:
+    """Move every device of the abandoned account onto the target account."""
+    n = (
+        db.query(Device)
+        .filter(Device.account_id == from_account_id)
+        .update({Device.account_id: to_account_id, Device.last_seen: _now()},
+                synchronize_session=False)
+    )
+    if n:
+        logger.info(f"login-merge: migrated {n} device(s) {from_account_id}->{to_account_id}")
+    return n
+
+
+def _carry_subscription_into_account(db: Session, src_sub: Subscription, dst_account: ClavisAccount) -> None:
+    """Fold the leaving account's active paid sub (``src_sub``) into ``dst_account``.
+
+    - target has no paid sub -> re-anchor src onto the target account (+ its user).
+    - both have a paid sub    -> highest tier wins; the lower sub's remaining time converts
+      into the winner (PLAN_CONVERSION_RATES, ceil in the user's favour); same tier -> sum.
+      The survivor is the target-anchored sub; the app-side src sub gets a 24h key grace.
+    """
+    from datetime import timedelta
+    from services.plan_math import PLAN_RANK, convert_remaining_days
+    from services.subscription_grace import grace_demote_subscription
+
+    now = _now()
+    _purge_expired_subs(db, dst_account.id)  # discard target's expired subs (never kept)
+    dst_user = db.query(User).filter(User.account_id == dst_account.id).first()
+    dst_sub = _mergeable_subscription_for_account(db, dst_account.id)
+
+    # (1) target has no paid sub -> re-anchor the source sub onto the target identity.
+    if dst_sub is None:
+        src_sub.account_id = dst_account.id
+        src_sub.user_id = dst_user.id if dst_user else None
+        _reprovision_keys(db, src_sub, dst_user)
+        return
+    if dst_sub.id == src_sub.id:
+        return
+
+    # (2) both active paid -> merge INTO dst_sub (survivor), grace the source.
+    src_days = max(0.0, (src_sub.expires_at - now).total_seconds() / 86400)
+    dst_days = max(0.0, (dst_sub.expires_at - now).total_seconds() / 86400)
+    src_rank = PLAN_RANK.get(src_sub.plan_type, 0)
+    dst_rank = PLAN_RANK.get(dst_sub.plan_type, 0)
+
+    if src_rank == dst_rank:                        # same tier -> sum time
+        total_days = dst_days + src_days
+        winner = dst_sub.plan_type
+    elif dst_rank > src_rank:                       # target higher -> convert src up
+        total_days = dst_days + convert_remaining_days(src_days, src_sub.plan_type, dst_sub.plan_type)
+        winner = dst_sub.plan_type
+    else:                                           # src higher -> upgrade target sub
+        total_days = src_days + convert_remaining_days(dst_days, dst_sub.plan_type, src_sub.plan_type)
+        winner = src_sub.plan_type
+
+    dst_sub.plan_type = winner
+    dst_sub.expires_at = now + timedelta(days=total_days)
+    dst_sub.is_active = True
+    dst_sub.reset_reminder_flags()
+
+    grace_demote_subscription(db, src_sub)          # app-side keys live 24h, then reaped
+    _reprovision_keys(db, dst_sub, dst_user)
+
+
+def _delete_abandoned_account(db: Session, account_id: str, target_account_id: str) -> None:
+    """Delete the leaving account after its devices + paid sub have moved.
+
+    Guard: never delete an account that still has a linked User (would orphan a real
+    Telegram user — the caller already rejects that, double-checked here). In-app
+    payments are reassigned to the survivor (audit follows the money); leftover free/test
+    subs (+ their keys via ORM cascade) and any support chats are deleted; the account's
+    login tokens go via ORM cascade. The graced paid sub already has account_id=None.
+    """
+    from database.models import AppPayment, SupportChat
+
+    if db.query(User).filter(User.account_id == account_id).first() is not None:
+        logger.warning(f"login-merge: account {account_id} still has a User — not deleting")
+        return
+
+    db.query(AppPayment).filter(AppPayment.account_id == account_id).update(
+        {AppPayment.account_id: target_account_id}, synchronize_session=False)
+    for sub in db.query(Subscription).filter(Subscription.account_id == account_id).all():
+        db.delete(sub)                              # ORM cascade removes its keys
+    for chat in db.query(SupportChat).filter(SupportChat.account_id == account_id).all():
+        db.delete(chat)                             # ORM cascade removes its messages
+    acc = db.query(ClavisAccount).filter(ClavisAccount.id == account_id).first()
+    if acc is not None:
+        db.delete(acc)                              # ORM cascade removes its login tokens
+    logger.info(f"login-merge: deleted abandoned account {account_id}")
 
 
 # ── sync pairs (show-code ↔ scan-code) ─────────────────────────
@@ -449,19 +743,29 @@ def ensure_implicit_account(db: Session, user: User) -> Optional[ClavisAccount]:
         upsert_telegram_device_for_user(db, user)
         return db.query(ClavisAccount).filter(ClavisAccount.id == user.account_id).first()
 
-    account = ClavisAccount(last_active=_now())  # recovery_phrase_hash stays NULL
-    db.add(account)
-    db.flush()
-    user.account_id = account.id
+    # Serialize per Telegram user: two concurrent /start (threaded telebot) must not each
+    # create an account. Commit inside the lock so the next waiter sees the link.
+    with _named_lock(_user_locks, str(user.telegram_id)):
+        db.refresh(user)
+        if user.account_id is not None:
+            upsert_telegram_device_for_user(db, user)
+            return db.query(ClavisAccount).filter(ClavisAccount.id == user.account_id).first()
 
-    # Back-link existing subscriptions that have no account yet.
-    subs = (
-        db.query(Subscription)
-        .filter(Subscription.user_id == user.id, Subscription.account_id.is_(None))
-        .all()
-    )
-    for s in subs:
-        s.account_id = account.id
+        account = ClavisAccount(last_active=_now())  # recovery_phrase_hash stays NULL
+        db.add(account)
+        db.flush()
+        user.account_id = account.id
 
-    upsert_telegram_device_for_user(db, user)
-    return account
+        # Back-link existing subscriptions that have no account yet.
+        subs = (
+            db.query(Subscription)
+            .filter(Subscription.user_id == user.id, Subscription.account_id.is_(None))
+            .all()
+        )
+        for s in subs:
+            s.account_id = account.id
+
+        upsert_telegram_device_for_user(db, user)
+        db.commit()
+        db.refresh(account)
+        return account
