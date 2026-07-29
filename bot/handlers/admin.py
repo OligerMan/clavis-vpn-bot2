@@ -2874,6 +2874,12 @@ def register_admin_handlers(bot: TeleBot) -> None:
 
         tg_id = int(call.data.replace('mu_rotcfm_', ''))
         bot.answer_callback_query(call.id, "Rotating...")
+        # Drop the confirm buttons immediately so a repeat tap can't re-fire the rotation
+        # (belt-and-suspenders alongside the per-user lock + dedup guard in the service).
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.id, reply_markup=None)
+        except Exception:
+            pass
         try:
             with get_db_session() as db:
                 ok, result = rotate_subscription(db, tg_id)

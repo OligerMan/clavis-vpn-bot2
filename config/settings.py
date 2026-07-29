@@ -127,6 +127,9 @@ BOOTSTRAP_SUB_NAME = "free-vpn-bootstrap"
 ROTATED_GRACE_SUB_NAME = "rotated-grace"
 # Hours the old keys keep working after a link rotation before they expire/are reaped.
 ROTATE_GRACE_HOURS = 24
+# Ignore repeat "rotate link" clicks for the same user within this window — a rapid
+# double/triple-tap on the admin confirm button would otherwise chain rotations.
+ROTATE_DEDUP_SECONDS = 120
 # Key lifetime. Client drops the key after ~5 min; this is the hard server cap.
 FREE_VPN_BOOTSTRAP_TTL_MINUTES = int(os.getenv('FREE_VPN_BOOTSTRAP_TTL_MINUTES', '60'))
 # Rate limit per install_id: at most MAX_PER_WINDOW issuances per WINDOW_MINUTES,

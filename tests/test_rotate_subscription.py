@@ -56,6 +56,9 @@ def db_user(tmp_path, monkeypatch):
     init_db(db_path=str(tmp_path / "rot.db"))
 
     monkeypatch.setattr("services.key_service.XUIClient", _FakeXUI)
+    # Reset the module-level dedup state so per-user rotation isn't blocked across tests.
+    import services.user_management_service as _ums
+    _ums._last_rotation_at.clear()
 
     with get_db_session() as db:
         user = User(telegram_id=555001, username="rot")
@@ -151,6 +154,24 @@ def test_reaper_deletes_expired_grace_sub(db_user):
     with get_db_session() as db:
         assert db.query(Subscription).filter(Subscription.name == ROTATED_GRACE_SUB_NAME).count() == 0
         # New sub and its keys survive.
+        assert db.query(Subscription).filter(Subscription.is_active == True).count() == 1
+
+
+def test_rotate_dedup_ignores_rapid_repeat(db_user):
+    """A second rotate right after the first is ignored — no duplicate active sub
+    (regression for the 3002/3003 triple-click race)."""
+    from services.user_management_service import rotate_subscription
+
+    with get_db_session() as db:
+        ok1, msg1 = rotate_subscription(db, 555001)
+    with get_db_session() as db:
+        ok2, msg2 = rotate_subscription(db, 555001)
+
+    assert ok1 and "Link rotated" in msg1
+    assert ok2 and "проигнорирован" in msg2  # repeat was deduped, not rotated again
+
+    with get_db_session() as db:
+        # exactly ONE active sub survives — the repeat did not mint a duplicate
         assert db.query(Subscription).filter(Subscription.is_active == True).count() == 1
 
 

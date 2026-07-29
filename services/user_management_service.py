@@ -7,6 +7,7 @@ inline buttons share the same logic.
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -255,7 +256,30 @@ def refresh_keys(db: Session, telegram_id: int) -> tuple[bool, str]:
     return True, f"Keys refreshed. New server: {server_name}"
 
 
+# Per-user serialization for rotation: a rapid double/triple-tap on the admin confirm
+# button dispatches concurrent handler threads; without this they could all read the same
+# active sub and mint duplicate active subscriptions (the 3002/3003 bug).
+_rotate_locks_guard = threading.Lock()
+_rotate_locks: dict[int, threading.Lock] = {}
+_last_rotation_at: dict[int, datetime] = {}  # telegram_id -> when we last rotated (dedup)
+
+
+def _rotate_lock_for(telegram_id: int) -> threading.Lock:
+    with _rotate_locks_guard:
+        lk = _rotate_locks.get(telegram_id)
+        if lk is None:
+            lk = threading.Lock()
+            _rotate_locks[telegram_id] = lk
+        return lk
+
+
 def rotate_subscription(db: Session, telegram_id: int, grace_hours: int = None) -> tuple[bool, str]:
+    """Serialized entry point for link rotation — see _rotate_subscription_impl."""
+    with _rotate_lock_for(telegram_id):
+        return _rotate_subscription_impl(db, telegram_id, grace_hours)
+
+
+def _rotate_subscription_impl(db: Session, telegram_id: int, grace_hours: int = None) -> tuple[bool, str]:
     """Rotate a user's subscription link: kill the old link now, keep old keys alive for
     a short grace window, and issue a NEW link + NEW keys on the SAME servers.
 
@@ -269,7 +293,10 @@ def rotate_subscription(db: Session, telegram_id: int, grace_hours: int = None) 
     Returns (success, result_text).
     """
     from subscription.cache import invalidate_subscription_cache
-    from config.settings import ROTATED_GRACE_SUB_NAME, ROTATE_GRACE_HOURS, SUBSCRIPTION_BASE_URL
+    from config.settings import (
+        ROTATED_GRACE_SUB_NAME, ROTATE_GRACE_HOURS, ROTATE_DEDUP_SECONDS,
+        SUBSCRIPTION_BASE_URL,
+    )
 
     if grace_hours is None:
         grace_hours = ROTATE_GRACE_HOURS
@@ -285,6 +312,18 @@ def rotate_subscription(db: Session, telegram_id: int, grace_hours: int = None) 
     ).order_by(Subscription.expires_at.desc()).first()
     if not s_old:
         return False, "No active subscription to rotate."
+
+    # Dedup rapid repeat clicks: if WE rotated this user within the window (a prior click
+    # in the same burst — the per-user lock serialized us behind it), don't chain another
+    # rotation; just return the current link. Keyed on our own last-rotation time, not the
+    # sub's created_at, so a freshly-purchased sub is still rotatable.
+    last = _last_rotation_at.get(telegram_id)
+    if last and (datetime.utcnow() - last) < timedelta(seconds=ROTATE_DEDUP_SECONDS):
+        base = SUBSCRIPTION_BASE_URL.rstrip('/')
+        return True, (
+            "🔄 Ссылка уже ротирована только что — повтор проигнорирован.\n"
+            f"Текущая ссылка: `{base}/sub/{s_old.token}`"
+        )
 
     old_keys = db.query(Key).filter(
         Key.subscription_id == s_old.id,
@@ -347,6 +386,8 @@ def rotate_subscription(db: Session, telegram_id: int, grace_hours: int = None) 
     log_activity(db, telegram_id, "admin_rotate_sub",
                  f"old_sub={s_old.id}, new_sub={s_new.id}, servers={len(servers)}")
     db.commit()
+
+    _last_rotation_at[telegram_id] = datetime.utcnow()  # dedup subsequent rapid clicks
 
     base = SUBSCRIPTION_BASE_URL.rstrip('/')
     new_url = f"{base}/sub/{new_token}"
